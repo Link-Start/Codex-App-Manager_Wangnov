@@ -26,7 +26,6 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
     "category": "Utility",
     "copyright": "Copyright (c) 2026 Wangnov",
     "shortDescription": "Codex App mirror install and update manager.",

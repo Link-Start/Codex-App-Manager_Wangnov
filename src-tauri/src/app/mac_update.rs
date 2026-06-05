@@ -217,9 +217,13 @@ pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport
         )));
     }
 
-    // EdDSA gate (pinned key).
+    // EdDSA gate (pinned key). On failure, drop the staged file so a retry
+    // re-downloads instead of re-hitting a corrupt same-size cache.
     let bytes = download::read_file(&dest).map_err(|e| AppError::Engine(e.to_string()))?;
-    verify_sparkle(&bytes, &signature).map_err(|e| AppError::Engine(e.to_string()))?;
+    if let Err(err) = verify_sparkle(&bytes, &signature) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(AppError::Engine(err.to_string()));
+    }
 
     Ok(MacStageReport {
         up_to_date: false,
