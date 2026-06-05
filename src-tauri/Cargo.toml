@@ -1,0 +1,23 @@
+[package]
+name = "codex-app-manager"
+version = "0.1.0"
+description = "A cross-platform manager for installing and updating mirrored official Codex desktop app packages."
+authors = ["Wangnov"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Wangnov/codex-app-mirror"
+
+[lib]
+name = "codex_app_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+directories = "6.0.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.11.2", features = [] }
+thiserror = "2.0"
+

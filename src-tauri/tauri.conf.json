@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex App Manager",
+  "version": "0.1.0",
+  "identifier": "io.github.wangnov.codexappmanager",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Codex App Manager",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 960,
+        "minHeight": 620,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Utility",
+    "copyright": "Copyright (c) 2026 Wangnov",
+    "shortDescription": "Codex App mirror install and update manager.",
+    "longDescription": "A manager app for installing and updating mirrored official Codex desktop app packages.",
+    "targets": ["nsis", "dmg"],
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installMode": "currentUser"
+      }
+    }
+  }
+}
+
