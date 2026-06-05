@@ -9,11 +9,12 @@
 |---|---|---|
 | macOS 更新引擎（plan→download→verify→apply→gate→swap→rollback） | ✅ | 全链路真机/真数据验证，9 单测 + 3 个 demo bin |
 | macOS Tauri 命令 + 最小前端 | ✅ | `mac_plan_update` / `mac_stage_update` + 面板（tsc+vite 构建通过） |
-| macOS live 编排（真 `/Applications`） | ⬜ | 机制全验，差"接真安装根 + 守卫命令 + UI 确认" |
+| macOS live 编排（真 `/Applications`） | 🟡 | 原子替换已**真机验证**（`mac_live_test`）；差完整编排串接 + 守卫命令 + UI 确认 |
 | mirror 服务端（appcast/zip/delta 镜像 + manifest v3） | ⬜ | mac 增量上线的前置 |
 | Windows 全链路 | ⬜ | **尚未开始**；设计见 §5，拷问提示词已备 |
-| manager 自更新 + 分发 | ⬜ | Tauri updater + R2/S3 + 签名 |
-| 横切（provenance / 纳管 UX / ~/.codex 边界） | ⬜ | v1 末期 |
+| manager 自更新 + 分发 | 🟡 | **客户端已接**（updater+process 插件 + UI）；服务端 latest.json/托管/签名 TODO |
+| provenance / 纳管 UX（mac） | ✅ | 存储 + managed/external/none 分类 + 显式同意纳管 + UI |
+| `~/.codex` 边界 | ⬜ | 仅卸载时保留/清除 |
 
 ---
 
