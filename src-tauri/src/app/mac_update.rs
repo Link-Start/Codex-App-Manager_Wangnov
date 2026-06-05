@@ -162,46 +162,32 @@ fn strategy_label(strategy: &UpdateStrategy) -> String {
     }
 }
 
-/// Download the planned artifact into staging, size-gate it, and verify its
-/// EdDSA signature against the pinned Sparkle key. Idempotent: reuses an
-/// already-staged file of the right size. On EdDSA failure the staged file is
+/// Download an artifact `(url, size, signature)` into staging, size-gate it, and
+/// verify its EdDSA signature against the pinned Sparkle key. Idempotent: reuses
+/// an already-staged file of the right size. On EdDSA failure the staged file is
 /// dropped so a retry re-downloads instead of trusting a corrupt same-size
 /// cache. Returns the verified staged path. Shared by `stage` (non-destructive)
 /// and `perform` (the full install), so the destructive path can never skip the
-/// pinned-key check.
-fn download_and_verify(plan: &UpdatePlan) -> Result<PathBuf, AppError> {
-    let signature = plan
-        .ed_signature
-        .clone()
-        .ok_or_else(|| AppError::Engine("appcast enclosure missing edSignature".to_string()))?;
-
-    let file_name = plan
-        .download_url
-        .rsplit('/')
-        .next()
-        .unwrap_or("payload.bin");
+/// pinned-key check. Taking explicit fields (rather than a plan) lets `perform`
+/// download the full enclosure when it falls back from a delta.
+fn download_and_verify(url: &str, size: u64, signature: &str) -> Result<PathBuf, AppError> {
+    let file_name = url.rsplit('/').next().unwrap_or("payload.bin");
     let dest = staging_dir().join(file_name);
 
-    let already = std::fs::metadata(&dest)
-        .map(|m| m.len() == plan.download_size)
-        .unwrap_or(false);
+    let already = std::fs::metadata(&dest).map(|m| m.len() == size).unwrap_or(false);
     if !already {
-        download::download_to(&plan.download_url, &dest)
-            .map_err(|e| AppError::Engine(e.to_string()))?;
+        download::download_to(url, &dest).map_err(|e| AppError::Engine(e.to_string()))?;
     }
 
     let len = std::fs::metadata(&dest)
         .map_err(|e| AppError::Engine(e.to_string()))?
         .len();
-    if len != plan.download_size {
-        return Err(AppError::Engine(format!(
-            "size mismatch: {len} != {}",
-            plan.download_size
-        )));
+    if len != size {
+        return Err(AppError::Engine(format!("size mismatch: {len} != {size}")));
     }
 
     let bytes = download::read_file(&dest).map_err(|e| AppError::Engine(e.to_string()))?;
-    if let Err(err) = verify_sparkle(&bytes, &signature) {
+    if let Err(err) = verify_sparkle(&bytes, signature) {
         let _ = std::fs::remove_file(&dest);
         return Err(AppError::Engine(err.to_string()));
     }
@@ -235,7 +221,11 @@ pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport
         require_os_supported(latest.minimum_system_version.as_deref())?;
     }
 
-    let dest = download_and_verify(&plan)?;
+    let signature = plan
+        .ed_signature
+        .clone()
+        .ok_or_else(|| AppError::Engine("appcast enclosure missing edSignature".to_string()))?;
+    let dest = download_and_verify(&plan.download_url, plan.download_size, &signature)?;
 
     Ok(MacStageReport {
         up_to_date: false,
@@ -364,34 +354,59 @@ pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformR
         require_os_supported(latest.minimum_system_version.as_deref())?;
     }
 
-    // 1) download + size + EdDSA verify (idempotent).
-    let staged = download_and_verify(&plan)?;
+    // 1) Decide what to fetch + how to reconstruct. A planned delta needs the
+    //    BinaryDelta tool; if it's absent, fall back to the appcast's full zip
+    //    (which needs no tool) instead of failing after the download — the full
+    //    enclosure is always present alongside the deltas.
+    let want_delta = matches!(plan.strategy, UpdateStrategy::Delta { .. });
+    let delta_tool = binary_delta.as_deref();
+    let use_delta = want_delta && delta_tool.is_some();
 
-    // 2) reconstruct the new bundle on the SAME VOLUME as the install root
-    //    (required for the atomic rename in step 5).
+    let (dl_url, dl_size, dl_sig, effective_strategy) = if use_delta {
+        let sig = plan
+            .ed_signature
+            .clone()
+            .ok_or_else(|| AppError::Engine("appcast delta missing edSignature".to_string()))?;
+        (
+            plan.download_url.clone(),
+            plan.download_size,
+            sig,
+            strategy_label(&plan.strategy),
+        )
+    } else {
+        // Full package: either the plan was already Full, or a delta was planned
+        // but the tool is unavailable. Pull the full enclosure from the appcast.
+        let latest = appcast
+            .latest()
+            .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+        let sig = latest.full.ed_signature.clone().ok_or_else(|| {
+            AppError::Engine("appcast full enclosure missing edSignature".to_string())
+        })?;
+        let label = if want_delta {
+            "full (delta 工具缺失，回退全量)".to_string()
+        } else {
+            "full".to_string()
+        };
+        (latest.full.url.clone(), latest.full.length, sig, label)
+    };
+
+    // 2) download + size + EdDSA verify (idempotent).
+    let staged = download_and_verify(&dl_url, dl_size, &dl_sig)?;
+
+    // 3) reconstruct the new bundle on the SAME VOLUME as the install root
+    //    (required for the atomic rename later).
     let work = staging_dir();
     let out_app = work.join("Codex.app");
     let backup = work.join("backup-Codex.app");
     let _ = std::fs::remove_dir_all(&out_app);
     let _ = std::fs::remove_dir_all(&backup);
 
-    match plan.strategy {
-        UpdateStrategy::Delta { .. } => {
-            // Only the delta path needs BinaryDelta; surface a precise error if
-            // it's missing here rather than rejecting every update up front.
-            let tool = binary_delta.as_deref().ok_or_else(|| {
-                AppError::Engine(
-                    "增量(delta)更新需要 Sparkle BinaryDelta 工具，但未找到：\
-                     请设置 CODEX_BINARY_DELTA，或在发布构建中将其 vendor 到 resources/"
-                        .to_string(),
-                )
-            })?;
-            apply_delta(tool, &install_path, &out_app, &staged)
-                .map_err(|e| AppError::Engine(e.to_string()))?;
-        }
-        UpdateStrategy::Full => {
-            unpack_app_zip(&staged, &work, &out_app)?;
-        }
+    if use_delta {
+        let tool = delta_tool.expect("delta tool is present when use_delta is true");
+        apply_delta(tool, &install_path, &out_app, &staged)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+    } else {
+        unpack_app_zip(&staged, &work, &out_app)?;
     }
 
     // 3) gate the reconstructed bundle before it touches the install root.
@@ -441,7 +456,7 @@ pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformR
                     up_to_date: false,
                     from_build: installed.build,
                     to_build: plan.latest_build,
-                    strategy: strategy_label(&plan.strategy),
+                    strategy: effective_strategy.clone(),
                     installed_path: installed.path,
                     verified: true,
                     relaunched: false,
@@ -462,7 +477,7 @@ pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformR
             up_to_date: false,
             from_build: installed.build,
             to_build: plan.latest_build,
-            strategy: strategy_label(&plan.strategy),
+            strategy: effective_strategy.clone(),
             installed_path: installed.path,
             verified: true,
             relaunched: was_running,
@@ -477,7 +492,7 @@ pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformR
             up_to_date: false,
             from_build: installed.build,
             to_build: plan.latest_build,
-            strategy: strategy_label(&plan.strategy),
+            strategy: effective_strategy.clone(),
             installed_path: installed.path,
             verified: true,
             relaunched,
