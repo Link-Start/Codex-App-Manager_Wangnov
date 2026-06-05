@@ -115,6 +115,30 @@ pub fn relaunch(install_app: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Capstone: gate (codesign/Team/Gatekeeper) `new_app`, then atomically install
+/// it over `install_app` keeping `backup_app`. When `manage_process` is true,
+/// quits a running Codex first and relaunches after (a real install). When
+/// false (rehearsal against a sandbox), the host Codex process is left alone.
+///
+/// Rolling back on a failed post-launch health check is the caller's decision
+/// (the backup is preserved here).
+pub fn install_gated_bundle(
+    install_app: &Path,
+    new_app: &Path,
+    backup_app: &Path,
+    manage_process: bool,
+) -> Result<(), EngineError> {
+    crate::codesign::gate_reconstructed(new_app)?;
+    if manage_process {
+        quit_codex(30)?;
+    }
+    swap_in_place(install_app, new_app, backup_app)?;
+    if manage_process {
+        relaunch(install_app)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
