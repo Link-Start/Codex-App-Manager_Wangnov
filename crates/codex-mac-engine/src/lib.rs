@@ -17,6 +17,7 @@ pub mod apply;
 pub mod codesign;
 pub mod download;
 pub mod plan;
+pub mod swap;
 pub mod sys;
 pub mod verify;
 
@@ -24,6 +25,7 @@ pub use appcast::{parse_appcast, Appcast, AppcastItem, Delta, Enclosure};
 pub use apply::apply_delta;
 pub use codesign::{gate_reconstructed, OPENAI_TEAM_ID};
 pub use plan::{plan_update, UpdatePlan, UpdateStrategy};
+pub use swap::{quit_codex, relaunch, rollback, swap_in_place};
 pub use verify::{verify_sparkle, SPARKLE_ED_PUBKEY_B64};
 
 #[derive(Debug, thiserror::Error)]
