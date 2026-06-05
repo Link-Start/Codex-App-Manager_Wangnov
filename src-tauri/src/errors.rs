@@ -5,6 +5,8 @@ use thiserror::Error;
 pub enum AppError {
     #[error("the current platform is not supported yet")]
     UnsupportedPlatform,
+    #[error("update engine error: {0}")]
+    Engine(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -13,6 +15,7 @@ impl AppError {
     fn code(&self) -> &'static str {
         match self {
             Self::UnsupportedPlatform => "unsupported_platform",
+            Self::Engine(_) => "engine_error",
             Self::Internal(_) => "internal_error",
         }
     }
