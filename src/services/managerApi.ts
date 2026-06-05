@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
 
 import type { MacStageReport, MacUpdateReport } from "../shared/types";
 
@@ -61,5 +63,19 @@ export const managerApi = {
     return invoke<MacStageReport>("mac_stage_update", {
       simulatedBuild: simulatedBuild ?? null,
     });
+  },
+  // Self-update the manager itself via the Tauri updater (minisign-signed,
+  // full bundle). Endpoints + signing are server-side (see roadmap §4).
+  async checkManagerUpdate(): Promise<string> {
+    if (!hasTauriRuntime()) {
+      return "（浏览器开发态：manager 自更新在桌面 app 内可用）";
+    }
+    const update = await check();
+    if (!update) {
+      return "manager 已是最新版";
+    }
+    await update.downloadAndInstall();
+    await relaunch();
+    return `已安装 ${update.version}，正在重启…`;
   },
 };

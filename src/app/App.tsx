@@ -13,6 +13,8 @@ export function App() {
   const [stage, setStage] = useState<MacStageReport | null>(null);
   const [busy, setBusy] = useState<"plan" | "stage" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [mgrMsg, setMgrMsg] = useState<string | null>(null);
+  const [mgrBusy, setMgrBusy] = useState(false);
 
   const simBuild = sim.trim() === "" ? undefined : Number(sim.trim());
 
@@ -40,6 +42,18 @@ export function App() {
       setBusy(null);
     }
   }, [simBuild]);
+
+  const checkManager = useCallback(async () => {
+    setMgrBusy(true);
+    setMgrMsg(null);
+    try {
+      setMgrMsg(await managerApi.checkManagerUpdate());
+    } catch (cause) {
+      setMgrMsg("检查失败：" + (cause instanceof Error ? cause.message : String(cause)));
+    } finally {
+      setMgrBusy(false);
+    }
+  }, []);
 
   useEffect(() => {
     void check();
@@ -172,6 +186,16 @@ export function App() {
           </p>
         </section>
       ) : null}
+
+      <section className="card">
+        <h2>manager 自更新</h2>
+        <div className="actions">
+          <button className="btn" onClick={checkManager} disabled={mgrBusy}>
+            {mgrBusy ? "检查中…" : "检查 manager 更新"}
+          </button>
+        </div>
+        {mgrMsg ? <p className="note">{mgrMsg}</p> : null}
+      </section>
 
       <footer className="foot">appcast: {report?.appcastUrl ?? "…"} · 仅 macOS · v1 雏形</footer>
     </main>
