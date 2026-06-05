@@ -78,27 +78,26 @@ pub async fn mac_stage_update(
     .map_err(Into::into)
 }
 
-/// Locate the vendored Sparkle `BinaryDelta` tool: an explicit `CODEX_BINARY_DELTA`
-/// override first (testing / a system Sparkle), then the app bundle's resources.
-fn resolve_binary_delta(app: &tauri::AppHandle) -> Result<std::path::PathBuf, CommandError> {
+/// Locate the vendored Sparkle `BinaryDelta` tool, if present: an explicit
+/// `CODEX_BINARY_DELTA` override first (testing / a system Sparkle), then the app
+/// bundle's resources. Returns `None` when it isn't found — a *full*-package
+/// update doesn't need it, so resolution is best-effort and only the delta path
+/// errors on a genuine miss.
+fn resolve_binary_delta(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("CODEX_BINARY_DELTA") {
         let pb = std::path::PathBuf::from(p);
         if pb.exists() {
-            return Ok(pb);
+            return Some(pb);
         }
     }
     for rel in ["resources/BinaryDelta", "BinaryDelta"] {
         if let Ok(res) = app.path().resolve(rel, tauri::path::BaseDirectory::Resource) {
             if res.exists() {
-                return Ok(res);
+                return Some(res);
             }
         }
     }
-    Err(AppError::Engine(
-        "BinaryDelta 工具未找到：请设置 CODEX_BINARY_DELTA，或在发布构建中将其 vendor 到 resources/"
-            .to_string(),
-    )
-    .into())
+    None
 }
 
 /// macOS-only **destructive** update: download+verify → reconstruct → codesign
@@ -116,8 +115,10 @@ pub async fn mac_perform_update(
     if !confirm {
         return Err(AppError::Internal("拒绝执行：破坏性更新必须带显式 confirm".to_string()).into());
     }
-    let binary_delta = resolve_binary_delta(&app)?;
-    tauri::async_runtime::spawn_blocking(move || perform_macos_update(&binary_delta))
+    // Best-effort: a full-package update needs no delta tool, so don't reject the
+    // whole operation when it's absent — only the delta branch requires it.
+    let binary_delta = resolve_binary_delta(&app);
+    tauri::async_runtime::spawn_blocking(move || perform_macos_update(binary_delta))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
         .map_err(Into::into)

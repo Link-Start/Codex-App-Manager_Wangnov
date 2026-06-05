@@ -331,9 +331,11 @@ fn find_dot_app(dir: &Path) -> Option<PathBuf> {
 ///      version (only if Codex had been running). On failure roll back to the
 ///      preserved old bundle and relaunch it.
 ///
-/// `binary_delta` is the path to the vendored Sparkle `BinaryDelta` tool,
-/// resolved by the command layer (it owns the Tauri resource resolver).
-pub fn perform_macos_update(binary_delta: &Path) -> Result<MacPerformReport, AppError> {
+/// `binary_delta` is the optional path to the vendored Sparkle `BinaryDelta`
+/// tool, resolved by the command layer (it owns the Tauri resource resolver).
+/// It is only required for the delta branch; a full-package update ignores it,
+/// so `None` is fine unless an actual delta needs reconstructing.
+pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformReport, AppError> {
     let installed = detect_installed()
         .ok_or_else(|| AppError::Engine("no Codex detected to update".to_string()))?;
     let install_path = PathBuf::from(&installed.path);
@@ -375,7 +377,16 @@ pub fn perform_macos_update(binary_delta: &Path) -> Result<MacPerformReport, App
 
     match plan.strategy {
         UpdateStrategy::Delta { .. } => {
-            apply_delta(binary_delta, &install_path, &out_app, &staged)
+            // Only the delta path needs BinaryDelta; surface a precise error if
+            // it's missing here rather than rejecting every update up front.
+            let tool = binary_delta.as_deref().ok_or_else(|| {
+                AppError::Engine(
+                    "增量(delta)更新需要 Sparkle BinaryDelta 工具，但未找到：\
+                     请设置 CODEX_BINARY_DELTA，或在发布构建中将其 vendor 到 resources/"
+                        .to_string(),
+                )
+            })?;
+            apply_delta(tool, &install_path, &out_app, &staged)
                 .map_err(|e| AppError::Engine(e.to_string()))?;
         }
         UpdateStrategy::Full => {
@@ -399,11 +410,38 @@ pub fn perform_macos_update(binary_delta: &Path) -> Result<MacPerformReport, App
         && gate_reconstructed(&install_path).is_ok();
 
     if healthy {
-        let _ = std::fs::remove_dir_all(&backup);
+        // The new bundle is authentic + correct-version; record provenance.
         let mut store = ProvenanceStore::load();
         store.record(installed.path.clone(), plan.latest_build, "manager-installed");
         let _ = store.save();
-        let relaunched = was_running && relaunch(&install_path).is_ok();
+
+        if was_running {
+            // Relaunch BEFORE discarding the backup: if `open` fails we keep the
+            // backup as a recovery path instead of claiming a clean success. We
+            // do NOT downgrade a healthy, gated install just because auto-launch
+            // failed — the user can launch it manually.
+            if let Err(err) = relaunch(&install_path) {
+                return Ok(MacPerformReport {
+                    up_to_date: false,
+                    from_build: installed.build,
+                    to_build: plan.latest_build,
+                    strategy: strategy_label(&plan.strategy),
+                    installed_path: installed.path,
+                    verified: true,
+                    relaunched: false,
+                    rolled_back: false,
+                    message: format!(
+                        "已替换为 build {}，但自动重启失败（{err}）：请手动启动 Codex；\
+                         旧版本备份暂留于 {}",
+                        plan.latest_build,
+                        backup.display()
+                    ),
+                });
+            }
+        }
+
+        // Not running, or relaunched cleanly → the backup is no longer needed.
+        let _ = std::fs::remove_dir_all(&backup);
         Ok(MacPerformReport {
             up_to_date: false,
             from_build: installed.build,
@@ -411,7 +449,7 @@ pub fn perform_macos_update(binary_delta: &Path) -> Result<MacPerformReport, App
             strategy: strategy_label(&plan.strategy),
             installed_path: installed.path,
             verified: true,
-            relaunched,
+            relaunched: was_running,
             rolled_back: false,
             message: format!("已更新 build {} → {}", installed.build, plan.latest_build),
         })
