@@ -46,8 +46,11 @@ pub fn quit_codex(timeout_secs: u64) -> Result<(), EngineError> {
     ))
 }
 
+/// Are `a` and `b` on the same filesystem volume? This is the precondition for
+/// an atomic `rename` swap. Exposed so callers can pre-flight it BEFORE taking
+/// destructive steps (e.g. quitting the app) rather than discovering it mid-swap.
 #[cfg(unix)]
-fn same_volume(a: &Path, b: &Path) -> bool {
+pub fn same_volume(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
@@ -59,7 +62,7 @@ fn same_volume(a: &Path, b: &Path) -> bool {
 // it must compile for Windows even though the macOS swap path is never invoked
 // there (Windows has its own installer path).
 #[cfg(not(unix))]
-fn same_volume(_a: &Path, _b: &Path) -> bool {
+pub fn same_volume(_a: &Path, _b: &Path) -> bool {
     true
 }
 

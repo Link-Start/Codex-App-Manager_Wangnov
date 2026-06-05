@@ -398,10 +398,26 @@ pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformR
     gate_reconstructed(&out_app)
         .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝替换）: {e}")))?;
 
-    // 4) graceful quit (never force-kill), then 5) atomic same-volume swap.
+    // 4a) pre-flight the atomic-swap precondition BEFORE quitting Codex, so a
+    //     cross-volume staging dir fails fast WITHOUT closing the user's app.
+    let install_parent = install_path.parent().unwrap_or(install_path.as_path());
+    if !codex_mac_engine::swap::same_volume(&out_app, install_parent) {
+        return Err(AppError::Engine(
+            "暂存目录与安装根不在同一卷，无法原子替换：请确保 TMPDIR 与安装根同卷".to_string(),
+        ));
+    }
+
+    // 4b) graceful quit (never force-kill), then 5) atomic same-volume swap. If
+    //     the swap fails after the quit, swap_in_place has restored the old
+    //     bundle in place — bring the user's app back before surfacing the error.
     let was_running = codex_running();
     quit_codex(30).map_err(|e| AppError::Engine(e.to_string()))?;
-    swap_in_place(&install_path, &out_app, &backup).map_err(|e| AppError::Engine(e.to_string()))?;
+    if let Err(err) = swap_in_place(&install_path, &out_app, &backup) {
+        if was_running {
+            let _ = relaunch(&install_path);
+        }
+        return Err(AppError::Engine(err.to_string()));
+    }
 
     // 6) filesystem health check on the installed root.
     let healthy = detect_installed()

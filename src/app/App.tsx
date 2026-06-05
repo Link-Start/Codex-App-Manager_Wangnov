@@ -60,8 +60,11 @@ export function App() {
     const target = stage
       ? `build ${stage.latestBuild}（${stage.strategy}）`
       : "最新版本";
+    // Name the ACTUAL detected install path (could be ~/Applications) so the
+    // confirmation matches what the backend will replace.
+    const path = status?.installed?.path ?? "/Applications/Codex.app";
     const ok = window.confirm(
-      `即将用 ${target} 替换 /Applications/Codex.app：\n\n` +
+      `即将用 ${target} 替换 ${path}：\n\n` +
         "· 会请求 Codex 优雅退出（绝不强杀，正在进行的任务可先保存）\n" +
         "· 替换前会复验 Apple 代码签名（发布者 = OpenAI）\n" +
         "· 失败会自动回滚到当前版本\n\n确定现在执行吗？",
@@ -81,7 +84,7 @@ export function App() {
     } finally {
       setBusy(null);
     }
-  }, [stage]);
+  }, [stage, status]);
 
   const adopt = useCallback(async () => {
     setError(null);
@@ -151,7 +154,13 @@ export function App() {
             <label>模拟已装 build(演示用 · 留空=真实)</label>
             <input
               value={sim}
-              onChange={(event) => setSim(event.target.value)}
+              onChange={(event) => {
+                setSim(event.target.value);
+                // A prior stage was computed for a different basis — invalidate
+                // it so it can never enable the destructive apply.
+                setStage(null);
+                setPerform(null);
+              }}
               placeholder="例如 3511"
               inputMode="numeric"
             />
