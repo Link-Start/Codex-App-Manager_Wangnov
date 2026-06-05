@@ -5,7 +5,9 @@ use crate::app::snapshot::ManagerSnapshot;
 use crate::app::update_check::PayloadUpdateCheck;
 use crate::domain::health::HealthReport;
 use crate::domain::operations::{OperationKind, OperationPlan};
-use crate::app::mac_update::{plan_macos_update, MacUpdateReport, PROD_ARM64_APPCAST};
+use crate::app::mac_update::{
+    plan_macos_update, stage_macos_update, MacStageReport, MacUpdateReport, PROD_ARM64_APPCAST,
+};
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
 use crate::state::ManagerState;
@@ -50,11 +52,31 @@ pub fn run_health_check(state: State<'_, ManagerState>) -> Result<HealthReport, 
 /// macOS-only: detect the installed Codex build, read the Sparkle appcast, and
 /// return an update plan (delta vs full). Read-only — performs no install.
 #[tauri::command]
-pub fn mac_plan_update(state: State<'_, ManagerState>) -> Result<MacUpdateReport, CommandError> {
+pub fn mac_plan_update(
+    state: State<'_, ManagerState>,
+    simulated_build: Option<u64>,
+) -> Result<MacUpdateReport, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Macos) {
         return Err(AppError::UnsupportedPlatform.into());
     }
     // TODO(mirror §4.4): point at the mirror's rewritten appcast, not oaistatic.
-    plan_macos_update(PROD_ARM64_APPCAST).map_err(Into::into)
+    plan_macos_update(PROD_ARM64_APPCAST, simulated_build).map_err(Into::into)
+}
+
+/// macOS-only: plan + download + size/EdDSA verify into staging. Non-destructive
+/// (no apply/swap). Runs the blocking download off the main thread.
+#[tauri::command]
+pub async fn mac_stage_update(
+    simulated_build: Option<u64>,
+) -> Result<MacStageReport, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        stage_macos_update(PROD_ARM64_APPCAST, simulated_build)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
 }
 
