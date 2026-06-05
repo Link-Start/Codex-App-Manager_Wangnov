@@ -57,12 +57,14 @@ export function App() {
   }, [simBuild]);
 
   const doPerform = useCallback(async () => {
-    const target = stage
-      ? `build ${stage.latestBuild}（${stage.strategy}）`
-      : "最新版本";
+    const installed = status?.installed;
+    if (!installed || !stage) {
+      return;
+    }
+    const target = `build ${stage.latestBuild}（${stage.strategy}）`;
     // Name the ACTUAL detected install path (could be ~/Applications) so the
     // confirmation matches what the backend will replace.
-    const path = status?.installed?.path ?? "/Applications/Codex.app";
+    const path = installed.path;
     const ok = window.confirm(
       `即将用 ${target} 替换 ${path}：\n\n` +
         "· 会请求 Codex 优雅退出（绝不强杀，正在进行的任务可先保存）\n" +
@@ -75,7 +77,11 @@ export function App() {
     setBusy("perform");
     setError(null);
     try {
-      const result = await managerApi.macPerformUpdate(true);
+      const result = await managerApi.macPerformUpdate({
+        fromBuild: installed.build,
+        toBuild: stage.latestBuild,
+        path: installed.path,
+      });
       setPerform(result);
       // The install is now manager-managed and on a new build — refresh status.
       await managerApi.macStatus().then(setStatus).catch(() => undefined);

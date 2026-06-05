@@ -258,6 +258,17 @@ pub struct MacPerformReport {
     pub message: String,
 }
 
+/// What the user saw + consented to at stage/confirm time. `perform` re-checks
+/// reality against this BEFORE the destructive swap, so a Codex self-update, a
+/// moved install, or an appcast that advanced between confirm and execute can't
+/// silently redirect the swap to a target the user never approved.
+#[derive(Debug, Clone)]
+pub struct PerformExpectation {
+    pub from_build: u64,
+    pub to_build: u64,
+    pub install_path: String,
+}
+
 /// Unpack a Sparkle macOS full-update `.zip` and surface the `.app` inside it.
 /// `ditto -x -k` is used (not `unzip`) because it preserves the extended
 /// attributes and resource metadata a code signature depends on, so the
@@ -340,9 +351,29 @@ fn reconstruct_full(appcast: &Appcast, work: &Path, out_app: &Path) -> Result<()
 /// tool, resolved by the command layer (it owns the Tauri resource resolver).
 /// It is only required for the delta branch; a full-package update ignores it,
 /// so `None` is fine unless an actual delta needs reconstructing.
-pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformReport, AppError> {
+pub fn perform_macos_update(
+    binary_delta: Option<PathBuf>,
+    expected: PerformExpectation,
+) -> Result<MacPerformReport, AppError> {
     let installed = detect_installed()
         .ok_or_else(|| AppError::Engine("no Codex detected to update".to_string()))?;
+
+    // Consent integrity: the destructive swap must target exactly what the user
+    // saw + confirmed. If Codex self-updated (Sparkle), moved, or staging is
+    // stale, refuse rather than act on a stale consent.
+    if installed.path != expected.install_path {
+        return Err(AppError::Engine(format!(
+            "安装位置已变化（确认时 {}，现在 {}）：请重新检查后再试",
+            expected.install_path, installed.path
+        )));
+    }
+    if installed.build != expected.from_build {
+        return Err(AppError::Engine(format!(
+            "已装版本已变化（确认时 build {}，现在 build {}）：请重新检查后再试",
+            expected.from_build, installed.build
+        )));
+    }
+
     let install_path = PathBuf::from(&installed.path);
 
     let appcast_url = appcast_for_arch(&installed.arch);
@@ -350,6 +381,14 @@ pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformR
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, installed.build)
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+
+    // The appcast must still point at the build the user confirmed.
+    if plan.latest_build != expected.to_build {
+        return Err(AppError::Engine(format!(
+            "更新目标已变化（确认时 build {}，现在 build {}）：请重新检查后再试",
+            expected.to_build, plan.latest_build
+        )));
+    }
 
     if plan.up_to_date {
         return Ok(MacPerformReport {

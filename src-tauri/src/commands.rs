@@ -7,7 +7,7 @@ use crate::domain::health::HealthReport;
 use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::app::mac_update::{
     perform_macos_update, plan_macos_update, stage_macos_update, MacInstallStatus, MacPerformReport,
-    MacStageReport, MacUpdateReport,
+    MacStageReport, MacUpdateReport, PerformExpectation,
 };
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
@@ -108,6 +108,9 @@ fn resolve_binary_delta(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 pub async fn mac_perform_update(
     app: tauri::AppHandle,
     confirm: bool,
+    expected_from_build: u64,
+    expected_to_build: u64,
+    expected_path: String,
 ) -> Result<MacPerformReport, CommandError> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
@@ -118,7 +121,15 @@ pub async fn mac_perform_update(
     // Best-effort: a full-package update needs no delta tool, so don't reject the
     // whole operation when it's absent — only the delta branch requires it.
     let binary_delta = resolve_binary_delta(&app);
-    tauri::async_runtime::spawn_blocking(move || perform_macos_update(binary_delta))
+    // The user confirmed a specific target; the backend re-verifies reality still
+    // matches before the destructive swap (guards a TOCTOU vs appcast refresh /
+    // Codex self-update between confirm and execute).
+    let expected = PerformExpectation {
+        from_build: expected_from_build,
+        to_build: expected_to_build,
+        install_path: expected_path,
+    };
+    tauri::async_runtime::spawn_blocking(move || perform_macos_update(binary_delta, expected))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
         .map_err(Into::into)

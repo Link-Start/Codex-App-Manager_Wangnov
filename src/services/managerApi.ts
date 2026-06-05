@@ -71,22 +71,33 @@ export const managerApi = {
   },
   // Destructive: reconstruct + codesign-gate + atomic swap + relaunch (or
   // rollback). `confirm` must be true; the backend rejects it otherwise. Guarded
-  // by a UI second confirmation before this is ever called.
-  macPerformUpdate(confirm: boolean): Promise<MacPerformReport> {
+  // by a UI second confirmation before this is ever called. The expected target
+  // (from/to build + install path the user confirmed) is sent so the backend can
+  // refuse if reality drifted (appcast refresh / Codex self-update) since confirm.
+  macPerformUpdate(expected: {
+    fromBuild: number;
+    toBuild: number;
+    path: string;
+  }): Promise<MacPerformReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
         upToDate: false,
-        fromBuild: 3511,
-        toBuild: 3575,
+        fromBuild: expected.fromBuild,
+        toBuild: expected.toBuild,
         strategy: "delta-from-3511",
-        installedPath: "/Applications/Codex.app",
+        installedPath: expected.path,
         verified: true,
         relaunched: true,
         rolledBack: false,
         message: "（浏览器开发态：真实替换仅在桌面 app 内执行）",
       });
     }
-    return invoke<MacPerformReport>("mac_perform_update", { confirm });
+    return invoke<MacPerformReport>("mac_perform_update", {
+      confirm: true,
+      expectedFromBuild: expected.fromBuild,
+      expectedToBuild: expected.toBuild,
+      expectedPath: expected.path,
+    });
   },
   // Self-update the manager itself via the Tauri updater (minisign-signed,
   // full bundle). Endpoints + signing are server-side (see roadmap §4).
