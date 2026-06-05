@@ -121,7 +121,7 @@ export function App() {
   }, []);
 
   const plan = report?.plan ?? null;
-  const canStage = Boolean(plan) && !plan?.upToDate && busy === null;
+  const canStage = Boolean(plan) && !plan?.upToDate && busy === null && !mgrBusy;
   // Only after a real, EdDSA-verified stage (no sim-build preview) may the
   // destructive swap run — the delta basis must be the true installed bundle.
   // This is an UPDATE flow, so it also requires a detected install: without one
@@ -131,7 +131,8 @@ export function App() {
     !stage?.upToDate &&
     Boolean(status?.installed) &&
     simBuild === undefined &&
-    busy === null;
+    busy === null &&
+    !mgrBusy;
 
   return (
     <main className="wrap">
@@ -179,14 +180,14 @@ export function App() {
         {status?.status === "external" ? (
           <div className="adopt">
             <span>发现外部安装的 Codex（官方 / 商店）。纳入 manager 管理后由其负责后续更新。</span>
-            <button className="btn" onClick={adopt} disabled={busy !== null}>
+            <button className="btn" onClick={adopt} disabled={busy !== null || mgrBusy}>
               纳管
             </button>
           </div>
         ) : null}
 
         <div className="actions">
-          <button className="btn" onClick={check} disabled={busy !== null}>
+          <button className="btn" onClick={check} disabled={busy !== null || mgrBusy}>
             {busy === "plan" ? "检查中…" : "检查更新"}
           </button>
           <button className="btn primary" onClick={doStage} disabled={!canStage}>
@@ -325,8 +326,8 @@ export function App() {
       <section className="card">
         <h2>manager 自更新</h2>
         <div className="actions">
-          <button className="btn" onClick={checkManager} disabled={mgrBusy}>
-            {mgrBusy ? "检查中…" : "检查 manager 更新"}
+          <button className="btn" onClick={checkManager} disabled={mgrBusy || busy !== null}>
+            {mgrBusy ? "检查中…" : busy !== null ? "更新进行中…" : "检查 manager 更新"}
           </button>
         </div>
         {mgrMsg ? <p className="note">{mgrMsg}</p> : null}

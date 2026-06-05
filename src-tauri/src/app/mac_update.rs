@@ -476,10 +476,16 @@ pub fn perform_macos_update(
         && gate_reconstructed(&install_path).is_ok();
 
     if healthy {
-        // The new bundle is authentic + correct-version; record provenance.
+        // The new bundle is authentic + correct-version; record provenance. If
+        // the store can't be written (disk full / unwritable data dir), the
+        // update still succeeded — but surface it, since status would otherwise
+        // keep classifying this now-manager install as "external".
         let mut store = ProvenanceStore::load();
         store.record(installed.path.clone(), plan.latest_build, "manager-installed");
-        let _ = store.save();
+        let save_note = match store.save() {
+            Ok(()) => String::new(),
+            Err(e) => format!("；但托管记录保存失败（{e}），安装暂仍会被识别为外部"),
+        };
 
         if was_running {
             // Relaunch BEFORE discarding the backup: if `open` fails we keep the
@@ -498,9 +504,10 @@ pub fn perform_macos_update(
                     rolled_back: false,
                     message: format!(
                         "已替换为 build {}，但自动重启失败（{err}）：请手动启动 Codex；\
-                         旧版本备份暂留于 {}",
+                         旧版本备份暂留于 {}{}",
                         plan.latest_build,
-                        backup.display()
+                        backup.display(),
+                        save_note
                     ),
                 });
             }
@@ -517,7 +524,10 @@ pub fn perform_macos_update(
             verified: true,
             relaunched: was_running,
             rolled_back: false,
-            message: format!("已更新 build {} → {}", installed.build, plan.latest_build),
+            message: format!(
+                "已更新 build {} → {}{}",
+                installed.build, plan.latest_build, save_note
+            ),
         })
     } else {
         rollback(&install_path, &backup)
