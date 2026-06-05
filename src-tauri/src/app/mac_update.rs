@@ -51,10 +51,57 @@ pub struct MacStageReport {
     pub verified: bool,
 }
 
-/// arm64 Sparkle appcast, served by the mirror (CN-reachable; enclosure URLs
-/// rewritten to R2/S3). EdDSA signatures are preserved (they sign bytes, not
-/// URLs), so the pinned-key verification still passes against mirrored files.
+/// arm64 / x64 Sparkle appcasts, served by the mirror (CN-reachable; enclosure
+/// URLs rewritten to R2/S3). EdDSA signatures are preserved (they sign bytes,
+/// not URLs), so the pinned-key verification still passes against mirrored files.
 pub const PROD_ARM64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast.xml";
+pub const PROD_X64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast-x64.xml";
+
+/// The mirror appcast matching the host architecture — you manage the Codex for
+/// the machine you are on.
+pub fn host_appcast() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => PROD_X64_APPCAST,
+        _ => PROD_ARM64_APPCAST,
+    }
+}
+
+fn parse_macos_version(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+fn host_macos_version() -> Option<(u32, u32)> {
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_macos_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Reject staging/installing an update the host macOS is too old to run. If the
+/// requirement or host version can't be parsed, we don't block.
+fn require_os_supported(required: Option<&str>) -> Result<(), AppError> {
+    let (Some(req), Some(host)) = (
+        required.and_then(parse_macos_version),
+        host_macos_version(),
+    ) else {
+        return Ok(());
+    };
+    if host >= req {
+        Ok(())
+    } else {
+        Err(AppError::Engine(format!(
+            "this macOS ({}.{}) is older than the latest Codex requires ({}.{}+)",
+            host.0, host.1, req.0, req.1
+        )))
+    }
+}
 
 fn effective_build(simulated_build: Option<u64>, installed: &Option<InstalledCodex>) -> u64 {
     simulated_build
@@ -74,6 +121,10 @@ pub fn plan_macos_update(
     let xml = sys::fetch_text(appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed));
+
+    if let Some(latest) = appcast.latest() {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
+    }
 
     Ok(MacUpdateReport {
         appcast_url: appcast_url.to_string(),
@@ -118,6 +169,10 @@ pub fn stage_macos_update(
             staged_path: None,
             verified: false,
         });
+    }
+
+    if let Some(latest) = appcast.latest() {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
     }
 
     let signature = plan

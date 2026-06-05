@@ -46,12 +46,21 @@ pub fn quit_codex(timeout_secs: u64) -> Result<(), EngineError> {
     ))
 }
 
+#[cfg(unix)]
 fn same_volume(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
         _ => false,
     }
+}
+
+// The crate is an unconditional dependency of the cross-platform Tauri app, so
+// it must compile for Windows even though the macOS swap path is never invoked
+// there (Windows has its own installer path).
+#[cfg(not(unix))]
+fn same_volume(_a: &Path, _b: &Path) -> bool {
+    true
 }
 
 /// Atomically replace `install_app` with `new_app`, preserving the previous
