@@ -31,7 +31,7 @@
     "copyright": "Copyright (c) 2026 Wangnov",
     "shortDescription": "Codex App mirror install and update manager.",
     "longDescription": "A manager app for installing and updating mirrored official Codex desktop app packages.",
-    "targets": ["nsis", "dmg"],
+    "targets": ["nsis", "dmg", "app"],
     "windows": {
       "nsis": {
         "displayLanguageSelector": false,

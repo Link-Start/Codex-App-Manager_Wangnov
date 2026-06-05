@@ -45,6 +45,49 @@ fn candidate_app_paths() -> Vec<String> {
     paths
 }
 
+/// Best-effort architecture of an installed Codex.app, read from its Mach-O
+/// executable via `lipo`. Returns the host arch when the bundle is universal,
+/// otherwise the bundle's single arch (e.g. an Intel/Rosetta install on Apple
+/// Silicon reports `x86_64`). Values match `lipo` naming: `arm64` / `x86_64`.
+pub fn app_arch(app: &str) -> Option<String> {
+    let plist = format!("{app}/Contents/Info.plist");
+    let exe = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleExecutable", &plist])
+        .output()
+        .ok()?;
+    if !exe.status.success() {
+        return None;
+    }
+    let exe_name = String::from_utf8_lossy(&exe.stdout).trim().to_string();
+    if exe_name.is_empty() {
+        return None;
+    }
+    let output = Command::new("lipo")
+        .args(["-archs", &format!("{app}/Contents/MacOS/{exe_name}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let archs: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    if archs.is_empty() {
+        return None;
+    }
+    let host = if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    if archs.iter().any(|a| a == host) {
+        Some(host.to_string())
+    } else {
+        Some(archs[0].clone())
+    }
+}
+
 fn read_bundle_build(app: &str) -> Option<u64> {
     let plist = format!("{app}/Contents/Info.plist");
     if !Path::new(&plist).exists() {

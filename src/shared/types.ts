@@ -4,6 +4,7 @@ export type Architecture = "x64" | "arm64" | "unknown";
 export interface InstalledCodex {
   path: string;
   build: number;
+  arch: string;
 }
 
 export interface UpdateStrategy {

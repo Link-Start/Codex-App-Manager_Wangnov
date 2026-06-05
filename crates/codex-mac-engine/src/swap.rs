@@ -117,10 +117,13 @@ pub fn rollback(install_app: &Path, backup_app: &Path) -> Result<(), EngineError
 
 /// Relaunch Codex from the install root.
 pub fn relaunch(install_app: &Path) -> Result<(), EngineError> {
-    Command::new("open")
+    let status = Command::new("open")
         .arg(install_app)
         .status()
         .map_err(|e| EngineError::Io(format!("open Codex: {e}")))?;
+    if !status.success() {
+        return Err(EngineError::Io(format!("open Codex exited with {status}")));
+    }
     Ok(())
 }
 

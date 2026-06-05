@@ -6,8 +6,7 @@ use crate::app::update_check::PayloadUpdateCheck;
 use crate::domain::health::HealthReport;
 use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::app::mac_update::{
-    host_appcast, plan_macos_update, stage_macos_update, MacInstallStatus, MacStageReport,
-    MacUpdateReport,
+    plan_macos_update, stage_macos_update, MacInstallStatus, MacStageReport, MacUpdateReport,
 };
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
@@ -60,7 +59,7 @@ pub fn mac_plan_update(
     if !matches!(state.target.os, OperatingSystem::Macos) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    plan_macos_update(host_appcast(), simulated_build).map_err(Into::into)
+    plan_macos_update(simulated_build).map_err(Into::into)
 }
 
 /// macOS-only: plan + download + size/EdDSA verify into staging. Non-destructive
@@ -72,10 +71,7 @@ pub async fn mac_stage_update(
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    let appcast = host_appcast();
-    tauri::async_runtime::spawn_blocking(move || {
-        stage_macos_update(appcast, simulated_build)
-    })
+    tauri::async_runtime::spawn_blocking(move || stage_macos_update(simulated_build))
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
     .map_err(Into::into)

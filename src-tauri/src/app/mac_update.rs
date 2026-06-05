@@ -25,6 +25,8 @@ use crate::errors::AppError;
 pub struct InstalledCodex {
     pub path: String,
     pub build: u64,
+    /// `arm64` / `x86_64` of the installed bundle (drives appcast selection).
+    pub arch: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,13 +59,22 @@ pub struct MacStageReport {
 pub const PROD_ARM64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast.xml";
 pub const PROD_X64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast-x64.xml";
 
-/// The mirror appcast matching the host architecture — you manage the Codex for
-/// the machine you are on.
-pub fn host_appcast() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => PROD_X64_APPCAST,
-        _ => PROD_ARM64_APPCAST,
+fn appcast_for_arch(arch: &str) -> &'static str {
+    match arch {
+        "x86_64" | "x64" => PROD_X64_APPCAST,
+        _ => PROD_ARM64_APPCAST, // arm64 / aarch64 / default
     }
+}
+
+/// Choose the mirror appcast matching the INSTALLED Codex's architecture (so a
+/// delta applies to the right base bundle), falling back to the host arch when
+/// nothing is installed yet.
+fn chosen_appcast(installed: &Option<InstalledCodex>) -> &'static str {
+    let arch = installed
+        .as_ref()
+        .map(|i| i.arch.as_str())
+        .unwrap_or(std::env::consts::ARCH);
+    appcast_for_arch(arch)
 }
 
 fn parse_macos_version(s: &str) -> Option<(u32, u32)> {
@@ -110,14 +121,15 @@ fn effective_build(simulated_build: Option<u64>, installed: &Option<InstalledCod
 }
 
 fn detect_installed() -> Option<InstalledCodex> {
-    sys::installed_codex_build().map(|(path, build)| InstalledCodex { path, build })
+    sys::installed_codex_build().map(|(path, build)| {
+        let arch = sys::app_arch(&path).unwrap_or_else(|| std::env::consts::ARCH.to_string());
+        InstalledCodex { path, build, arch }
+    })
 }
 
-pub fn plan_macos_update(
-    appcast_url: &str,
-    simulated_build: Option<u64>,
-) -> Result<MacUpdateReport, AppError> {
+pub fn plan_macos_update(simulated_build: Option<u64>) -> Result<MacUpdateReport, AppError> {
     let installed = detect_installed();
+    let appcast_url = chosen_appcast(&installed);
     let xml = sys::fetch_text(appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed));
@@ -147,11 +159,9 @@ fn strategy_label(strategy: &UpdateStrategy) -> String {
     }
 }
 
-pub fn stage_macos_update(
-    appcast_url: &str,
-    simulated_build: Option<u64>,
-) -> Result<MacStageReport, AppError> {
+pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport, AppError> {
     let installed = detect_installed();
+    let appcast_url = chosen_appcast(&installed);
     let xml = sys::fetch_text(appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed))
