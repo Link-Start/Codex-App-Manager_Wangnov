@@ -170,7 +170,7 @@ mod tests {
             arch: Architecture::X64,
             label: "Windows / X64".to_string(),
         };
-        let plan = InstallPlanner::default().plan(
+        let plan = InstallPlanner.plan(
             OperationKind::Install,
             &target,
             &settings(),
@@ -188,7 +188,7 @@ mod tests {
             arch: Architecture::Arm64,
             label: "Macos / Arm64".to_string(),
         };
-        let plan = InstallPlanner::default().plan(
+        let plan = InstallPlanner.plan(
             OperationKind::Install,
             &target,
             &settings(),

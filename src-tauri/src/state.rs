@@ -25,7 +25,7 @@ impl ManagerState {
             target,
             settings,
             endpoints,
-            planner: InstallPlanner::default(),
+            planner: InstallPlanner,
         }
     }
 
