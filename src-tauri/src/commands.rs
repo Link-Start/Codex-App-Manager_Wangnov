@@ -6,7 +6,8 @@ use crate::app::update_check::PayloadUpdateCheck;
 use crate::domain::health::HealthReport;
 use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::app::mac_update::{
-    plan_macos_update, stage_macos_update, MacStageReport, MacUpdateReport, PROD_ARM64_APPCAST,
+    plan_macos_update, stage_macos_update, MacInstallStatus, MacStageReport, MacUpdateReport,
+    PROD_ARM64_APPCAST,
 };
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
@@ -78,5 +79,23 @@ pub async fn mac_stage_update(
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
     .map_err(Into::into)
+}
+
+/// macOS-only: classify the installed Codex (managed / external / none).
+#[tauri::command]
+pub fn mac_status(state: State<'_, ManagerState>) -> Result<MacInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Macos) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(crate::app::mac_update::mac_install_status())
+}
+
+/// macOS-only: adopt the detected external install (after explicit user consent).
+#[tauri::command]
+pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Macos) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    crate::app::mac_update::mac_adopt().map_err(Into::into)
 }
 

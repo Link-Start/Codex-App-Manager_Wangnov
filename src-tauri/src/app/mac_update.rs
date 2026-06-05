@@ -17,6 +17,7 @@ use codex_mac_engine::{
     download, parse_appcast, plan_update, sys, verify_sparkle, UpdatePlan, UpdateStrategy,
 };
 
+use crate::app::provenance::ProvenanceStore;
 use crate::errors::AppError;
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,4 +169,35 @@ pub fn stage_macos_update(
         staged_path: Some(dest.to_string_lossy().into_owned()),
         verified: true,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacInstallStatus {
+    pub installed: Option<InstalledCodex>,
+    /// "managed" | "external" | "none"
+    pub status: String,
+}
+
+/// Classify the installed Codex against our provenance store.
+pub fn mac_install_status() -> MacInstallStatus {
+    let installed = detect_installed();
+    let store = ProvenanceStore::load();
+    let status = match &installed {
+        None => "none",
+        Some(codex) if store.is_managed(&codex.path) => "managed",
+        Some(_) => "external",
+    }
+    .to_string();
+    MacInstallStatus { installed, status }
+}
+
+/// Adopt the detected install — record provenance after explicit user consent.
+pub fn mac_adopt() -> Result<MacInstallStatus, AppError> {
+    let installed = detect_installed()
+        .ok_or_else(|| AppError::Internal("no Codex detected to adopt".to_string()))?;
+    let mut store = ProvenanceStore::load();
+    store.record(installed.path.clone(), installed.build, "adopted-external");
+    store.save()?;
+    Ok(mac_install_status())
 }
