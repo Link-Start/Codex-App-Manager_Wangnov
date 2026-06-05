@@ -13,11 +13,14 @@
 //!   - download, EdDSA verify, BinaryDelta apply, atomic swap, relaunch
 
 pub mod appcast;
+pub mod download;
 pub mod plan;
 pub mod sys;
+pub mod verify;
 
 pub use appcast::{parse_appcast, Appcast, AppcastItem, Delta, Enclosure};
 pub use plan::{plan_update, UpdatePlan, UpdateStrategy};
+pub use verify::{verify_sparkle, SPARKLE_ED_PUBKEY_B64};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -25,6 +28,8 @@ pub enum EngineError {
     Parse(String),
     #[error("appcast contained no usable items")]
     EmptyAppcast,
+    #[error("signature verification error: {0}")]
+    Verify(String),
     #[error("io error: {0}")]
     Io(String),
 }
