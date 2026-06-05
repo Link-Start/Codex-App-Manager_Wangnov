@@ -42,3 +42,10 @@ export interface MacStageReport {
   stagedPath: string | null;
   verified: boolean;
 }
+
+export type InstallClass = "managed" | "external" | "none";
+
+export interface MacInstallStatus {
+  installed: InstalledCodex | null;
+  status: InstallClass;
+}

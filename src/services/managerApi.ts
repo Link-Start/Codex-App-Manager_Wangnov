@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 
-import type { MacStageReport, MacUpdateReport } from "../shared/types";
+import type { MacInstallStatus, MacStageReport, MacUpdateReport } from "../shared/types";
 
 declare global {
   interface Window {
@@ -77,5 +77,17 @@ export const managerApi = {
     await update.downloadAndInstall();
     await relaunch();
     return `已安装 ${update.version}，正在重启…`;
+  },
+  macStatus(): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ installed: null, status: "none" });
+    }
+    return invoke<MacInstallStatus>("mac_status");
+  },
+  macAdopt(): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ installed: null, status: "managed" });
+    }
+    return invoke<MacInstallStatus>("mac_adopt");
   },
 };

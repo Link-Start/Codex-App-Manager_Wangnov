@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { managerApi } from "../services/managerApi";
-import type { MacStageReport, MacUpdateReport } from "../shared/types";
+import type { InstallClass, MacInstallStatus, MacStageReport, MacUpdateReport } from "../shared/types";
 
 function mib(bytes: number): string {
   return (bytes / 1_048_576).toFixed(1);
+}
+
+function statusLabel(status: InstallClass): string {
+  return status === "managed" ? "manager 托管" : status === "external" ? "外部安装" : "未安装";
 }
 
 export function App() {
   const [sim, setSim] = useState("");
   const [report, setReport] = useState<MacUpdateReport | null>(null);
   const [stage, setStage] = useState<MacStageReport | null>(null);
+  const [status, setStatus] = useState<MacInstallStatus | null>(null);
   const [busy, setBusy] = useState<"plan" | "stage" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [mgrMsg, setMgrMsg] = useState<string | null>(null);
@@ -43,6 +48,15 @@ export function App() {
     }
   }, [simBuild]);
 
+  const adopt = useCallback(async () => {
+    setError(null);
+    try {
+      setStatus(await managerApi.macAdopt());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, []);
+
   const checkManager = useCallback(async () => {
     setMgrBusy(true);
     setMgrMsg(null);
@@ -57,6 +71,7 @@ export function App() {
 
   useEffect(() => {
     void check();
+    void managerApi.macStatus().then(setStatus).catch(() => undefined);
     // run once on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -81,8 +96,13 @@ export function App() {
           <div className="field">
             <label>已装 Codex</label>
             <div className="val">
-              {report?.installed ? `build ${report.installed.build}` : "未检测到"}
-              {report?.installed ? <span className="path">{report.installed.path}</span> : null}
+              <span>
+                {status?.installed ? `build ${status.installed.build}` : "未检测到"}
+                {status ? (
+                  <span className={`statuspill ${status.status}`}>{statusLabel(status.status)}</span>
+                ) : null}
+              </span>
+              {status?.installed ? <span className="path">{status.installed.path}</span> : null}
             </div>
           </div>
           <div className="field">
@@ -95,6 +115,16 @@ export function App() {
             />
           </div>
         </div>
+
+        {status?.status === "external" ? (
+          <div className="adopt">
+            <span>发现外部安装的 Codex（官方 / 商店）。纳入 manager 管理后由其负责后续更新。</span>
+            <button className="btn" onClick={adopt} disabled={busy !== null}>
+              纳管
+            </button>
+          </div>
+        ) : null}
+
         <div className="actions">
           <button className="btn" onClick={check} disabled={busy !== null}>
             {busy === "plan" ? "检查中…" : "检查更新"}

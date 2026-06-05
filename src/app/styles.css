@@ -215,6 +215,48 @@ body {
   background: var(--accent-2);
 }
 
+.statuspill {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.statuspill.managed {
+  color: #06281c;
+  background: var(--accent);
+}
+
+.statuspill.external {
+  color: #1a1205;
+  background: #d9a441;
+}
+
+.statuspill.none {
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
+.adopt {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: 10px;
+  background: rgba(217, 164, 65, 0.1);
+  border: 1px solid rgba(217, 164, 65, 0.35);
+  font-size: 13px;
+  color: #e8d6b0;
+}
+
+.adopt .btn {
+  flex: 0 0 auto;
+}
+
 .kv {
   list-style: none;
   margin: 0;
