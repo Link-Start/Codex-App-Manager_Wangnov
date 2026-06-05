@@ -13,12 +13,16 @@
 //!   - download, EdDSA verify, BinaryDelta apply, atomic swap, relaunch
 
 pub mod appcast;
+pub mod apply;
+pub mod codesign;
 pub mod download;
 pub mod plan;
 pub mod sys;
 pub mod verify;
 
 pub use appcast::{parse_appcast, Appcast, AppcastItem, Delta, Enclosure};
+pub use apply::apply_delta;
+pub use codesign::{gate_reconstructed, OPENAI_TEAM_ID};
 pub use plan::{plan_update, UpdatePlan, UpdateStrategy};
 pub use verify::{verify_sparkle, SPARKLE_ED_PUBKEY_B64};
 
@@ -30,6 +34,8 @@ pub enum EngineError {
     EmptyAppcast,
     #[error("signature verification error: {0}")]
     Verify(String),
+    #[error("delta apply error: {0}")]
+    Apply(String),
     #[error("io error: {0}")]
     Io(String),
 }
