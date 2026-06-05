@@ -17,7 +17,8 @@ use serde::Serialize;
 
 use codex_mac_engine::{
     apply_delta, download, gate_reconstructed, parse_appcast, plan_update, quit_codex, relaunch,
-    rollback, swap::codex_running, swap_in_place, sys, verify_sparkle, UpdatePlan, UpdateStrategy,
+    rollback, swap::codex_running, swap_in_place, sys, verify_sparkle, Appcast, UpdatePlan,
+    UpdateStrategy,
 };
 
 use crate::app::provenance::ProvenanceStore;
@@ -302,6 +303,20 @@ fn find_dot_app(dir: &Path) -> Option<PathBuf> {
         .find(|p| p.is_dir() && p.extension().map(|x| x == "app").unwrap_or(false))
 }
 
+/// Download the appcast's full enclosure (size + EdDSA verified) and unpack it
+/// into `out_app`. Needs no BinaryDelta — used both as the primary full path and
+/// as the recovery when a delta is unavailable or fails to apply.
+fn reconstruct_full(appcast: &Appcast, work: &Path, out_app: &Path) -> Result<(), AppError> {
+    let latest = appcast
+        .latest()
+        .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+    let sig = latest.full.ed_signature.clone().ok_or_else(|| {
+        AppError::Engine("appcast full enclosure missing edSignature".to_string())
+    })?;
+    let staged = download_and_verify(&latest.full.url, latest.full.length, &sig)?;
+    unpack_app_zip(&staged, work, out_app)
+}
+
 /// **Destructive**: download → verify → reconstruct → gate → quit → atomic swap
 /// → health-check → relaunch (or rollback). Always operates on the REAL installed
 /// build (no `simulated_build` — a delta only applies to the true basis bundle).
@@ -354,60 +369,41 @@ pub fn perform_macos_update(binary_delta: Option<PathBuf>) -> Result<MacPerformR
         require_os_supported(latest.minimum_system_version.as_deref())?;
     }
 
-    // 1) Decide what to fetch + how to reconstruct. A planned delta needs the
-    //    BinaryDelta tool; if it's absent, fall back to the appcast's full zip
-    //    (which needs no tool) instead of failing after the download — the full
-    //    enclosure is always present alongside the deltas.
-    let want_delta = matches!(plan.strategy, UpdateStrategy::Delta { .. });
-    let delta_tool = binary_delta.as_deref();
-    let use_delta = want_delta && delta_tool.is_some();
-
-    let (dl_url, dl_size, dl_sig, effective_strategy) = if use_delta {
-        let sig = plan
-            .ed_signature
-            .clone()
-            .ok_or_else(|| AppError::Engine("appcast delta missing edSignature".to_string()))?;
-        (
-            plan.download_url.clone(),
-            plan.download_size,
-            sig,
-            strategy_label(&plan.strategy),
-        )
-    } else {
-        // Full package: either the plan was already Full, or a delta was planned
-        // but the tool is unavailable. Pull the full enclosure from the appcast.
-        let latest = appcast
-            .latest()
-            .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
-        let sig = latest.full.ed_signature.clone().ok_or_else(|| {
-            AppError::Engine("appcast full enclosure missing edSignature".to_string())
-        })?;
-        let label = if want_delta {
-            "full (delta 工具缺失，回退全量)".to_string()
-        } else {
-            "full".to_string()
-        };
-        (latest.full.url.clone(), latest.full.length, sig, label)
-    };
-
-    // 2) download + size + EdDSA verify (idempotent).
-    let staged = download_and_verify(&dl_url, dl_size, &dl_sig)?;
-
-    // 3) reconstruct the new bundle on the SAME VOLUME as the install root
-    //    (required for the atomic rename later).
+    // 1) Set up same-volume staging for the reconstructed bundle + backup.
     let work = staging_dir();
     let out_app = work.join("Codex.app");
     let backup = work.join("backup-Codex.app");
     let _ = std::fs::remove_dir_all(&out_app);
     let _ = std::fs::remove_dir_all(&backup);
 
-    if use_delta {
-        let tool = delta_tool.expect("delta tool is present when use_delta is true");
-        apply_delta(tool, &install_path, &out_app, &staged)
-            .map_err(|e| AppError::Engine(e.to_string()))?;
+    // 2) Reconstruct the new bundle into out_app. Prefer a delta when the tool is
+    //    present; fall back to the appcast's full package when the tool is missing
+    //    OR the delta fails to apply (modified basis, tool/patch version mismatch,
+    //    …). The full enclosure is always present in the same appcast entry and
+    //    needs no tool, so a recoverable delta failure no longer fails the update.
+    let want_delta = matches!(plan.strategy, UpdateStrategy::Delta { .. });
+    let effective_strategy = if want_delta {
+        if let Some(tool) = binary_delta.as_deref() {
+            let sig = plan
+                .ed_signature
+                .clone()
+                .ok_or_else(|| AppError::Engine("appcast delta missing edSignature".to_string()))?;
+            let staged = download_and_verify(&plan.download_url, plan.download_size, &sig)?;
+            match apply_delta(tool, &install_path, &out_app, &staged) {
+                Ok(()) => strategy_label(&plan.strategy),
+                Err(delta_err) => {
+                    reconstruct_full(&appcast, &work, &out_app)?;
+                    format!("full (delta 应用失败回退: {delta_err})")
+                }
+            }
+        } else {
+            reconstruct_full(&appcast, &work, &out_app)?;
+            "full (delta 工具缺失，回退全量)".to_string()
+        }
     } else {
-        unpack_app_zip(&staged, &work, &out_app)?;
-    }
+        reconstruct_full(&appcast, &work, &out_app)?;
+        "full".to_string()
+    };
 
     // 3) gate the reconstructed bundle before it touches the install root.
     gate_reconstructed(&out_app)
