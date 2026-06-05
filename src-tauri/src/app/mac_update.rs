@@ -51,12 +51,10 @@ pub struct MacStageReport {
     pub verified: bool,
 }
 
-/// Prod arm64 Sparkle appcast.
-///
-/// TODO(§4.4): replace with the mirror's rewritten, CN-reachable appcast once
-/// the mirror publishes one (enclosure URLs pointed at R2/S3).
-pub const PROD_ARM64_APPCAST: &str =
-    "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
+/// arm64 Sparkle appcast, served by the mirror (CN-reachable; enclosure URLs
+/// rewritten to R2/S3). EdDSA signatures are preserved (they sign bytes, not
+/// URLs), so the pinned-key verification still passes against mirrored files.
+pub const PROD_ARM64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast.xml";
 
 fn effective_build(simulated_build: Option<u64>, installed: &Option<InstalledCodex>) -> u64 {
     simulated_build
