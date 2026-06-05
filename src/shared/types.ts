@@ -44,6 +44,18 @@ export interface MacStageReport {
   verified: boolean;
 }
 
+export interface MacPerformReport {
+  upToDate: boolean;
+  fromBuild: number;
+  toBuild: number;
+  strategy: string;
+  installedPath: string;
+  verified: boolean;
+  relaunched: boolean;
+  rolledBack: boolean;
+  message: string;
+}
+
 export type InstallClass = "managed" | "external" | "none";
 
 export interface MacInstallStatus {

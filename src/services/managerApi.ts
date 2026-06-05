@@ -2,7 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 
-import type { MacInstallStatus, MacStageReport, MacUpdateReport } from "../shared/types";
+import type {
+  MacInstallStatus,
+  MacPerformReport,
+  MacStageReport,
+  MacUpdateReport,
+} from "../shared/types";
 
 declare global {
   interface Window {
@@ -63,6 +68,25 @@ export const managerApi = {
     return invoke<MacStageReport>("mac_stage_update", {
       simulatedBuild: simulatedBuild ?? null,
     });
+  },
+  // Destructive: reconstruct + codesign-gate + atomic swap + relaunch (or
+  // rollback). `confirm` must be true; the backend rejects it otherwise. Guarded
+  // by a UI second confirmation before this is ever called.
+  macPerformUpdate(confirm: boolean): Promise<MacPerformReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        upToDate: false,
+        fromBuild: 3511,
+        toBuild: 3575,
+        strategy: "delta-from-3511",
+        installedPath: "/Applications/Codex.app",
+        verified: true,
+        relaunched: true,
+        rolledBack: false,
+        message: "（浏览器开发态：真实替换仅在桌面 app 内执行）",
+      });
+    }
+    return invoke<MacPerformReport>("mac_perform_update", { confirm });
   },
   // Self-update the manager itself via the Tauri updater (minisign-signed,
   // full bundle). Endpoints + signing are server-side (see roadmap §4).

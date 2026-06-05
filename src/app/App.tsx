@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { managerApi } from "../services/managerApi";
-import type { InstallClass, MacInstallStatus, MacStageReport, MacUpdateReport } from "../shared/types";
+import type {
+  InstallClass,
+  MacInstallStatus,
+  MacPerformReport,
+  MacStageReport,
+  MacUpdateReport,
+} from "../shared/types";
 
 function mib(bytes: number): string {
   return (bytes / 1_048_576).toFixed(1);
@@ -15,8 +21,9 @@ export function App() {
   const [sim, setSim] = useState("");
   const [report, setReport] = useState<MacUpdateReport | null>(null);
   const [stage, setStage] = useState<MacStageReport | null>(null);
+  const [perform, setPerform] = useState<MacPerformReport | null>(null);
   const [status, setStatus] = useState<MacInstallStatus | null>(null);
-  const [busy, setBusy] = useState<"plan" | "stage" | null>(null);
+  const [busy, setBusy] = useState<"plan" | "stage" | "perform" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [mgrMsg, setMgrMsg] = useState<string | null>(null);
   const [mgrBusy, setMgrBusy] = useState(false);
@@ -39,6 +46,7 @@ export function App() {
   const doStage = useCallback(async () => {
     setBusy("stage");
     setError(null);
+    setPerform(null);
     try {
       setStage(await managerApi.macStageUpdate(simBuild));
     } catch (cause) {
@@ -47,6 +55,33 @@ export function App() {
       setBusy(null);
     }
   }, [simBuild]);
+
+  const doPerform = useCallback(async () => {
+    const target = stage
+      ? `build ${stage.latestBuild}（${stage.strategy}）`
+      : "最新版本";
+    const ok = window.confirm(
+      `即将用 ${target} 替换 /Applications/Codex.app：\n\n` +
+        "· 会请求 Codex 优雅退出（绝不强杀，正在进行的任务可先保存）\n" +
+        "· 替换前会复验 Apple 代码签名（发布者 = OpenAI）\n" +
+        "· 失败会自动回滚到当前版本\n\n确定现在执行吗？",
+    );
+    if (!ok) {
+      return;
+    }
+    setBusy("perform");
+    setError(null);
+    try {
+      const result = await managerApi.macPerformUpdate(true);
+      setPerform(result);
+      // The install is now manager-managed and on a new build — refresh status.
+      await managerApi.macStatus().then(setStatus).catch(() => undefined);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(null);
+    }
+  }, [stage]);
 
   const adopt = useCallback(async () => {
     setError(null);
@@ -78,6 +113,13 @@ export function App() {
 
   const plan = report?.plan ?? null;
   const canStage = Boolean(plan) && !plan?.upToDate && busy === null;
+  // Only after a real, EdDSA-verified stage (no sim-build preview) may the
+  // destructive swap run — the delta basis must be the true installed bundle.
+  const canPerform =
+    Boolean(stage?.verified) &&
+    !stage?.upToDate &&
+    simBuild === undefined &&
+    busy === null;
 
   return (
     <main className="wrap">
@@ -132,7 +174,17 @@ export function App() {
           <button className="btn primary" onClick={doStage} disabled={!canStage}>
             {busy === "stage" ? "下载验签中…" : "下载并验签(暂存)"}
           </button>
+          {stage?.verified && !stage.upToDate ? (
+            <button className="btn danger" onClick={doPerform} disabled={!canPerform}>
+              {busy === "perform" ? "替换中…" : "应用更新(替换并重启)"}
+            </button>
+          ) : null}
         </div>
+        {stage?.verified && !stage.upToDate && simBuild !== undefined ? (
+          <p className="note">
+            当前为「模拟已装 build」预览态：真实替换已禁用。清空模拟值并重新「下载并验签」后方可应用。
+          </p>
+        ) : null}
       </section>
 
       {error ? <div className="err">⚠ {error}</div> : null}
@@ -212,8 +264,43 @@ export function App() {
             </ul>
           )}
           <p className="note">
-            非破坏性：仅下载 + 验签到 staging，未触碰安装根。下一步才是 BinaryDelta apply → codesign 复验 → 原子替换。
+            非破坏性：仅下载 + 验签到 staging，未触碰安装根。点「应用更新」才会 BinaryDelta apply → codesign 复验 → 原子替换 → 重启。
           </p>
+        </section>
+      ) : null}
+
+      {perform ? (
+        <section className="card">
+          <h2>应用结果</h2>
+          {perform.upToDate ? (
+            <p className="ok">✓ {perform.message}</p>
+          ) : (
+            <ul className="kv">
+              <li>
+                <span>结果</span>
+                <b className={perform.rolledBack ? "bad" : "save"}>
+                  {perform.rolledBack ? "↩ 已回滚" : "✅ 已更新"}
+                </b>
+              </li>
+              <li>
+                <span>版本</span>
+                <b>
+                  build {perform.fromBuild} → {perform.toBuild}（{perform.strategy}）
+                </b>
+              </li>
+              <li>
+                <span>签名闸</span>
+                <b className={perform.verified ? "save" : "bad"}>
+                  {perform.verified ? "✅ EdDSA + codesign(OpenAI)" : "❌ 未通过"}
+                </b>
+              </li>
+              <li>
+                <span>重启</span>
+                <b>{perform.relaunched ? "已重启 Codex" : "未重启(原本未运行)"}</b>
+              </li>
+            </ul>
+          )}
+          <p className="note">{perform.message}</p>
         </section>
       ) : null}
 

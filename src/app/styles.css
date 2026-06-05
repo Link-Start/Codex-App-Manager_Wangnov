@@ -171,6 +171,16 @@ body {
   border-color: transparent;
 }
 
+.btn.danger {
+  background: rgba(248, 113, 113, 0.14);
+  color: var(--danger);
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.btn.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+}
+
 .btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;

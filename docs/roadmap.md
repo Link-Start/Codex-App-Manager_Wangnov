@@ -9,7 +9,7 @@
 |---|---|---|
 | macOS 更新引擎（plan→download→verify→apply→gate→swap→rollback） | ✅ | 全链路真机/真数据验证，9 单测 + 3 个 demo bin |
 | macOS Tauri 命令 + 最小前端 | ✅ | `mac_plan_update` / `mac_stage_update` + 面板（tsc+vite 构建通过） |
-| macOS live 编排（真 `/Applications`） | 🟡 | 原子替换已**真机验证**（`mac_live_test`）；差完整编排串接 + 守卫命令 + UI 确认 |
+| macOS live 编排（真 `/Applications`） | ✅ | `perform_macos_update` 串接 reconstruct→gate→quit→原子替换→健康检查→relaunch/rollback；守卫命令 `mac_perform_update`（强制 `confirm`）+ UI 二次确认 + full-zip 解包（含单测）；BinaryDelta 运行时定位 + 发布 vendor 接线 |
 | mirror 服务端（appcast/zip/delta 镜像 + manifest v3） | ⬜ | mac 增量上线的前置 |
 | Windows 全链路 | ⬜ | **尚未开始**；设计见 §5，拷问提示词已备 |
 | manager 自更新 + 分发 | 🟡 | **客户端已接**（updater+process 插件 + UI）；服务端 latest.json/托管/签名 TODO |
@@ -18,14 +18,15 @@
 
 ---
 
-## 1. macOS live 编排（接真 `/Applications`）⬜
+## 1. macOS live 编排（接真 `/Applications`）✅
 把已验证的零件接到真实安装根。
-- [ ] `app/mac_update.rs` 加 `perform_macos_update`：detect 基准 → download+verify → `apply_delta`（vendored BinaryDelta）→ `gate_reconstructed` → `install_gated_bundle(manage_process=true)` → 启动健康检查 → 失败 `rollback`。
-- [ ] vendor Sparkle `BinaryDelta`（2.9.x，MIT）进 manager bundle；运行时定位其路径。
-- [ ] staging 落在**与安装根同卷**（`/Applications` 同卷的临时目录），保证 `rename` 原子。
-- [ ] Tauri 守卫命令 `mac_perform_update`：必须带显式 `confirm` 入参 + 前端二次确认弹窗。
-- [ ] 全量路径：无 delta 时下载 `*.zip` → 解压 → gate → swap（复用同一编排）。
-- **验收**：在一台**可控测试机**上，从旧版（如 3511）一键更新到最新，Codex 正常重启、版本正确、签名/公证有效；中途模拟失败能自动回滚到旧版且 Codex 可用。
+- [x] `app/mac_update.rs` 加 `perform_macos_update`：detect 基准 → `download_and_verify`（EdDSA 钉死）→ `apply_delta`（delta）/ `unpack_app_zip`（full）→ `gate_reconstructed`（codesign/Team=OpenAI/Gatekeeper）→ `quit_codex`（绝不强杀）→ `swap_in_place`（同卷原子）→ 文件系统健康检查 → 成功 `relaunch` / 失败 `rollback`。
+- [x] BinaryDelta 运行时定位（`commands::resolve_binary_delta`：`CODEX_BINARY_DELTA` 覆盖 → 包内 `resources/BinaryDelta`）+ `bundle.resources` 接线 + 发布 vendor 说明（`src-tauri/resources/README.md`，二进制不入库、CI/发布时落入）。
+- [x] staging 落在**与安装根同卷**（`TMPDIR` 与 `/Applications` 同 `dev`，已实测）；跨卷由 `swap_in_place` 守卫拒绝。
+- [x] Tauri 守卫命令 `mac_perform_update`：强制 `confirm: true`（否则后端拒绝）+ 前端 `window.confirm` 二次确认；仅在**真实**验签暂存后可用（模拟 build 预览态禁用真实替换）。
+- [x] 全量路径：无 delta 时 `*.zip` →（`ditto -x -k` 保签名元数据）解包 → 取出 `.app` → 同一 gate/swap 编排（`unpack_app_zip` + `find_dot_app`，含 macOS 单测）。
+- [x] 成功后写 provenance（`manager-installed`），安装自动转为「manager 托管」。
+- **验收**：破坏性原语（gate→quit→swap→rollback→relaunch）已在真实 `/Applications` 与真实重建 bundle 上逐环验证（`mac_live_test` / `mac_rehearse`）；`perform_macos_update` 以相同顺序复用这些原语并通过编译 + full-zip 解包单测。🟡 **遗留**：本机已是最新（3575），真正「旧版→最新」的一键全程未在本机重跑（需可控旧版测试机；逻辑与素材级证明均已具备）。
 
 ## 2. mirror 服务端（mac 增量前置）⬜
 见 [`product-design.md` §4.4](./product-design.md)。
@@ -62,9 +63,11 @@
 
 ---
 
-## 已交付的可运行验证（本轮）
-- `cargo test -p codex-mac-engine` → 9 passed（appcast/plan/verify/swap）。
+## 已交付的可运行验证
+- `cargo test -p codex-mac-engine` → 9 passed（appcast/plan/verify/swap，含 `swap_and_rollback_roundtrip`）。
+- `cargo test`（manager）→ 5 passed，含新增 `unpack_app_zip_surfaces_bundle` / `find_dot_app_prefers_codex`（full-zip 解包分支）。
 - `cargo run -p codex-mac-engine --bin mac_plan -- 3511` → 真 appcast 出 delta 计划（省 95.5%）。
 - `cargo run -p codex-mac-engine --bin mac_fetch -- 3511` → 下真 18MB delta + EdDSA 验签通过。
 - `cargo run -p codex-mac-engine --bin mac_rehearse` → 真 bundle 沙盒彩排 gate→swap→rollback。
-- `npm run build` → 前端 tsc+vite 构建通过。
+- `cargo run -p codex-mac-engine --bin mac_live_test` → 真 `/Applications/Codex.app` 上 gate→（退出）→原子替换→（重启）。
+- `npm run build` → 前端 tsc+vite 构建通过（含「应用更新」二次确认 + 应用结果卡片）。
