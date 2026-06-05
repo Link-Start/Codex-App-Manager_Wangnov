@@ -21,6 +21,7 @@ pub fn run() {
             commands::run_health_check,
             commands::mac_plan_update,
             commands::mac_stage_update,
+            commands::mac_perform_update,
             commands::mac_status,
             commands::mac_adopt,
         ])

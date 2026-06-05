@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::app::health_service::HealthService;
 use crate::app::snapshot::ManagerSnapshot;
@@ -6,7 +6,8 @@ use crate::app::update_check::PayloadUpdateCheck;
 use crate::domain::health::HealthReport;
 use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::app::mac_update::{
-    plan_macos_update, stage_macos_update, MacInstallStatus, MacStageReport, MacUpdateReport,
+    perform_macos_update, plan_macos_update, stage_macos_update, MacInstallStatus, MacPerformReport,
+    MacStageReport, MacUpdateReport,
 };
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
@@ -75,6 +76,51 @@ pub async fn mac_stage_update(
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
     .map_err(Into::into)
+}
+
+/// Locate the vendored Sparkle `BinaryDelta` tool: an explicit `CODEX_BINARY_DELTA`
+/// override first (testing / a system Sparkle), then the app bundle's resources.
+fn resolve_binary_delta(app: &tauri::AppHandle) -> Result<std::path::PathBuf, CommandError> {
+    if let Ok(p) = std::env::var("CODEX_BINARY_DELTA") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Ok(pb);
+        }
+    }
+    for rel in ["resources/BinaryDelta", "BinaryDelta"] {
+        if let Ok(res) = app.path().resolve(rel, tauri::path::BaseDirectory::Resource) {
+            if res.exists() {
+                return Ok(res);
+            }
+        }
+    }
+    Err(AppError::Engine(
+        "BinaryDelta 工具未找到：请设置 CODEX_BINARY_DELTA，或在发布构建中将其 vendor 到 resources/"
+            .to_string(),
+    )
+    .into())
+}
+
+/// macOS-only **destructive** update: download+verify → reconstruct → codesign
+/// gate → graceful quit → atomic same-volume swap → health-check → relaunch (or
+/// rollback). Requires an explicit `confirm: true` from a UI second confirmation;
+/// runs the blocking work off the main thread.
+#[tauri::command]
+pub async fn mac_perform_update(
+    app: tauri::AppHandle,
+    confirm: bool,
+) -> Result<MacPerformReport, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    if !confirm {
+        return Err(AppError::Internal("拒绝执行：破坏性更新必须带显式 confirm".to_string()).into());
+    }
+    let binary_delta = resolve_binary_delta(&app)?;
+    tauri::async_runtime::spawn_blocking(move || perform_macos_update(&binary_delta))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
 }
 
 /// macOS-only: classify the installed Codex (managed / external / none).

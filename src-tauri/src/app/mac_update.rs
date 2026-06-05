@@ -11,10 +11,13 @@
 //! `simulated_build` lets the UI preview the delta path even when the machine is
 //! already on the latest build (the user's case during development).
 
+use std::path::{Path, PathBuf};
+
 use serde::Serialize;
 
 use codex_mac_engine::{
-    download, parse_appcast, plan_update, sys, verify_sparkle, UpdatePlan, UpdateStrategy,
+    apply_delta, download, gate_reconstructed, parse_appcast, plan_update, quit_codex, relaunch,
+    rollback, swap::codex_running, swap_in_place, sys, verify_sparkle, UpdatePlan, UpdateStrategy,
 };
 
 use crate::app::provenance::ProvenanceStore;
@@ -159,6 +162,53 @@ fn strategy_label(strategy: &UpdateStrategy) -> String {
     }
 }
 
+/// Download the planned artifact into staging, size-gate it, and verify its
+/// EdDSA signature against the pinned Sparkle key. Idempotent: reuses an
+/// already-staged file of the right size. On EdDSA failure the staged file is
+/// dropped so a retry re-downloads instead of trusting a corrupt same-size
+/// cache. Returns the verified staged path. Shared by `stage` (non-destructive)
+/// and `perform` (the full install), so the destructive path can never skip the
+/// pinned-key check.
+fn download_and_verify(plan: &UpdatePlan) -> Result<PathBuf, AppError> {
+    let signature = plan
+        .ed_signature
+        .clone()
+        .ok_or_else(|| AppError::Engine("appcast enclosure missing edSignature".to_string()))?;
+
+    let file_name = plan
+        .download_url
+        .rsplit('/')
+        .next()
+        .unwrap_or("payload.bin");
+    let dest = staging_dir().join(file_name);
+
+    let already = std::fs::metadata(&dest)
+        .map(|m| m.len() == plan.download_size)
+        .unwrap_or(false);
+    if !already {
+        download::download_to(&plan.download_url, &dest)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+    }
+
+    let len = std::fs::metadata(&dest)
+        .map_err(|e| AppError::Engine(e.to_string()))?
+        .len();
+    if len != plan.download_size {
+        return Err(AppError::Engine(format!(
+            "size mismatch: {len} != {}",
+            plan.download_size
+        )));
+    }
+
+    let bytes = download::read_file(&dest).map_err(|e| AppError::Engine(e.to_string()))?;
+    if let Err(err) = verify_sparkle(&bytes, &signature) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(AppError::Engine(err.to_string()));
+    }
+
+    Ok(dest)
+}
+
 pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport, AppError> {
     let installed = detect_installed();
     let appcast_url = chosen_appcast(&installed);
@@ -185,45 +235,7 @@ pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport
         require_os_supported(latest.minimum_system_version.as_deref())?;
     }
 
-    let signature = plan
-        .ed_signature
-        .clone()
-        .ok_or_else(|| AppError::Engine("appcast enclosure missing edSignature".to_string()))?;
-
-    let file_name = plan
-        .download_url
-        .rsplit('/')
-        .next()
-        .unwrap_or("payload.bin");
-    let dest = staging_dir().join(file_name);
-
-    // Reuse an already-staged artifact of the right size (idempotent).
-    let already = std::fs::metadata(&dest)
-        .map(|m| m.len() == plan.download_size)
-        .unwrap_or(false);
-    if !already {
-        download::download_to(&plan.download_url, &dest)
-            .map_err(|e| AppError::Engine(e.to_string()))?;
-    }
-
-    // Size gate.
-    let len = std::fs::metadata(&dest)
-        .map_err(|e| AppError::Engine(e.to_string()))?
-        .len();
-    if len != plan.download_size {
-        return Err(AppError::Engine(format!(
-            "size mismatch: {len} != {}",
-            plan.download_size
-        )));
-    }
-
-    // EdDSA gate (pinned key). On failure, drop the staged file so a retry
-    // re-downloads instead of re-hitting a corrupt same-size cache.
-    let bytes = download::read_file(&dest).map_err(|e| AppError::Engine(e.to_string()))?;
-    if let Err(err) = verify_sparkle(&bytes, &signature) {
-        let _ = std::fs::remove_file(&dest);
-        return Err(AppError::Engine(err.to_string()));
-    }
+    let dest = download_and_verify(&plan)?;
 
     Ok(MacStageReport {
         up_to_date: false,
@@ -236,6 +248,189 @@ pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport
         staged_path: Some(dest.to_string_lossy().into_owned()),
         verified: true,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacPerformReport {
+    pub up_to_date: bool,
+    pub from_build: u64,
+    pub to_build: u64,
+    pub strategy: String,
+    pub installed_path: String,
+    /// EdDSA (download) + codesign/Team/Gatekeeper (reconstructed bundle) passed.
+    pub verified: bool,
+    /// The new version was relaunched (only when Codex had been running).
+    pub relaunched: bool,
+    /// The post-swap health check failed and we restored the previous bundle.
+    pub rolled_back: bool,
+    pub message: String,
+}
+
+/// Unpack a Sparkle macOS full-update `.zip` and surface the `.app` inside it.
+/// `ditto -x -k` is used (not `unzip`) because it preserves the extended
+/// attributes and resource metadata a code signature depends on, so the
+/// extracted bundle still passes `codesign`/Gatekeeper. The found bundle is
+/// moved to `out_app` (both live under the same-volume `work` dir).
+fn unpack_app_zip(zip: &Path, work: &Path, out_app: &Path) -> Result<(), AppError> {
+    let extract = work.join("unzip");
+    let _ = std::fs::remove_dir_all(&extract);
+    std::fs::create_dir_all(&extract)
+        .map_err(|e| AppError::Engine(format!("mkdir unzip: {e}")))?;
+
+    let status = std::process::Command::new("ditto")
+        .args(["-x", "-k"])
+        .arg(zip)
+        .arg(&extract)
+        .status()
+        .map_err(|e| AppError::Engine(format!("spawn ditto: {e}")))?;
+    if !status.success() {
+        return Err(AppError::Engine(format!("ditto unzip exited with {status}")));
+    }
+
+    let found = find_dot_app(&extract)
+        .ok_or_else(|| AppError::Engine("no .app found inside the full-update zip".to_string()))?;
+    if out_app.exists() {
+        let _ = std::fs::remove_dir_all(out_app);
+    }
+    std::fs::rename(&found, out_app)
+        .map_err(|e| AppError::Engine(format!("move unpacked app: {e}")))?;
+    Ok(())
+}
+
+/// Locate a `.app` bundle inside an extracted directory: prefer a top-level
+/// `Codex.app`, else the first `*.app` directory entry.
+fn find_dot_app(dir: &Path) -> Option<PathBuf> {
+    let direct = dir.join("Codex.app");
+    if direct.exists() {
+        return Some(direct);
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|p| p.is_dir() && p.extension().map(|x| x == "app").unwrap_or(false))
+}
+
+/// **Destructive**: download → verify → reconstruct → gate → quit → atomic swap
+/// → health-check → relaunch (or rollback). Always operates on the REAL installed
+/// build (no `simulated_build` — a delta only applies to the true basis bundle).
+///
+/// Ordering minimizes downtime and maximizes safety:
+///   1. download the artifact and verify its EdDSA signature (pinned key);
+///   2. reconstruct the new bundle in same-volume staging (delta apply, or unzip
+///      a full update) — Codex may stay running; the basis is only read;
+///   3. gate the reconstructed bundle (codesign/Team=OpenAI/Gatekeeper) BEFORE it
+///      goes anywhere near the install root — a compromised mirror cannot forge
+///      Apple's Developer ID signature;
+///   4. ask Codex to quit gracefully (never force-kill — protects in-flight work);
+///      if it refuses we abort with the install root untouched;
+///   5. same-volume atomic `rename` swap, keeping the old bundle as a backup;
+///   6. filesystem health check (installed build == target && still gated). On
+///      success drop the backup, record managed provenance, relaunch the new
+///      version (only if Codex had been running). On failure roll back to the
+///      preserved old bundle and relaunch it.
+///
+/// `binary_delta` is the path to the vendored Sparkle `BinaryDelta` tool,
+/// resolved by the command layer (it owns the Tauri resource resolver).
+pub fn perform_macos_update(binary_delta: &Path) -> Result<MacPerformReport, AppError> {
+    let installed = detect_installed()
+        .ok_or_else(|| AppError::Engine("no Codex detected to update".to_string()))?;
+    let install_path = PathBuf::from(&installed.path);
+
+    let appcast_url = appcast_for_arch(&installed.arch);
+    let xml = sys::fetch_text(appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
+    let plan = plan_update(&appcast, installed.build)
+        .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+
+    if plan.up_to_date {
+        return Ok(MacPerformReport {
+            up_to_date: true,
+            from_build: installed.build,
+            to_build: plan.latest_build,
+            strategy: "none".to_string(),
+            installed_path: installed.path,
+            verified: false,
+            relaunched: false,
+            rolled_back: false,
+            message: format!("已是最新 (build {})", plan.latest_build),
+        });
+    }
+
+    if let Some(latest) = appcast.latest() {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
+    }
+
+    // 1) download + size + EdDSA verify (idempotent).
+    let staged = download_and_verify(&plan)?;
+
+    // 2) reconstruct the new bundle on the SAME VOLUME as the install root
+    //    (required for the atomic rename in step 5).
+    let work = staging_dir();
+    let out_app = work.join("Codex.app");
+    let backup = work.join("backup-Codex.app");
+    let _ = std::fs::remove_dir_all(&out_app);
+    let _ = std::fs::remove_dir_all(&backup);
+
+    match plan.strategy {
+        UpdateStrategy::Delta { .. } => {
+            apply_delta(binary_delta, &install_path, &out_app, &staged)
+                .map_err(|e| AppError::Engine(e.to_string()))?;
+        }
+        UpdateStrategy::Full => {
+            unpack_app_zip(&staged, &work, &out_app)?;
+        }
+    }
+
+    // 3) gate the reconstructed bundle before it touches the install root.
+    gate_reconstructed(&out_app)
+        .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝替换）: {e}")))?;
+
+    // 4) graceful quit (never force-kill), then 5) atomic same-volume swap.
+    let was_running = codex_running();
+    quit_codex(30).map_err(|e| AppError::Engine(e.to_string()))?;
+    swap_in_place(&install_path, &out_app, &backup).map_err(|e| AppError::Engine(e.to_string()))?;
+
+    // 6) filesystem health check on the installed root.
+    let healthy = detect_installed()
+        .map(|i| i.build == plan.latest_build)
+        .unwrap_or(false)
+        && gate_reconstructed(&install_path).is_ok();
+
+    if healthy {
+        let _ = std::fs::remove_dir_all(&backup);
+        let mut store = ProvenanceStore::load();
+        store.record(installed.path.clone(), plan.latest_build, "manager-installed");
+        let _ = store.save();
+        let relaunched = was_running && relaunch(&install_path).is_ok();
+        Ok(MacPerformReport {
+            up_to_date: false,
+            from_build: installed.build,
+            to_build: plan.latest_build,
+            strategy: strategy_label(&plan.strategy),
+            installed_path: installed.path,
+            verified: true,
+            relaunched,
+            rolled_back: false,
+            message: format!("已更新 build {} → {}", installed.build, plan.latest_build),
+        })
+    } else {
+        rollback(&install_path, &backup)
+            .map_err(|e| AppError::Engine(format!("回滚失败（需人工介入）: {e}")))?;
+        let relaunched = was_running && relaunch(&install_path).is_ok();
+        Ok(MacPerformReport {
+            up_to_date: false,
+            from_build: installed.build,
+            to_build: plan.latest_build,
+            strategy: strategy_label(&plan.strategy),
+            installed_path: installed.path,
+            verified: true,
+            relaunched,
+            rolled_back: true,
+            message: "新版本健康检查未通过，已回滚到旧版本".to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,4 +462,66 @@ pub fn mac_adopt() -> Result<MacInstallStatus, AppError> {
     store.record(installed.path.clone(), installed.build, "adopted-external");
     store.save()?;
     Ok(mac_install_status())
+}
+
+// The full-update unpack branch is new logic (the delta/gate/swap tail reuses
+// engine primitives already proven on real /Applications). `ditto` is macOS-only,
+// so these stay gated off the cross-compiled Windows build.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    fn ditto(args: &[&str]) {
+        let status = std::process::Command::new("ditto")
+            .args(args)
+            .status()
+            .expect("spawn ditto");
+        assert!(status.success(), "ditto {args:?} failed");
+    }
+
+    #[test]
+    fn unpack_app_zip_surfaces_bundle() {
+        let root = std::env::temp_dir().join(format!("codex-unpack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A synthetic Codex.app, zipped the way Sparkle ships a macOS full update
+        // (`ditto -c -k --keepParent` → the `.app` is the top-level entry).
+        let src_app = root.join("Codex.app");
+        std::fs::create_dir_all(src_app.join("Contents")).unwrap();
+        std::fs::write(src_app.join("Contents/marker"), "3575").unwrap();
+        let zip = root.join("Codex.zip");
+        ditto(&[
+            "-c",
+            "-k",
+            "--keepParent",
+            &src_app.to_string_lossy(),
+            &zip.to_string_lossy(),
+        ]);
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let out_app = work.join("Codex.app");
+        unpack_app_zip(&zip, &work, &out_app).unwrap();
+
+        assert!(out_app.join("Contents/marker").exists(), "bundle surfaced");
+        assert_eq!(
+            std::fs::read_to_string(out_app.join("Contents/marker")).unwrap(),
+            "3575"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_dot_app_prefers_codex() {
+        let root = std::env::temp_dir().join(format!("codex-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Other.app")).unwrap();
+        std::fs::create_dir_all(root.join("Codex.app")).unwrap();
+
+        let found = find_dot_app(&root).expect("an .app is found");
+        assert!(found.ends_with("Codex.app"), "prefers Codex.app, got {found:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
