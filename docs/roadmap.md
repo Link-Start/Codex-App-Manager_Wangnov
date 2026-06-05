@@ -71,3 +71,5 @@
 - `cargo run -p codex-mac-engine --bin mac_rehearse` → 真 bundle 沙盒彩排 gate→swap→rollback。
 - `cargo run -p codex-mac-engine --bin mac_live_test` → 真 `/Applications/Codex.app` 上 gate→（退出）→原子替换→（重启）。
 - `npm run build` → 前端 tsc+vite 构建通过（含「应用更新」二次确认 + 应用结果卡片）。
+- `cargo clippy --all-targets -- -D warnings` → manager + engine 两 crate 均干净。
+- `codex review --base <pre-slice>` → 8 轮对抗式 review 收敛至「无阻断问题」；逐轮修复：重启前不删备份、退出前预检同卷+失败重启、确认文案用真实路径、sim 变更作废暂存、未检测安装禁用应用、缺工具/应用失败双重回退全量、确认目标 TOCTOU 校验、自更新与 perform 串行化、provenance 保存失败上报。
