@@ -118,9 +118,12 @@ export function App() {
   const canStage = Boolean(plan) && !plan?.upToDate && busy === null;
   // Only after a real, EdDSA-verified stage (no sim-build preview) may the
   // destructive swap run — the delta basis must be the true installed bundle.
+  // This is an UPDATE flow, so it also requires a detected install: without one
+  // the backend rejects immediately ("no Codex detected to update").
   const canPerform =
     Boolean(stage?.verified) &&
     !stage?.upToDate &&
+    Boolean(status?.installed) &&
     simBuild === undefined &&
     busy === null;
 
@@ -183,7 +186,7 @@ export function App() {
           <button className="btn primary" onClick={doStage} disabled={!canStage}>
             {busy === "stage" ? "下载验签中…" : "下载并验签(暂存)"}
           </button>
-          {stage?.verified && !stage.upToDate ? (
+          {stage?.verified && !stage.upToDate && status?.installed ? (
             <button className="btn danger" onClick={doPerform} disabled={!canPerform}>
               {busy === "perform" ? "替换中…" : "应用更新(替换并重启)"}
             </button>
