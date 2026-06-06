@@ -24,6 +24,9 @@ pub fn run() {
             commands::mac_perform_update,
             commands::mac_status,
             commands::mac_adopt,
+            commands::mac_uninstall,
+            commands::get_settings,
+            commands::set_settings,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex App Manager");

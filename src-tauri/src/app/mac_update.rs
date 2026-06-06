@@ -63,6 +63,13 @@ pub struct MacStageReport {
 pub const PROD_ARM64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast.xml";
 pub const PROD_X64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast-x64.xml";
 
+/// OpenAI's own Sparkle appcast (for users who can reach OpenAI directly — e.g.
+/// overseas users whose only blocker is that Windows can't use the Store).
+pub const OFFICIAL_ARM64_APPCAST: &str =
+    "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
+pub const OFFICIAL_X64_APPCAST: &str =
+    "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
+
 fn appcast_for_arch(arch: &str) -> &'static str {
     match arch {
         "x86_64" | "x64" => PROD_X64_APPCAST,
@@ -70,15 +77,41 @@ fn appcast_for_arch(arch: &str) -> &'static str {
     }
 }
 
-/// Choose the mirror appcast matching the INSTALLED Codex's architecture (so a
-/// delta applies to the right base bundle), falling back to the host arch when
-/// nothing is installed yet.
-fn chosen_appcast(installed: &Option<InstalledCodex>) -> &'static str {
+fn official_for_arch(arch: &str) -> &'static str {
+    match arch {
+        "x86_64" | "x64" => OFFICIAL_X64_APPCAST,
+        _ => OFFICIAL_ARM64_APPCAST,
+    }
+}
+
+/// Resolve the appcast URL honoring the user's configured update source and the
+/// given architecture. `auto`/`mirror` use the CN-reachable mirror; `official`
+/// uses OpenAI directly; `custom` uses the user's URL (mirror fallback if empty).
+fn resolve_appcast_for_arch(arch: &str) -> String {
+    let settings = crate::app::settings_store::AppSettings::load();
+    match settings.source.as_str() {
+        "official" => official_for_arch(arch).to_string(),
+        "custom" => {
+            let u = settings.custom_url.trim();
+            if u.is_empty() {
+                appcast_for_arch(arch).to_string()
+            } else {
+                u.to_string()
+            }
+        }
+        _ => appcast_for_arch(arch).to_string(),
+    }
+}
+
+/// Resolve the appcast for the INSTALLED Codex's architecture (so a delta applies
+/// to the right base bundle), falling back to the host arch when nothing is
+/// installed yet.
+fn resolve_appcast(installed: &Option<InstalledCodex>) -> String {
     let arch = installed
         .as_ref()
         .map(|i| i.arch.as_str())
         .unwrap_or(std::env::consts::ARCH);
-    appcast_for_arch(arch)
+    resolve_appcast_for_arch(arch)
 }
 
 fn parse_macos_version(s: &str) -> Option<(u32, u32)> {
@@ -133,8 +166,8 @@ fn detect_installed() -> Option<InstalledCodex> {
 
 pub fn plan_macos_update(simulated_build: Option<u64>) -> Result<MacUpdateReport, AppError> {
     let installed = detect_installed();
-    let appcast_url = chosen_appcast(&installed);
-    let xml = sys::fetch_text(appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let appcast_url = resolve_appcast(&installed);
+    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed));
 
@@ -143,7 +176,7 @@ pub fn plan_macos_update(simulated_build: Option<u64>) -> Result<MacUpdateReport
     }
 
     Ok(MacUpdateReport {
-        appcast_url: appcast_url.to_string(),
+        appcast_url,
         installed,
         simulated_build,
         plan,
@@ -198,8 +231,8 @@ fn download_and_verify(url: &str, size: u64, signature: &str) -> Result<PathBuf,
 
 pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport, AppError> {
     let installed = detect_installed();
-    let appcast_url = chosen_appcast(&installed);
-    let xml = sys::fetch_text(appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let appcast_url = resolve_appcast(&installed);
+    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed))
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
@@ -376,8 +409,8 @@ pub fn perform_macos_update(
 
     let install_path = PathBuf::from(&installed.path);
 
-    let appcast_url = appcast_for_arch(&installed.arch);
-    let xml = sys::fetch_text(appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let appcast_url = resolve_appcast_for_arch(&installed.arch);
+    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, installed.build)
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
@@ -576,6 +609,55 @@ pub fn mac_adopt() -> Result<MacInstallStatus, AppError> {
     store.record(installed.path.clone(), installed.build, "adopted-external");
     store.save()?;
     Ok(mac_install_status())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacUninstallReport {
+    pub removed: bool,
+    pub kept_codex_home: bool,
+    pub message: String,
+}
+
+/// Remove the installed Codex app. `keep_codex_home` is true by default at the
+/// UI: the user's `~/.codex` (sign-in, sessions, config) survives unless they
+/// explicitly opt out. Quits Codex first (never force-kills).
+pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppError> {
+    let installed = detect_installed()
+        .ok_or_else(|| AppError::Engine("no Codex detected to uninstall".to_string()))?;
+    let install_path = PathBuf::from(&installed.path);
+
+    quit_codex(30).map_err(|e| AppError::Engine(e.to_string()))?;
+
+    std::fs::remove_dir_all(&install_path)
+        .map_err(|e| AppError::Engine(format!("remove app bundle: {e}")))?;
+
+    // Drop our provenance record for this path (best-effort).
+    let mut store = ProvenanceStore::load();
+    if store.is_managed(&installed.path) {
+        store.managed.retain(|r| r.path != installed.path);
+        let _ = store.save();
+    }
+
+    // Only ever touch ~/.codex when the user explicitly opted out of keeping it.
+    if !keep_codex_home {
+        if let Ok(home) = std::env::var("HOME") {
+            let codex_home = PathBuf::from(home).join(".codex");
+            if codex_home.exists() {
+                let _ = std::fs::remove_dir_all(&codex_home);
+            }
+        }
+    }
+
+    Ok(MacUninstallReport {
+        removed: true,
+        kept_codex_home: keep_codex_home,
+        message: if keep_codex_home {
+            "已卸载 Codex,保留了 ~/.codex".to_string()
+        } else {
+            "已卸载 Codex,并清除了 ~/.codex".to_string()
+        },
+    })
 }
 
 // The full-update unpack branch is new logic (the delta/gate/swap tail reuses

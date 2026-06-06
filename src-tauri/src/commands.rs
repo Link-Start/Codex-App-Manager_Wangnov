@@ -6,9 +6,10 @@ use crate::app::update_check::PayloadUpdateCheck;
 use crate::domain::health::HealthReport;
 use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::app::mac_update::{
-    perform_macos_update, plan_macos_update, stage_macos_update, MacInstallStatus, MacPerformReport,
-    MacStageReport, MacUpdateReport, PerformExpectation,
+    perform_macos_update, plan_macos_update, stage_macos_update, uninstall_macos, MacInstallStatus,
+    MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport, PerformExpectation,
 };
+use crate::app::settings_store::AppSettings;
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
 use crate::state::ManagerState;
@@ -151,5 +152,40 @@ pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, Com
         return Err(AppError::UnsupportedPlatform.into());
     }
     crate::app::mac_update::mac_adopt().map_err(Into::into)
+}
+
+/// Read persisted app settings (update source + general).
+#[tauri::command]
+pub fn get_settings() -> Result<AppSettings, CommandError> {
+    Ok(AppSettings::load())
+}
+
+/// Persist app settings. `signed_only` is forced on regardless of input.
+#[tauri::command]
+pub fn set_settings(settings: AppSettings) -> Result<AppSettings, CommandError> {
+    let mut s = settings;
+    s.signed_only = true;
+    s.save()?;
+    Ok(s)
+}
+
+/// macOS-only **destructive**: uninstall Codex. Requires explicit `confirm`.
+/// `keep_codex_home` defaults true at the UI — `~/.codex` survives unless the
+/// user opts out. Runs the blocking work off the main thread.
+#[tauri::command]
+pub async fn mac_uninstall(
+    confirm: bool,
+    keep_codex_home: bool,
+) -> Result<MacUninstallReport, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    if !confirm {
+        return Err(AppError::Internal("拒绝执行：卸载必须带显式 confirm".to_string()).into());
+    }
+    tauri::async_runtime::spawn_blocking(move || uninstall_macos(keep_codex_home))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
 }
 
