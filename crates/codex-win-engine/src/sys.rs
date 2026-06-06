@@ -239,7 +239,7 @@ fn detect_msix_install() -> Option<InstalledWindowsCodex> {
     None
 }
 
-fn detect_portable_install(portable_root: &Path) -> Option<InstalledWindowsCodex> {
+pub fn detect_portable_install(portable_root: &Path) -> Option<InstalledWindowsCodex> {
     let exe = portable_root.join("Codex.exe");
     if !exe.exists() {
         return None;

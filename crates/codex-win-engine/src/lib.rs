@@ -37,11 +37,11 @@ pub use msix::{
 pub use plan::{plan_update, WinInstallRoute, WindowsUpdatePlan};
 pub use portable::{
     close_codex_gracefully, close_codex_gracefully_for_root, install_portable_from_msix,
-    uninstall_portable, PortableInstallReport, PortableUninstallReport,
+    purge_codex_user_data, uninstall_portable, PortableInstallReport, PortableUninstallReport,
 };
 pub use sys::{
-    detect_installed_codex, fetch_text, probe_capabilities, remove_msix_package,
-    InstalledWindowsCodex, MsixRemoveReport,
+    detect_installed_codex, detect_portable_install, fetch_text, probe_capabilities,
+    remove_msix_package, InstalledWindowsCodex, MsixRemoveReport,
 };
 pub use sys::{install_msix_sideload, MsixSideloadReport};
 pub use version::{compare_versions, version_key};

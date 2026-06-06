@@ -11,13 +11,14 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use codex_win_engine::{
-    cancel_active_download, close_codex_gracefully_for_root, detect_installed_codex, download_to,
-    fetch_text, find_msix_sha256, install_msix_sideload, install_portable_from_msix,
-    parse_manifest, plan_update, probe_capabilities, read_msix_identity, remove_msix_package,
-    sha256_file, uninstall_portable, validate_codex_identity, verify_openai_authenticode,
-    version_key, AuthenticodeReport, CapabilityState, InstalledWindowsCodex, MsixIdentity,
-    MsixRemoveReport, MsixSideloadReport, PortableInstallReport, PortableUninstallReport,
-    WinCapabilityReport, WindowsRelease, WindowsUpdatePlan,
+    cancel_active_download, close_codex_gracefully_for_root, detect_installed_codex,
+    detect_portable_install, download_to, fetch_text, find_msix_sha256, install_msix_sideload,
+    install_portable_from_msix, parse_manifest, plan_update, probe_capabilities,
+    purge_codex_user_data, read_msix_identity, remove_msix_package, sha256_file,
+    uninstall_portable, validate_codex_identity, verify_openai_authenticode, version_key,
+    AuthenticodeReport, CapabilityState, InstalledWindowsCodex, MsixIdentity, MsixRemoveReport,
+    MsixSideloadReport, PortableInstallReport, PortableUninstallReport, WinCapabilityReport,
+    WindowsRelease, WindowsUpdatePlan,
 };
 
 use crate::app::provenance::ProvenanceStore;
@@ -454,7 +455,11 @@ fn install_portable_after_stage(
     )
     .map_err(engine_err)?;
 
-    let installed = detect_installed_codex(PathBuf::from(&settings.install_root).as_path());
+    // Detect the PORTABLE install we just wrote — not detect_installed_codex,
+    // which prefers MSIX and would return a still-present older MSIX package
+    // (e.g. when sideload was blocked by policy), recording the wrong target so
+    // the user keeps seeing the same update and the portable build goes unmanaged.
+    let installed = detect_portable_install(PathBuf::from(&settings.install_root).as_path());
     if let Some(installed) = &installed {
         let mut store = ProvenanceStore::load();
         if let Some(previous) = &previous_installed {
@@ -565,9 +570,21 @@ pub fn uninstall_windows_codex(
         close_codex_gracefully_for_root(30, PathBuf::from(&installed_before.path).as_path())
             .map_err(engine_err)?;
         let msix = remove_msix_package().map_err(engine_err)?;
+        let mut notes = Vec::new();
+        let mut purged_user_data = false;
         if msix.success {
             store.remove(&installed_before.path);
             store.save()?;
+            // Honor the user's "don't keep my data" choice on the MSIX path too,
+            // exactly like the portable path — remove ~/.codex when asked.
+            if purge_user_data {
+                purged_user_data = purge_codex_user_data(&mut notes).map_err(engine_err)?;
+                if purged_user_data {
+                    notes.push("User data was removed.".to_string());
+                }
+            } else {
+                notes.push("User data was preserved.".to_string());
+            }
         }
         return Ok(WinUninstallReport {
             success: msix.success,
@@ -576,8 +593,8 @@ pub fn uninstall_windows_codex(
             installed_before: Some(installed_before),
             msix: Some(msix),
             portable: None,
-            purged_user_data: false,
-            notes: vec!["User data was preserved.".to_string()],
+            purged_user_data,
+            notes,
         });
     }
 

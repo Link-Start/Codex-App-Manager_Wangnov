@@ -337,9 +337,14 @@ fn register_uninstall_entry(
         "Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Codex' -Recurse -Force -ErrorAction SilentlyContinue",
         install_root.to_string_lossy().replace('\'', "''")
     );
+    // Wrap the script in DOUBLE quotes, not single, so Windows' uninstall entry
+    // actually RUNS it: `-Command '<script>'` makes PowerShell evaluate the text
+    // as one string literal and echo it back; `-Command "<script>"` executes it.
+    // The install path sits in single quotes inside, and Windows paths can't
+    // contain '"', so the outer double quotes stay unambiguous. -ExecutionPolicy
+    // Bypass keeps a restrictive machine policy from blocking the removal.
     let uninstall_string = format!(
-        "powershell.exe -NoProfile -Command {}",
-        ps_quote(&uninstall_script)
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{uninstall_script}\""
     );
     let script = format!(
         r#"
@@ -599,6 +604,27 @@ fn install_portable_from_msix_inner(
     })
 }
 
+/// Remove the user's Codex data directory (`~/.codex`: sign-in, sessions,
+/// config). Returns whether a directory was actually deleted. Shared by the
+/// portable and MSIX uninstall paths so both honor the "don't keep my data"
+/// choice identically: a missing home directory is recorded as a note (nothing
+/// to delete), while an IO failure removing an existing directory propagates.
+pub fn purge_codex_user_data(notes: &mut Vec<String>) -> Result<bool, EngineError> {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        notes.push(
+            "User data purge requested but home directory was not available.".to_string(),
+        );
+        return Ok(false);
+    };
+    let user_data = PathBuf::from(home).join(".codex");
+    if user_data.exists() {
+        fs::remove_dir_all(&user_data).map_err(|e| io_err("purge user data", e))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub fn uninstall_portable(
     install_root: &Path,
     purge_user_data: bool,
@@ -615,21 +641,11 @@ pub fn uninstall_portable(
     let removed_shortcut = remove_start_menu_shortcut().unwrap_or(false);
     let removed_uninstall_entry = remove_uninstall_entry().unwrap_or(false);
     let mut notes = Vec::new();
-    let mut purged_user_data = false;
-
-    if purge_user_data {
-        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-            let user_data = PathBuf::from(home).join(".codex");
-            if user_data.exists() {
-                fs::remove_dir_all(&user_data).map_err(|e| io_err("purge user data", e))?;
-                purged_user_data = true;
-            }
-        } else {
-            notes.push(
-                "User data purge requested but home directory was not available.".to_string(),
-            );
-        }
-    }
+    let purged_user_data = if purge_user_data {
+        purge_codex_user_data(&mut notes)?
+    } else {
+        false
+    };
 
     Ok(PortableUninstallReport {
         success: true,
