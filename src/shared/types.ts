@@ -62,3 +62,28 @@ export interface MacInstallStatus {
   installed: InstalledCodex | null;
   status: InstallClass;
 }
+
+export type UpdateSourceKind = "auto" | "mirror" | "official" | "custom";
+
+export interface AppSettings {
+  source: UpdateSourceKind;
+  customUrl: string;
+  autoCheck: boolean;
+  askBefore: boolean;
+  /** Always true at the backend; surfaced read-only in the UI. */
+  signedOnly: boolean;
+}
+
+export const DEFAULT_SETTINGS: AppSettings = {
+  source: "auto",
+  customUrl: "",
+  autoCheck: true,
+  askBefore: true,
+  signedOnly: true,
+};
+
+export interface MacUninstallReport {
+  removed: boolean;
+  keptCodexHome: boolean;
+  message: string;
+}

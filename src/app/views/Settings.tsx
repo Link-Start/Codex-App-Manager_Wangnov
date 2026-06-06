@@ -1,0 +1,192 @@
+import { useEffect, useState } from "react";
+
+import { managerApi } from "../../services/managerApi";
+import type { AppSettings, UpdateSourceKind } from "../../shared/types";
+import { DEFAULT_SETTINGS } from "../../shared/types";
+import { Icon } from "../icons";
+import { useI18n, type Lang, type TKey } from "../i18n";
+import { useTheme, type ThemeMode } from "../theme";
+import { NavBar, Toggle } from "../components";
+
+const SOURCES: { kind: UpdateSourceKind; label: TKey; desc: TKey | "" }[] = [
+  { kind: "auto", label: "settings.source.auto", desc: "settings.source.autoDesc" },
+  { kind: "mirror", label: "settings.source.mirror", desc: "settings.source.mirrorDesc" },
+  { kind: "official", label: "settings.source.official", desc: "settings.source.officialDesc" },
+  { kind: "custom", label: "settings.source.custom", desc: "" },
+];
+
+export function Settings({
+  onBack,
+  onOpenAbout,
+  onOpenUninstall,
+  onOpenConfig,
+}: {
+  onBack: () => void;
+  onOpenAbout: () => void;
+  onOpenUninstall: () => void;
+  onOpenConfig: () => void;
+}) {
+  const { t, lang, setLang } = useI18n();
+  const { mode, setMode } = useTheme();
+  const [s, setS] = useState<AppSettings>(DEFAULT_SETTINGS);
+
+  useEffect(() => {
+    void managerApi.getSettings().then(setS).catch(() => undefined);
+  }, []);
+
+  const save = (next: AppSettings) => {
+    setS(next);
+    void managerApi.setSettings(next).then(setS).catch(() => undefined);
+  };
+
+  const themes: { v: ThemeMode; k: "settings.appearance.system" | "settings.appearance.light" | "settings.appearance.dark" }[] = [
+    { v: "system", k: "settings.appearance.system" },
+    { v: "light", k: "settings.appearance.light" },
+    { v: "dark", k: "settings.appearance.dark" },
+  ];
+  const langs: { v: Lang; label: string }[] = [
+    { v: "zh-CN", label: "简体中文" },
+    { v: "en", label: "English" },
+  ];
+
+  return (
+    <div className="pop">
+      <NavBar title={t("settings.title")} onBack={onBack} />
+      <div className="scroll view">
+        {/* 更新源 */}
+        <div className="group">
+          <div className="group-h">{t("settings.source.header")}</div>
+          <div className="list">
+            {SOURCES.map((src) => (
+              <button
+                key={src.kind}
+                className="row"
+                aria-checked={s.source === src.kind}
+                onClick={() => save({ ...s, source: src.kind })}
+              >
+                <span className="radio" />
+                <span className="rtext">
+                  <span className="rtitle">
+                    {t(src.label)}
+                    {src.kind === "auto" ? (
+                      <span className="tag" style={{ marginLeft: 8 }}>
+                        {t("settings.source.recommended")}
+                      </span>
+                    ) : null}
+                  </span>
+                  {src.desc ? <span className="rsub">{t(src.desc)}</span> : null}
+                </span>
+              </button>
+            ))}
+            {s.source === "custom" ? (
+              <div className="row" style={{ display: "block" }}>
+                <input
+                  className="input mono"
+                  value={s.customUrl}
+                  placeholder={t("settings.source.customPlaceholder")}
+                  onChange={(e) => setS({ ...s, customUrl: e.target.value })}
+                  onBlur={() => save(s)}
+                />
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        {/* 通用 */}
+        <div className="group">
+          <div className="group-h">{t("settings.general.header")}</div>
+          <div className="list">
+            <div className="row">
+              <span className="rtext">
+                <span className="rtitle">{t("settings.general.autoCheck")}</span>
+              </span>
+              <Toggle checked={s.autoCheck} onChange={(v) => save({ ...s, autoCheck: v })} />
+            </div>
+            <div className="row">
+              <span className="rtext">
+                <span className="rtitle">{t("settings.general.askBefore")}</span>
+              </span>
+              <Toggle checked={s.askBefore} onChange={(v) => save({ ...s, askBefore: v })} />
+            </div>
+            <div className="row">
+              <Icon name="shield" className="ricon" />
+              <span className="rtext">
+                <span className="rtitle">{t("settings.general.signedOnly")}</span>
+                <span className="rsub">{t("settings.general.signedOnlyNote")}</span>
+              </span>
+              <Icon name="check" className="chev" />
+            </div>
+          </div>
+        </div>
+
+        {/* 外观 */}
+        <div className="group">
+          <div className="group-h">{t("settings.appearance.header")}</div>
+          <div className="list">
+            <div className="row" style={{ display: "block" }}>
+              <div className="rtitle" style={{ marginBottom: 8 }}>
+                {t("settings.appearance.theme")}
+              </div>
+              <div className="seg">
+                {themes.map((th) => (
+                  <button
+                    key={th.v}
+                    aria-selected={mode === th.v}
+                    onClick={() => setMode(th.v)}
+                  >
+                    {t(th.k)}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="row" style={{ display: "block" }}>
+              <div className="rtitle" style={{ marginBottom: 8 }}>
+                {t("settings.appearance.language")}
+              </div>
+              <div className="seg">
+                {langs.map((l) => (
+                  <button
+                    key={l.v}
+                    aria-selected={lang === l.v}
+                    onClick={() => setLang(l.v)}
+                  >
+                    {l.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 更多 */}
+        <div className="group">
+          <div className="group-h">{t("settings.more.header")}</div>
+          <div className="list">
+            <button className="row" onClick={onOpenConfig}>
+              <Icon name="sliders" className="ricon" />
+              <span className="rtext">
+                <span className="rtitle">{t("settings.more.config")}</span>
+              </span>
+              <span className="tag soon">{t("settings.more.soon")}</span>
+              <Icon name="chevron" className="chev" />
+            </button>
+            <button className="row" onClick={onOpenAbout}>
+              <Icon name="info" className="ricon" />
+              <span className="rtext">
+                <span className="rtitle">{t("settings.more.about")}</span>
+              </span>
+              <Icon name="chevron" className="chev" />
+            </button>
+            <button className="row danger" onClick={onOpenUninstall}>
+              <Icon name="trash" className="ricon" />
+              <span className="rtext">
+                <span className="rtitle">{t("settings.more.uninstall")}</span>
+              </span>
+              <Icon name="chevron" className="chev" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

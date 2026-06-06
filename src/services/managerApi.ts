@@ -3,11 +3,26 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 
 import type {
+  AppSettings,
   MacInstallStatus,
   MacPerformReport,
   MacStageReport,
+  MacUninstallReport,
   MacUpdateReport,
 } from "../shared/types";
+import { DEFAULT_SETTINGS } from "../shared/types";
+
+const SETTINGS_LS = "cam.settings";
+
+function localSettings(): AppSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_LS);
+    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw), signedOnly: true };
+  } catch {
+    // ignore
+  }
+  return { ...DEFAULT_SETTINGS };
+}
 
 declare global {
   interface Window {
@@ -124,5 +139,41 @@ export const managerApi = {
       return Promise.resolve({ installed: null, status: "managed" });
     }
     return invoke<MacInstallStatus>("mac_adopt");
+  },
+
+  // Settings (update source + general). The backend persists them so the source
+  // choice actually drives which appcast the update flow reads.
+  async getSettings(): Promise<AppSettings> {
+    if (!hasTauriRuntime()) {
+      return localSettings();
+    }
+    try {
+      return await invoke<AppSettings>("get_settings");
+    } catch {
+      return localSettings();
+    }
+  },
+  async setSettings(next: AppSettings): Promise<AppSettings> {
+    const safe = { ...next, signedOnly: true };
+    if (!hasTauriRuntime()) {
+      localStorage.setItem(SETTINGS_LS, JSON.stringify(safe));
+      return safe;
+    }
+    const saved = await invoke<AppSettings>("set_settings", { settings: safe });
+    localStorage.setItem(SETTINGS_LS, JSON.stringify(saved));
+    return saved;
+  },
+
+  // Destructive: remove the Codex app. keepCodexHome defaults to true so the
+  // user's ~/.codex (sign-in, sessions, config) survives unless they opt out.
+  macUninstall(keepCodexHome: boolean): Promise<MacUninstallReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        removed: true,
+        keptCodexHome: keepCodexHome,
+        message: keepCodexHome ? "（浏览器开发态）已卸载,保留数据" : "（浏览器开发态）已卸载并清除数据",
+      });
+    }
+    return invoke<MacUninstallReport>("mac_uninstall", { confirm: true, keepCodexHome });
   },
 };
