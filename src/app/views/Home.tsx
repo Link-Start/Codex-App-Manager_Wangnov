@@ -30,6 +30,8 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   // Whether the status request has finished (success OR failure) — distinct from
   // the value, so a failed macStatus doesn't leave the home stuck on "loading".
   const [statusLoaded, setStatusLoaded] = useState(false);
+  // Whether it failed (e.g. unsupported platform) — so we don't offer install.
+  const [statusFailed, setStatusFailed] = useState(false);
 
   const check = useCallback(async () => {
     setBusy("plan");
@@ -46,8 +48,10 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const refreshStatus = useCallback(async () => {
     try {
       setStatus(await managerApi.macStatus());
+      setStatusFailed(false);
     } catch {
-      // leave status as-is; the "loaded" flag below still flips so we don't hang.
+      // e.g. unsupported platform — record the failure so we don't offer install.
+      setStatusFailed(true);
     } finally {
       setStatusLoaded(true);
     }
@@ -120,7 +124,13 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const updateAvailable = Boolean(plan) && !plan?.upToDate;
 
   const kind: Kind = useMemo(() => {
-    if (!installed) return busy === "plan" || !statusLoaded ? "loading" : "none";
+    if (!installed) {
+      if (busy === "plan" || !statusLoaded) return "loading";
+      // Status request failed (e.g. unsupported platform) — show error, never
+      // an install entry that would call a macOS-only command and fail again.
+      if (statusFailed) return "error";
+      return "none";
+    }
     // Don't classify (update / idle / uptodate) until the local adoption status
     // is known — otherwise report.installed can drive an "update" entry that
     // bypasses the external→adopt boundary once status resolves to external.
@@ -134,7 +144,7 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
     if (!report) return "idle";
     if (updateAvailable) return "update";
     return "uptodate";
-  }, [busy, report, error, installed, updateAvailable, status, statusLoaded]);
+  }, [busy, report, error, installed, updateAvailable, status, statusLoaded, statusFailed]);
 
   const version = plan?.latestShortVersion || (installed ? `build ${installed.build}` : "");
   const sourceLabel = t(`source.${settings.source}` as TKey);

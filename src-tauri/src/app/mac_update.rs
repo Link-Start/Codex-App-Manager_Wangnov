@@ -742,21 +742,21 @@ pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppE
 
     quit_codex(30).map_err(|e| AppError::Engine(e.to_string()))?;
 
-    // Update provenance BEFORE deleting, and abort if it can't be persisted — a
-    // stale "managed" record would otherwise let a later same-path/same-build
-    // external install be removed without re-adoption.
-    store.managed.retain(|r| r.path != installed.path);
-    store
-        .save()
-        .map_err(|e| AppError::Engine(format!("无法更新托管记录,已取消卸载: {e}")))?;
-
+    // Delete first: if we lack permission to remove the bundle (e.g. a root-owned
+    // install), the managed record stays intact so the user can retry without
+    // re-adopting.
     std::fs::remove_dir_all(&install_path)
         .map_err(|e| AppError::Engine(format!("remove app bundle: {e}")))?;
+
+    // The app is gone — drop the provenance record. If the write fails, surface
+    // it: a stale record could misclassify a same-path/same-build reinstall.
+    store.managed.retain(|r| r.path != installed.path);
+    let prov_saved = store.save().is_ok();
 
     // Only ever touch ~/.codex when the user explicitly opted out of keeping it.
     // If the removal fails (e.g. permissions), report honestly rather than
     // claiming the data was cleared.
-    let (kept_codex_home, message) = if keep_codex_home {
+    let (kept_codex_home, mut message) = if keep_codex_home {
         (true, "已卸载 Codex,保留了 ~/.codex".to_string())
     } else {
         let mut cleared = true;
@@ -772,6 +772,9 @@ pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppE
             (true, "已卸载 Codex,但 ~/.codex 清除失败,数据仍保留".to_string())
         }
     };
+    if !prov_saved {
+        message.push_str("；托管记录更新失败,请重新检查管理状态");
+    }
 
     Ok(MacUninstallReport {
         removed: true,
