@@ -6,7 +6,11 @@ use crate::domain::target::{OperatingSystem, Target};
 pub struct HealthService;
 
 impl HealthService {
-    pub fn run(target: &Target, settings: &AppSettings, endpoints: &MirrorEndpoints) -> HealthReport {
+    pub fn run(
+        target: &Target,
+        settings: &AppSettings,
+        endpoints: &MirrorEndpoints,
+    ) -> HealthReport {
         let mut checks = vec![
             HealthCheck {
                 id: "platform".to_string(),
@@ -43,4 +47,3 @@ impl HealthService {
         HealthReport { checks }
     }
 }
-

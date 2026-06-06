@@ -8,10 +8,7 @@ pub fn default_install_root(target: &Target) -> String {
     };
 
     let path = match target.os {
-        OperatingSystem::Windows => base_dirs
-            .data_local_dir()
-            .join("Programs")
-            .join("Codex"),
+        OperatingSystem::Windows => base_dirs.data_local_dir().join("Programs").join("Codex"),
         OperatingSystem::Macos => base_dirs.home_dir().join("Applications").join("Codex.app"),
         _ => return fallback_install_root(target),
     };
@@ -26,4 +23,3 @@ fn fallback_install_root(target: &Target) -> String {
         _ => "Codex".to_string(),
     }
 }
-

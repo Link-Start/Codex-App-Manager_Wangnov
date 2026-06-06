@@ -11,4 +11,3 @@ pub trait Installer {
         settings: &AppSettings,
     ) -> Result<OperationPlan, AppError>;
 }
-
