@@ -13,6 +13,7 @@ import { DEFAULT_SETTINGS } from "../../shared/types";
 import { Icon } from "../icons";
 import { useI18n, type TKey } from "../i18n";
 import { Ring, TopBar } from "../components";
+import { useCountUp } from "../useCountUp";
 
 function mib(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
@@ -36,6 +37,11 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [dl, setDl] = useState<DownloadProgress | null>(null);
   const [speed, setSpeed] = useState(0);
   const dlSample = useRef<{ t: number; bytes: number } | null>(null);
+  // Smoothly roll the live download figures instead of snapping per event.
+  const dlPctTarget = dl && dl.total > 0 ? Math.min(100, (dl.downloaded / dl.total) * 100) : 0;
+  const dlPct = useCountUp(dlPctTarget);
+  const dlBytes = useCountUp(dl?.downloaded ?? 0);
+  const dlSpeed = useCountUp(speed);
 
   const onDlProgress = useCallback((event: { payload: DownloadProgress }) => {
     const p = event.payload;
@@ -159,31 +165,36 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const sourceLabel = t(`source.${settings.source}` as TKey);
 
   if (busy === "perform" || busy === "install") {
-    const pct =
-      dl && dl.total > 0 ? Math.min(100, Math.round((dl.downloaded / dl.total) * 100)) : null;
+    const known = Boolean(dl && dl.total > 0);
+    const pct = known ? Math.round(dlPct) : null;
     return (
       <div className="pop">
         <TopBar />
         <div className="scroll view">
           <div className="hero" style={{ marginTop: 24 }}>
-            <Ring icon="loader" spin />
-            <div className="headline">
+            <Ring icon="loader" spin className="glow" />
+            <div className="headline shimmer">
               {busy === "install" ? t("progress.installing") : t("progress.title")}
             </div>
             <div className="sub">
               {dl ? t("progress.downloadingFrom", { source: dl.source }) : t("progress.preparing")}
             </div>
+            {pct !== null ? (
+              <div className="pctbig">
+                {pct}
+                <span className="pctsign">%</span>
+              </div>
+            ) : null}
             <div className="bar">
               <div
                 className={`bar-fill${pct === null ? " indeterminate" : ""}`}
-                style={pct === null ? undefined : { width: `${pct}%` }}
+                style={pct === null ? undefined : { width: `${dlPct}%` }}
               />
             </div>
-            {dl && dl.total > 0 ? (
+            {known && dl ? (
               <div className="dlmeta">
-                {mib(dl.downloaded)} / {mib(dl.total)}
-                {pct !== null ? ` · ${pct}%` : ""}
-                {speed > 0 ? ` · ${mib(speed)}/s` : ""}
+                {mib(dlBytes)} / {mib(dl.total)}
+                {dlSpeed > 0 ? ` · ${mib(dlSpeed)}/s` : ""}
               </div>
             ) : null}
           </div>
@@ -217,8 +228,8 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         <section className="hero">
           {kind === "loading" ? (
             <>
-              <Ring icon="loader" spin />
-              <div className="headline">{t("home.checking")}</div>
+              <Ring icon="loader" spin className="glow" />
+              <div className="headline shimmer">{t("home.checking")}</div>
             </>
           ) : kind === "error" ? (
             <>
@@ -244,7 +255,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             </>
           ) : kind === "update" ? (
             <>
-              <Ring icon="arrowUp" />
+              <Ring icon="arrowUp" className="glow" />
               <div className="headline">{t("home.update.title")}</div>
               <div className="sub">
                 <span className="ver">{plan?.latestVersion}</span>
@@ -276,7 +287,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             </>
           ) : (
             <>
-              <Ring icon="check" />
+              <Ring icon="check" variant="success" />
               <div className="headline">{t("home.uptodate.title")}</div>
               <div className="sub">{t("home.uptodate.sub", { version })}</div>
               <div className="microcue">

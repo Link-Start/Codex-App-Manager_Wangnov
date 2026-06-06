@@ -8,6 +8,8 @@ import {
   type ReactNode,
 } from "react";
 
+import { withViewTransition } from "./viewTransition";
+
 export type ThemeMode = "system" | "light" | "dark";
 type Resolved = "light" | "dark";
 
@@ -49,8 +51,15 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [resolved]);
 
   const setMode = useCallback((m: ThemeMode) => {
-    setModeState(m);
     localStorage.setItem(LS_KEY, m);
+    withViewTransition(() => {
+      setModeState(m);
+      // Set the attribute synchronously too, so the transition's "after"
+      // snapshot already reflects the new theme — the effect below is passive
+      // and would otherwise run after the snapshot is captured.
+      document.documentElement.dataset.theme =
+        m === "system" ? (systemPrefersDark() ? "dark" : "light") : m;
+    });
   }, []);
 
   const value = useMemo(() => ({ mode, resolved, setMode }), [mode, resolved, setMode]);

@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { managerApi } from "../services/managerApi";
-import { Icon, type IconName } from "./icons";
+import { Icon, type IconName, CodexMark } from "./icons";
 import { useI18n } from "./i18n";
 
 function closeWindow() {
@@ -67,7 +67,7 @@ export function TopBar({ children }: { children?: ReactNode }) {
   return (
     <div className="topbar" data-tauri-drag-region>
       <div className="mark" data-tauri-drag-region>
-        C
+        <CodexMark />
       </div>
       <div className="wordmark" data-tauri-drag-region>
         {t("app.name")}
@@ -107,7 +107,7 @@ export function NavBar({
   );
 }
 
-export type RingVariant = "accent" | "amber" | "muted" | "danger";
+export type RingVariant = "accent" | "success" | "amber" | "muted" | "danger";
 
 export function Ring({
   icon,

@@ -61,7 +61,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         {done ? (
           <>
             <section className="hero" style={{ marginTop: 16 }}>
-              <Ring icon="check" />
+              <Ring icon="check" variant="success" className="pop" />
               <div className="headline">{t("uninstall.heading")}</div>
               <div className="desc">{done}</div>
             </section>

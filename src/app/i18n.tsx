@@ -8,6 +8,8 @@ import {
   type ReactNode,
 } from "react";
 
+import { withViewTransition } from "./viewTransition";
+
 export type Lang = "zh-CN" | "en";
 
 // Canonical copy lives here. zh-CN is the source of truth; en mirrors it.
@@ -307,9 +309,9 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   const [lang, setLangState] = useState<Lang>(detectLang);
 
   const setLang = useCallback((l: Lang) => {
-    setLangState(l);
     localStorage.setItem(LS_KEY, l);
     document.documentElement.lang = l;
+    withViewTransition(() => setLangState(l));
   }, []);
 
   useEffect(() => {

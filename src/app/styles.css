@@ -6,10 +6,20 @@
    ─────────────────────────────────────────────────────────────────────────── */
 
 :root {
-  --accent: #2ee6a6;
-  --accent-2: #16c98c;
-  --accent-deep: #0c8f63;
-  --accent-ink: #04140e;
+  /* Codex brand gradient — straight from the official logo (lobehub) */
+  --brand-violet: #b1a7ff;
+  --brand-blue: #7a9dff;
+  --brand-deep: #3941ff;
+
+  /* accent — interactive blue-violet, drawn from the cloud's core */
+  --accent: #7c8dff;
+  --accent-2: #5a6bf5;
+  --accent-ink: #ffffff;
+
+  /* success — the former brand green, demoted to a "healthy / done" semantic */
+  --success: #2ee6a6;
+  --success-2: #16c98c;
+
   --amber: #f0a83d;
   --danger: #f2615f;
   --danger-2: #d94542;
@@ -24,50 +34,63 @@
     "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 /* Dark — primary (the approved look) */
 :root,
 [data-theme="dark"] {
-  --bg: #0e0f11;
-  --surface: #16181b;
-  --surface-2: #1c1f23;
-  --surface-3: #23272c;
-  --line: #262a2f;
-  --line-2: #343941;
-  --text: #f2f4f6;
-  --text-soft: #9aa3ad;
-  --text-faint: #69707a;
-  --accent-tint: rgba(46, 230, 166, 0.13);
+  /* cooler, faintly blue-leaning ink so the violet brand feels at home */
+  --bg: #0c0d12;
+  --surface: #15161c;
+  --surface-2: #1b1d25;
+  --surface-3: #23262f;
+  --line: #262a33;
+  --line-2: #343a46;
+  --text: #f2f3f7;
+  --text-soft: #9aa1b0;
+  --text-faint: #686f7e;
+  --accent-deep: #aab4ff;
+  --success-deep: #4fe6b0;
+  --accent-tint: color-mix(in srgb, var(--accent) 16%, transparent);
+  --success-tint: color-mix(in srgb, var(--success) 14%, transparent);
   --amber-tint: rgba(240, 168, 61, 0.15);
   --danger-tint: rgba(242, 97, 95, 0.14);
-  --ring-glow: rgba(46, 230, 166, 0.35);
+  --ring-glow: color-mix(in srgb, var(--accent) 42%, transparent);
+  --accent-glow: color-mix(in srgb, var(--accent) 30%, transparent);
   --sh-md: 0 1px 2px rgba(0, 0, 0, 0.4), 0 16px 40px rgba(0, 0, 0, 0.45);
   --sh-pop: 0 20px 60px rgba(0, 0, 0, 0.55);
-  --btn-primary-ink: #04140e;
+  --btn-primary-ink: #ffffff;
 }
 
 [data-theme="light"] {
-  --bg: #eef0f3;
+  --bg: #eceef3;
   --surface: #ffffff;
-  --surface-2: #f6f7f9;
-  --surface-3: #eef0f3;
-  --line: #e4e7ec;
-  --line-2: #d4d9e0;
-  --text: #15171a;
-  --text-soft: #5c636d;
-  --text-faint: #9aa1aa;
-  --accent: #10b981;
-  --accent-2: #0ea372;
-  --accent-tint: rgba(16, 185, 129, 0.12);
+  --surface-2: #f5f6f9;
+  --surface-3: #eceef3;
+  --line: #e3e6ec;
+  --line-2: #d2d7e0;
+  --text: #14151a;
+  --text-soft: #595f6b;
+  --text-faint: #969ca8;
+  /* deeper, more saturated blue-violet so it reads on white */
+  --accent: #5b6bff;
+  --accent-2: #4453f0;
+  --accent-deep: #4a52cf;
+  --success: #10b981;
+  --success-2: #0ea372;
+  --success-deep: #0a8f63;
+  --accent-tint: color-mix(in srgb, var(--accent) 12%, transparent);
+  --success-tint: color-mix(in srgb, var(--success) 12%, transparent);
   --amber: #e08a1e;
   --amber-tint: rgba(224, 138, 30, 0.14);
   --danger: #e0524f;
   --danger-tint: rgba(224, 82, 79, 0.12);
-  --ring-glow: rgba(16, 185, 129, 0.28);
+  --ring-glow: color-mix(in srgb, var(--accent) 26%, transparent);
+  --accent-glow: color-mix(in srgb, var(--accent) 22%, transparent);
   --sh-md: 0 1px 2px rgba(20, 24, 30, 0.06), 0 14px 34px rgba(20, 24, 30, 0.1);
   --sh-pop: 0 18px 50px rgba(20, 24, 30, 0.22);
-  --btn-primary-ink: #04241a;
+  --btn-primary-ink: #ffffff;
 }
 
 * {
@@ -132,17 +155,34 @@ input {
   width: 0;
 }
 
-/* view transition */
+/* view transition — children rise in sequence (Codex-style staggered entrance) */
 .view {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  animation: viewin 0.18s var(--ease);
 }
-@keyframes viewin {
+.view > * {
+  animation: risein 0.34s var(--ease) both;
+}
+.view > *:nth-child(1) {
+  animation-delay: 0.02s;
+}
+.view > *:nth-child(2) {
+  animation-delay: 0.06s;
+}
+.view > *:nth-child(3) {
+  animation-delay: 0.1s;
+}
+.view > *:nth-child(4) {
+  animation-delay: 0.14s;
+}
+.view > *:nth-child(n + 5) {
+  animation-delay: 0.16s;
+}
+@keyframes risein {
   from {
     opacity: 0;
-    transform: translateY(4px);
+    transform: translateY(7px);
   }
 }
 
@@ -156,14 +196,22 @@ input {
 .mark {
   width: 24px;
   height: 24px;
-  border-radius: 7px;
-  background: linear-gradient(150deg, var(--accent), var(--accent-2));
-  color: var(--accent-ink);
   display: grid;
   place-items: center;
-  font-weight: 800;
-  font-size: 14px;
   flex-shrink: 0;
+}
+.mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.3));
+}
+.mark-lg {
+  width: 56px;
+  height: 56px;
+}
+.mark-lg img {
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.25));
 }
 .wordmark {
   font-weight: 700;
@@ -312,7 +360,7 @@ input {
 .headline {
   font-size: 22px;
   font-weight: 760;
-  letter-spacing: 0.3px;
+  letter-spacing: -0.02em;
 }
 .sub {
   margin-top: 5px;
@@ -363,7 +411,7 @@ input {
   border-radius: 50%;
 }
 .dot.managed {
-  background: var(--accent);
+  background: var(--success);
 }
 .dot.external {
   background: var(--amber);
@@ -421,10 +469,17 @@ input {
   background: linear-gradient(150deg, var(--accent), var(--accent-2));
   border-color: transparent;
   color: var(--btn-primary-ink);
-  box-shadow: 0 6px 18px rgba(46, 230, 166, 0.25);
+  box-shadow: 0 6px 18px var(--accent-glow);
 }
 .btn.primary:hover:not(:disabled) {
-  box-shadow: 0 6px 22px rgba(46, 230, 166, 0.36);
+  /* mirror the danger button: keep the gradient on hover (brighter top stop),
+     not the flat surface-3 that .btn:hover would otherwise paint on. */
+  background: linear-gradient(
+    150deg,
+    color-mix(in srgb, var(--accent) 78%, #ffffff),
+    var(--accent-2)
+  );
+  box-shadow: 0 8px 26px color-mix(in srgb, var(--accent) 44%, transparent);
 }
 .btn.danger {
   background: linear-gradient(150deg, var(--danger), var(--danger-2));
@@ -572,6 +627,8 @@ button.row:hover {
   margin-top: 14px;
 }
 .bar-fill {
+  position: relative;
+  overflow: hidden;
   height: 100%;
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
   border-radius: var(--r-pill);
@@ -731,8 +788,8 @@ button.row:hover {
   flex-shrink: 0;
 }
 .banner.ok {
-  background: var(--accent-tint);
-  color: var(--accent-deep);
+  background: var(--success-tint);
+  color: var(--success-deep);
 }
 .banner.err {
   background: var(--danger-tint);
@@ -833,4 +890,166 @@ button.row:hover {
 }
 .sheet .row2 > * {
   flex: 1;
+}
+
+/* ── Motion: Codex-style shimmer / glow / micro-interactions ──────────────── */
+
+/* Busy-state title shimmer — learnt from codex-logo-shimmer
+   (background-clip:text + a sweeping gradient position). */
+.shimmer {
+  background: linear-gradient(
+    100deg,
+    var(--text-soft) 0%,
+    var(--text-soft) 38%,
+    var(--text) 50%,
+    var(--text-soft) 62%,
+    var(--text-soft) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: textsweep 2s var(--ease) infinite;
+}
+@keyframes textsweep {
+  0% {
+    background-position: 140% 0;
+  }
+  100% {
+    background-position: -120% 0;
+  }
+}
+
+/* Success ring variant (semantic green: up-to-date / installed). */
+.ring.success {
+  --ring-color: var(--success);
+  --ring-soft: var(--success-tint);
+  box-shadow: 0 0 0 6px var(--success-tint),
+    0 0 24px color-mix(in srgb, var(--success) 34%, transparent);
+}
+
+/* Hero ring breathing glow — used while checking / downloading. */
+.ring.glow {
+  animation: ringbreath 2.6s ease-in-out infinite;
+}
+@keyframes ringbreath {
+  0%,
+  100% {
+    box-shadow: 0 0 0 6px var(--ring-soft, var(--accent-tint)), 0 0 20px var(--ring-glow);
+  }
+  50% {
+    box-shadow: 0 0 0 7px var(--ring-soft, var(--accent-tint)), 0 0 40px var(--ring-glow);
+  }
+}
+
+/* Completion check — springy pop-in with slight overshoot. */
+.ring.pop {
+  animation: popin 0.5s var(--ease-spring) both;
+}
+@keyframes popin {
+  0% {
+    transform: scale(0.7);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.06);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Live status-dot pulse — learnt from sync-dot-pass. */
+.dot.live {
+  animation: dotpulse 1.8s ease-in-out infinite;
+}
+@keyframes dotpulse {
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.25);
+  }
+}
+
+/* Progress-bar moving sheen — learnt from loading-shimmer. */
+.bar-fill:not(.indeterminate)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.4) 50%,
+    transparent 80%
+  );
+  background-size: 200% 100%;
+  animation: barsheen 1.5s linear infinite;
+}
+@keyframes barsheen {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -60% 0;
+  }
+}
+
+/* Respect reduced-motion — drop sweeps & pulses, keep everything legible. */
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    animation: none;
+    -webkit-text-fill-color: var(--text);
+    color: var(--text);
+  }
+  .ring.glow,
+  .ring.pop,
+  .dot.live,
+  .bar-fill::after,
+  .bar-fill.indeterminate,
+  .ring.spin svg,
+  .spinicon,
+  .view > * {
+    animation: none !important;
+  }
+}
+
+/* Big rolling percentage — the focal point of the download state. */
+.pctbig {
+  margin-top: 16px;
+  font-family: var(--mono);
+  font-size: 38px;
+  font-weight: 660;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.pctbig .pctsign {
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--text-soft);
+  margin-left: 3px;
+  letter-spacing: 0;
+}
+
+/* The app-icon logo carries its own light/dark variant (swapped in CodexMark by
+   theme), so no per-theme mark tweaks are needed here. */
+
+/* ── Theme / language cross-fade (View Transitions API) ──────────────────── */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.32s;
+  animation-timing-function: var(--ease);
+}
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
 }
