@@ -10,7 +10,8 @@
     "check": "tsc --noEmit",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "tauri:build:mac": "tauri build && bash scripts/macos-adaptive-icon.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0",
