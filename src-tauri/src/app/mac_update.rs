@@ -84,34 +84,47 @@ fn official_for_arch(arch: &str) -> &'static str {
     }
 }
 
-/// Resolve the appcast URL honoring the user's configured update source and the
-/// given architecture. `auto`/`mirror` use the CN-reachable mirror; `official`
-/// uses OpenAI directly; `custom` uses the user's URL (mirror fallback if empty).
-fn resolve_appcast_for_arch(arch: &str) -> String {
+/// Architecture to plan against: the INSTALLED Codex's (so a delta applies to
+/// the right base bundle), falling back to the host arch when nothing's installed.
+fn arch_of(installed: &Option<InstalledCodex>) -> &str {
+    installed
+        .as_ref()
+        .map(|i| i.arch.as_str())
+        .unwrap_or(std::env::consts::ARCH)
+}
+
+fn fetch_one(url: String) -> Result<(String, String), AppError> {
+    let xml = sys::fetch_text(&url).map_err(|e| AppError::Engine(e.to_string()))?;
+    Ok((url, xml))
+}
+
+/// Fetch the appcast XML honoring the configured source — returns (url, xml).
+/// `auto` tries the CN-reachable mirror first and falls back to OpenAI official
+/// when the mirror is unreachable; `mirror` / `official` / `custom` use exactly
+/// that source (custom falls back to the mirror when its URL is blank).
+fn fetch_appcast_for_arch(arch: &str) -> Result<(String, String), AppError> {
     let settings = crate::app::settings_store::AppSettings::load();
     match settings.source.as_str() {
-        "official" => official_for_arch(arch).to_string(),
+        "official" => fetch_one(official_for_arch(arch).to_string()),
+        "mirror" => fetch_one(appcast_for_arch(arch).to_string()),
         "custom" => {
             let u = settings.custom_url.trim();
-            if u.is_empty() {
+            let url = if u.is_empty() {
                 appcast_for_arch(arch).to_string()
             } else {
                 u.to_string()
+            };
+            fetch_one(url)
+        }
+        _ => {
+            // auto: mirror first, fall back to OpenAI official if unreachable.
+            let mirror = appcast_for_arch(arch).to_string();
+            match sys::fetch_text(&mirror) {
+                Ok(xml) => Ok((mirror, xml)),
+                Err(_) => fetch_one(official_for_arch(arch).to_string()),
             }
         }
-        _ => appcast_for_arch(arch).to_string(),
     }
-}
-
-/// Resolve the appcast for the INSTALLED Codex's architecture (so a delta applies
-/// to the right base bundle), falling back to the host arch when nothing is
-/// installed yet.
-fn resolve_appcast(installed: &Option<InstalledCodex>) -> String {
-    let arch = installed
-        .as_ref()
-        .map(|i| i.arch.as_str())
-        .unwrap_or(std::env::consts::ARCH);
-    resolve_appcast_for_arch(arch)
 }
 
 fn parse_macos_version(s: &str) -> Option<(u32, u32)> {
@@ -166,8 +179,7 @@ fn detect_installed() -> Option<InstalledCodex> {
 
 pub fn plan_macos_update(simulated_build: Option<u64>) -> Result<MacUpdateReport, AppError> {
     let installed = detect_installed();
-    let appcast_url = resolve_appcast(&installed);
-    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let (appcast_url, xml) = fetch_appcast_for_arch(arch_of(&installed))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed));
 
@@ -231,8 +243,7 @@ fn download_and_verify(url: &str, size: u64, signature: &str) -> Result<PathBuf,
 
 pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport, AppError> {
     let installed = detect_installed();
-    let appcast_url = resolve_appcast(&installed);
-    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let (_, xml) = fetch_appcast_for_arch(arch_of(&installed))?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed))
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
@@ -409,8 +420,7 @@ pub fn perform_macos_update(
 
     let install_path = PathBuf::from(&installed.path);
 
-    let appcast_url = resolve_appcast_for_arch(&installed.arch);
-    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let (_, xml) = fetch_appcast_for_arch(&installed.arch)?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, installed.build)
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
@@ -659,8 +669,7 @@ pub fn install_macos() -> Result<MacInstallStatus, AppError> {
     } else {
         "x86_64"
     };
-    let appcast_url = resolve_appcast_for_arch(arch);
-    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let (_, xml) = fetch_appcast_for_arch(arch)?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
     if let Some(latest) = appcast.latest() {
         require_os_supported(latest.minimum_system_version.as_deref())?;
@@ -687,7 +696,14 @@ pub fn install_macos() -> Result<MacInstallStatus, AppError> {
     if let Some((path, build)) = sys::installed_codex_build() {
         let mut store = ProvenanceStore::load();
         store.record(path, build, "manager-installed");
-        let _ = store.save();
+        // The app is on disk now; if we can't persist provenance the install
+        // would be misclassified as external, so surface it (the install
+        // succeeded — the user just needs to re-adopt from the main screen).
+        store.save().map_err(|e| {
+            AppError::Engine(format!(
+                "已安装 Codex,但来源记录保存失败（{e}）;请在主界面「开始管理」纳入管理"
+            ))
+        })?;
     }
     let _ = relaunch(&install_path);
     Ok(mac_install_status())
