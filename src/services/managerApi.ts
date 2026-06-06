@@ -7,6 +7,12 @@ import type {
   MacPerformReport,
   MacStageReport,
   MacUpdateReport,
+  WinAutoStageReport,
+  WinInstallStatus,
+  WinPerformReport,
+  WinStageReport,
+  WinUninstallReport,
+  WinUpdateReport,
 } from "../shared/types";
 
 declare global {
@@ -50,6 +56,134 @@ const FALLBACK_STAGE: MacStageReport = {
   savingsPct: 95.5,
   stagedPath: "(browser-dev mock) …/Codex3575-3511-arm64.delta",
   verified: true,
+};
+
+const WIN_FALLBACK_PLAN: WinUpdateReport = {
+  manifestUrl: "https://codexapp.agentsmirror.com/latest/manifest",
+  checksumsUrl: "https://codexapp.agentsmirror.com/latest/checksums",
+  packageUrl: "https://codexapp.agentsmirror.com/latest/win",
+  release: {
+    version: "26.602.3474.0",
+    packageMoniker: "OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0",
+    architecture: "x64",
+    contentLength: 566504666,
+    etag: '"4XJflSyTxVc59Sr2FfA4HAqFCD0="',
+    storeProductId: "9PLM9XGG6VKS",
+    packageIdentity: "OpenAI.Codex",
+  },
+  installed: null,
+  capabilities: {
+    addAppxPackage: { state: "available", detail: "browser-dev mock" },
+    appxService: { state: "available", detail: "browser-dev mock" },
+    sideloadPolicy: { state: "unknown", detail: "browser-dev mock" },
+    appInstaller: { state: "available", detail: "browser-dev mock" },
+    meteredNetwork: { state: "unknown", detail: "browser-dev mock" },
+    recommendation: "msix-preferred",
+    notes: ["Certificate trust is verified after the MSIX is staged."],
+  },
+  plan: {
+    upToDate: false,
+    currentVersion: null,
+    latestVersion: "26.602.3474.0",
+    packageMoniker: "OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0",
+    packageUrl: "https://codexapp.agentsmirror.com/latest/win",
+    downloadSize: 566504666,
+    sha256: "6dc2e05ac2b760bbc77ce3f8a992efdb327363512c9c4744b9a146c41bc4d55a",
+    route: "msix-sideload",
+    portableFallbackReady: true,
+    warnings: [],
+  },
+};
+
+const WIN_FALLBACK_STAGE: WinStageReport = {
+  upToDate: false,
+  route: "msix-sideload",
+  latestVersion: "26.602.3474.0",
+  downloadSize: 566504666,
+  stagedPath: "(browser-dev mock) …/OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0.msix",
+  sha256: "6dc2e05ac2b760bbc77ce3f8a992efdb327363512c9c4744b9a146c41bc4d55a",
+  hashVerified: true,
+  authenticode: {
+    trusted: true,
+    publisherIsOpenai: true,
+    status: "Valid",
+    statusMessage: "browser-dev mock",
+    subject: "CN=OpenAI OpCo, LLC",
+    issuer: "browser-dev mock",
+    thumbprint: "browser-dev mock",
+  },
+  identity: {
+    name: "OpenAI.Codex",
+    publisher: "CN=OpenAI OpCo, LLC",
+    version: "26.602.3474.0",
+    processorArchitecture: "x64",
+  },
+  identityVerified: true,
+  installReady: true,
+  portableFallbackReady: true,
+  notes: ["Non-destructive staging only; install execution is the next guarded step."],
+};
+
+const WIN_FALLBACK_AUTO_STAGE: WinAutoStageReport = {
+  enabled: true,
+  allowMetered: false,
+  attempted: true,
+  skipped: false,
+  reason: "staged",
+  stage: WIN_FALLBACK_STAGE,
+  capabilities: WIN_FALLBACK_PLAN.capabilities,
+  notes: ["browser-dev mock: package staged in the background."],
+};
+
+const WIN_FALLBACK_PERFORM: WinPerformReport = {
+  success: true,
+  action: "msix-sideload",
+  message: "browser-dev mock: Add-AppxPackage succeeded",
+  stage: WIN_FALLBACK_STAGE,
+  sideload: {
+    success: true,
+    message: "browser-dev mock: Add-AppxPackage succeeded",
+    installed: {
+      path: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0",
+      version: "26.602.3474.0",
+      arch: "x64",
+      source: "msix",
+      packageFamilyName: "OpenAI.Codex_2p2nqsd0c76g0",
+    },
+    fallbackRecommended: false,
+    rawError: null,
+  },
+  portable: null,
+  installed: {
+    path: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0",
+    version: "26.602.3474.0",
+    arch: "x64",
+    source: "msix",
+    packageFamilyName: "OpenAI.Codex_2p2nqsd0c76g0",
+  },
+  fallbackAvailable: true,
+  fallbackAttempted: false,
+  notes: ["browser-dev mock: install path is simulated."],
+};
+
+const WIN_FALLBACK_UNINSTALL: WinUninstallReport = {
+  success: true,
+  action: "remove-portable",
+  message: "browser-dev mock: uninstall completed",
+  installedBefore: WIN_FALLBACK_PERFORM.installed,
+  msix: null,
+  portable: {
+    success: true,
+    installRoot: "%LOCALAPPDATA%\\Programs\\Codex",
+    removedFiles: true,
+    removedShortcut: true,
+    removedUninstallEntry: true,
+    purgedUserData: false,
+    message: "browser-dev mock: portable uninstall completed",
+    notes: ["browser-dev mock"],
+  },
+  purgedUserData: false,
+  notes: ["User data was preserved."],
 };
 
 export const managerApi = {
@@ -124,5 +258,69 @@ export const managerApi = {
       return Promise.resolve({ installed: null, status: "managed" });
     }
     return invoke<MacInstallStatus>("mac_adopt");
+  },
+  winPlanUpdate(): Promise<WinUpdateReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(WIN_FALLBACK_PLAN);
+    }
+    return invoke<WinUpdateReport>("win_plan_update");
+  },
+  winStageUpdate(): Promise<WinStageReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(WIN_FALLBACK_STAGE);
+    }
+    return invoke<WinStageReport>("win_stage_update");
+  },
+  winAutoStageUpdate(enabled: boolean, allowMetered: boolean): Promise<WinAutoStageReport> {
+    if (!hasTauriRuntime()) {
+      if (!enabled) {
+        return Promise.resolve({
+          ...WIN_FALLBACK_AUTO_STAGE,
+          enabled,
+          allowMetered,
+          attempted: false,
+          skipped: true,
+          reason: "disabled",
+          stage: null,
+          notes: ["browser-dev mock: automatic pre-download is disabled."],
+        });
+      }
+      return Promise.resolve({ ...WIN_FALLBACK_AUTO_STAGE, enabled, allowMetered });
+    }
+    return invoke<WinAutoStageReport>("win_auto_stage_update", { enabled, allowMetered });
+  },
+  winCancelDownload(): Promise<boolean> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(false);
+    }
+    return invoke<boolean>("win_cancel_download");
+  },
+  winPerformUpdate(confirm: boolean): Promise<WinPerformReport> {
+    if (!hasTauriRuntime()) {
+      return confirm
+        ? Promise.resolve(WIN_FALLBACK_PERFORM)
+        : Promise.reject(new Error("explicit confirmation is required"));
+    }
+    return invoke<WinPerformReport>("win_perform_update", { confirm });
+  },
+  winUninstall(confirm: boolean, purgeUserData: boolean): Promise<WinUninstallReport> {
+    if (!hasTauriRuntime()) {
+      return confirm
+        ? Promise.resolve({ ...WIN_FALLBACK_UNINSTALL, purgedUserData: purgeUserData })
+        : Promise.reject(new Error("explicit confirmation is required"));
+    }
+    return invoke<WinUninstallReport>("win_uninstall", { confirm, purgeUserData });
+  },
+  winStatus(): Promise<WinInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ installed: null, status: "none" });
+    }
+    return invoke<WinInstallStatus>("win_status");
+  },
+  winAdopt(): Promise<WinInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ installed: WIN_FALLBACK_PLAN.installed, status: "managed" });
+    }
+    return invoke<WinInstallStatus>("win_adopt");
   },
 };

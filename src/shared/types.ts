@@ -62,3 +62,176 @@ export interface MacInstallStatus {
   installed: InstalledCodex | null;
   status: InstallClass;
 }
+
+export interface InstalledWindowsCodex {
+  path: string;
+  version: string;
+  arch: string | null;
+  source: "msix" | "portable" | string;
+  packageFamilyName: string | null;
+}
+
+export interface WindowsRelease {
+  version: string;
+  packageMoniker: string;
+  architecture: string | null;
+  contentLength: number | null;
+  etag: string | null;
+  storeProductId: string | null;
+  packageIdentity: string | null;
+}
+
+export type CapabilityState = "available" | "unavailable" | "unknown";
+
+export interface CapabilityCheck {
+  state: CapabilityState;
+  detail: string;
+}
+
+export type SideloadRecommendation = "msix-preferred" | "portable-fallback";
+
+export interface WinCapabilityReport {
+  addAppxPackage: CapabilityCheck;
+  appxService: CapabilityCheck;
+  sideloadPolicy: CapabilityCheck;
+  appInstaller: CapabilityCheck;
+  meteredNetwork: CapabilityCheck;
+  recommendation: SideloadRecommendation;
+  notes: string[];
+}
+
+export type WinInstallRoute = "msix-sideload" | "portable-fallback";
+
+export interface WindowsUpdatePlan {
+  upToDate: boolean;
+  currentVersion: string | null;
+  latestVersion: string;
+  packageMoniker: string;
+  packageUrl: string;
+  downloadSize: number | null;
+  sha256: string;
+  route: WinInstallRoute;
+  portableFallbackReady: boolean;
+  warnings: string[];
+}
+
+export interface WinUpdateReport {
+  manifestUrl: string;
+  checksumsUrl: string;
+  packageUrl: string;
+  release: WindowsRelease;
+  installed: InstalledWindowsCodex | null;
+  capabilities: WinCapabilityReport;
+  plan: WindowsUpdatePlan;
+}
+
+export interface AuthenticodeReport {
+  trusted: boolean;
+  publisherIsOpenai: boolean;
+  status: string;
+  statusMessage: string;
+  subject: string;
+  issuer: string;
+  thumbprint: string;
+}
+
+export interface MsixIdentity {
+  name: string;
+  publisher: string;
+  version: string;
+  processorArchitecture: string;
+}
+
+export interface WinStageReport {
+  upToDate: boolean;
+  route: string;
+  latestVersion: string;
+  downloadSize: number;
+  stagedPath: string | null;
+  sha256: string;
+  hashVerified: boolean;
+  authenticode: AuthenticodeReport | null;
+  identity: MsixIdentity | null;
+  identityVerified: boolean;
+  installReady: boolean;
+  portableFallbackReady: boolean;
+  notes: string[];
+}
+
+export interface WinAutoStageReport {
+  enabled: boolean;
+  allowMetered: boolean;
+  attempted: boolean;
+  skipped: boolean;
+  reason: "disabled" | "up-to-date" | "metered-network" | "metered-unknown" | "staged" | string;
+  stage: WinStageReport | null;
+  capabilities: WinCapabilityReport | null;
+  notes: string[];
+}
+
+export interface MsixSideloadReport {
+  success: boolean;
+  message: string;
+  installed: InstalledWindowsCodex | null;
+  fallbackRecommended: boolean;
+  rawError: string | null;
+}
+
+export interface WinPerformReport {
+  success: boolean;
+  action: string;
+  message: string;
+  stage: WinStageReport;
+  sideload: MsixSideloadReport | null;
+  portable: PortableInstallReport | null;
+  installed: InstalledWindowsCodex | null;
+  fallbackAvailable: boolean;
+  fallbackAttempted: boolean;
+  notes: string[];
+}
+
+export interface PortableInstallReport {
+  success: boolean;
+  installRoot: string;
+  executablePath: string | null;
+  version: string;
+  backupPath: string | null;
+  shortcutCreated: boolean;
+  uninstallEntryCreated: boolean;
+  relaunched: boolean;
+  message: string;
+  notes: string[];
+}
+
+export interface MsixRemoveReport {
+  success: boolean;
+  message: string;
+  rawError: string | null;
+}
+
+export interface PortableUninstallReport {
+  success: boolean;
+  installRoot: string;
+  removedFiles: boolean;
+  removedShortcut: boolean;
+  removedUninstallEntry: boolean;
+  purgedUserData: boolean;
+  message: string;
+  notes: string[];
+}
+
+export interface WinUninstallReport {
+  success: boolean;
+  action: string;
+  message: string;
+  installedBefore: InstalledWindowsCodex | null;
+  msix: MsixRemoveReport | null;
+  portable: PortableUninstallReport | null;
+  purgedUserData: boolean;
+  notes: string[];
+}
+
+export interface WinInstallStatus {
+  installed: InstalledWindowsCodex | null;
+  status: InstallClass;
+}
