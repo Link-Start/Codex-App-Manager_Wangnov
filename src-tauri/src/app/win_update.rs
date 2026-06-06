@@ -140,12 +140,35 @@ fn route_label(plan: &WindowsUpdatePlan) -> String {
     .to_string()
 }
 
+/// Detect the installed Codex, preferring a manager-managed PORTABLE build over
+/// a still-present (possibly stale) MSIX package.
+///
+/// `detect_installed_codex` is MSIX-first, which is correct for a clean machine.
+/// But after a portable fallback an older MSIX can linger — e.g. sideload was
+/// blocked by policy and the package couldn't be removed — and it would shadow
+/// the portable build we just installed and recorded, leaving status, planning
+/// and uninstall all resolving to the stale package (shown as external, planned
+/// against the old version, and impossible to uninstall). When a managed portable
+/// build is present it wins; otherwise fall back to normal MSIX-first detection.
+fn detect_managed_codex(
+    settings: &AppSettings,
+    store: &ProvenanceStore,
+) -> Option<InstalledWindowsCodex> {
+    let root = PathBuf::from(&settings.install_root);
+    if let Some(portable) = detect_portable_install(root.as_path()) {
+        if store.is_managed(&portable.path) {
+            return Some(portable);
+        }
+    }
+    detect_installed_codex(root.as_path())
+}
+
 pub fn plan_windows_update(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
 ) -> Result<WinUpdateReport, AppError> {
     let (release, sha256) = read_windows_release(endpoints)?;
-    let installed = detect_installed_codex(PathBuf::from(&settings.install_root).as_path());
+    let installed = detect_managed_codex(settings, &ProvenanceStore::load());
     let capabilities = probe_capabilities();
     let plan = plan_update(
         &release,
@@ -501,8 +524,8 @@ fn install_portable_after_stage(
 }
 
 pub fn win_install_status(settings: &AppSettings) -> WinInstallStatus {
-    let installed = detect_installed_codex(PathBuf::from(&settings.install_root).as_path());
     let store = ProvenanceStore::load();
+    let installed = detect_managed_codex(settings, &store);
     let status = match &installed {
         None => "none",
         Some(codex) if store.is_managed(&codex.path) => "managed",
@@ -536,7 +559,7 @@ pub fn uninstall_windows_codex(
         ));
     }
 
-    let installed = detect_installed_codex(PathBuf::from(&settings.install_root).as_path());
+    let installed = detect_managed_codex(settings, &ProvenanceStore::load());
     let Some(installed_before) = installed else {
         return Ok(WinUninstallReport {
             success: true,
