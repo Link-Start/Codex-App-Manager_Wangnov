@@ -271,6 +271,7 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
             <button
               className="btn primary big"
               onClick={() => (settings.askBefore ? setConfirmOpen(true) : void runPerform())}
+              disabled={busy !== null}
             >
               <Icon name="download" />
               {t("home.update.cta")}

@@ -725,14 +725,16 @@ pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppE
     std::fs::remove_dir_all(&install_path)
         .map_err(|e| AppError::Engine(format!("remove app bundle: {e}")))?;
 
-    // Drop our provenance record for this path.
+    // Drop our provenance record for this path. If the write fails the file
+    // still lists this path as managed — a later external install at the same
+    // path would then bypass the uninstall boundary — so surface it.
     store.managed.retain(|r| r.path != installed.path);
-    let _ = store.save();
+    let prov_saved = store.save().is_ok();
 
     // Only ever touch ~/.codex when the user explicitly opted out of keeping it.
     // If the removal fails (e.g. permissions), report honestly rather than
     // claiming the data was cleared.
-    let (kept_codex_home, message) = if keep_codex_home {
+    let (kept_codex_home, mut message) = if keep_codex_home {
         (true, "已卸载 Codex,保留了 ~/.codex".to_string())
     } else {
         let mut cleared = true;
@@ -748,6 +750,9 @@ pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppE
             (true, "已卸载 Codex,但 ~/.codex 清除失败,数据仍保留".to_string())
         }
     };
+    if !prov_saved {
+        message.push_str("；托管记录更新失败,请重新检查管理状态");
+    }
 
     Ok(MacUninstallReport {
         removed: true,
