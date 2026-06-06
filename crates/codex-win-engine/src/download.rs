@@ -12,6 +12,25 @@ use crate::EngineError;
 static DOWNLOAD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static DOWNLOAD_CANCELLED: AtomicBool = AtomicBool::new(false);
 
+struct DownloadGuard;
+
+impl DownloadGuard {
+    fn acquire() -> Result<Self, String> {
+        DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
+        DOWNLOAD_ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self)
+            .map_err(|_| "another Windows package download is already active".to_string())
+    }
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        DOWNLOAD_ACTIVE.store(false, Ordering::SeqCst);
+        DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
+    }
+}
+
 pub fn cancel_active_download() -> bool {
     let active = DOWNLOAD_ACTIVE.load(Ordering::SeqCst);
     if active {
@@ -46,7 +65,6 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
     }
     args.extend(["-o".to_string(), dest, url.to_string()]);
 
-    DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
     let mut child = Command::new("curl")
         .args(args)
         .stdout(Stdio::piped())
@@ -54,12 +72,10 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("spawn curl: {e}"))?;
 
-    DOWNLOAD_ACTIVE.store(true, Ordering::SeqCst);
     loop {
         if DOWNLOAD_CANCELLED.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
-            DOWNLOAD_ACTIVE.store(false, Ordering::SeqCst);
             return Err("download cancelled".to_string());
         }
         match child.try_wait() {
@@ -67,7 +83,6 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
             Ok(None) => thread::sleep(Duration::from_millis(200)),
             Err(err) => {
                 let _ = child.kill();
-                DOWNLOAD_ACTIVE.store(false, Ordering::SeqCst);
                 return Err(format!("wait for curl: {err}"));
             }
         }
@@ -75,12 +90,8 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
 
     let output = match child.wait_with_output() {
         Ok(output) => output,
-        Err(err) => {
-            DOWNLOAD_ACTIVE.store(false, Ordering::SeqCst);
-            return Err(format!("collect curl output: {err}"));
-        }
+        Err(err) => return Err(format!("collect curl output: {err}")),
     };
-    DOWNLOAD_ACTIVE.store(false, Ordering::SeqCst);
 
     if !output.status.success() {
         return Err(format!(
@@ -92,6 +103,10 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
 }
 
 pub fn download_to(url: &str, dest: &Path) -> Result<(), EngineError> {
+    // The manager has one Windows package staging slot. Serialize downloads so
+    // auto-stage and manual-stage cannot reset each other's cancel flag.
+    let _guard = DownloadGuard::acquire().map_err(EngineError::Io)?;
+
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| EngineError::Io(format!("create staging dir: {e}")))?;
@@ -146,4 +161,18 @@ pub fn sha256_file(path: &Path) -> Result<String, EngineError> {
         hasher.update(&buf[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_guard_rejects_concurrent_downloads() {
+        let guard = DownloadGuard::acquire().unwrap();
+        assert!(cancel_active_download());
+        assert!(DownloadGuard::acquire().is_err());
+        drop(guard);
+        assert!(!cancel_active_download());
+    }
 }

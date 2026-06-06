@@ -70,7 +70,7 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
         let mut file = zip
             .by_index(idx)
             .map_err(|e| EngineError::Msix(format!("read zip entry {idx}: {e}")))?;
-        let Some(enclosed) = file.enclosed_name().map(PathBuf::from) else {
+        let Some(enclosed) = file.enclosed_name() else {
             continue;
         };
         let out_path = dest.join(&enclosed);
@@ -196,6 +196,7 @@ fn request_codex_close_filtered(timeout_secs: u64, root: Option<&Path>) -> Resul
     let root_filter = root
         .map(|path| ps_quote(&path.to_string_lossy()))
         .unwrap_or_else(|| "$null".to_string());
+    let timeout = timeout_secs;
     let script = format!(
         r#"
 $RootFilter = {root_filter}
@@ -245,9 +246,7 @@ while ((Get-Date) -lt $deadline) {{
   }}
 }}
 'running:' + (($remaining | ForEach-Object {{ $_.Id }}) -join ',')
-"#,
-        root_filter = root_filter,
-        timeout = timeout_secs
+"#
     );
     let result = run_powershell(&script)?;
     if result.trim().ends_with("closed") || result.trim().ends_with("no-targets") {
