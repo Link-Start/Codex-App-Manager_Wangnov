@@ -29,14 +29,22 @@ export function Settings({
   const { t, lang, setLang } = useI18n();
   const { mode, setMode } = useTheme();
   const [s, setS] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [autostart, setAutostart] = useState(false);
 
   useEffect(() => {
     void managerApi.getSettings().then(setS).catch(() => undefined);
+    void managerApi.getAutostart().then(setAutostart).catch(() => undefined);
   }, []);
 
   const save = (next: AppSettings) => {
     setS(next);
     void managerApi.setSettings(next).then(setS).catch(() => undefined);
+  };
+
+  const toggleAutostart = (v: boolean) => {
+    setAutostart(v);
+    // Revert the UI if the OS write fails so the toggle never lies.
+    void managerApi.setAutostart(v).catch(() => setAutostart(!v));
   };
 
   const themes: { v: ThemeMode; k: "settings.appearance.system" | "settings.appearance.light" | "settings.appearance.dark" }[] = [
@@ -109,12 +117,11 @@ export function Settings({
               <Toggle checked={s.askBefore} onChange={(v) => save({ ...s, askBefore: v })} />
             </div>
             <div className="row">
-              <Icon name="shield" className="ricon" />
               <span className="rtext">
-                <span className="rtitle">{t("settings.general.signedOnly")}</span>
-                <span className="rsub">{t("settings.general.signedOnlyNote")}</span>
+                <span className="rtitle">{t("settings.general.autostart")}</span>
+                <span className="rsub">{t("settings.general.autostartNote")}</span>
               </span>
-              <Icon name="check" className="chev" />
+              <Toggle checked={autostart} onChange={toggleAutostart} />
             </div>
           </div>
         </div>

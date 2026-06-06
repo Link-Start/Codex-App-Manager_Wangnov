@@ -17,6 +17,9 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
   const [error, setError] = useState<string | null>(null);
   // Only a managed install may be uninstalled — mirror the backend boundary.
   const [managed, setManaged] = useState<boolean | null>(null);
+  // Confirmation gate: 0 = none, 1 = first confirm, 2 = data-purge confirm
+  // (only reached when the user opted out of keeping data — a 3rd tap total).
+  const [confirmStep, setConfirmStep] = useState<0 | 1 | 2>(0);
 
   useEffect(() => {
     const load = win ? managerApi.winStatus() : managerApi.macStatus();
@@ -24,6 +27,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
   }, [win]);
 
   const run = async () => {
+    setConfirmStep(0);
     setBusy(true);
     setError(null);
     try {
@@ -37,6 +41,16 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
+    }
+  };
+
+  // First confirm → run when keeping data; otherwise escalate to a second,
+  // explicit data-erasure confirm before doing anything destructive.
+  const onFirstConfirm = () => {
+    if (keepData) {
+      void run();
+    } else {
+      setConfirmStep(2);
     }
   };
 
@@ -92,7 +106,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
             <div className="actions">
               <button
                 className="btn danger big"
-                onClick={run}
+                onClick={() => setConfirmStep(1)}
                 disabled={busy || managed !== true}
               >
                 <Icon name="trash" />
@@ -105,6 +119,42 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
           </>
         )}
       </div>
+
+      {confirmStep === 1 ? (
+        <div className="scrim" onClick={() => setConfirmStep(0)}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <Ring icon="trash" variant="danger" />
+            <h3>{t("uninstall.confirm1.title")}</h3>
+            <p>{keepData ? t("uninstall.confirm1.bodyKeep") : t("uninstall.confirm1.bodyPurge")}</p>
+            <div className="row2">
+              <button className="btn ghost" onClick={() => setConfirmStep(0)}>
+                {t("uninstall.cancel")}
+              </button>
+              <button className="btn danger" onClick={onFirstConfirm}>
+                {t("uninstall.continue")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {confirmStep === 2 ? (
+        <div className="scrim" onClick={() => setConfirmStep(0)}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <Ring icon="alert" variant="danger" />
+            <h3>{t("uninstall.confirm2.title")}</h3>
+            <p>{t("uninstall.confirm2.body")}</p>
+            <div className="row2">
+              <button className="btn ghost" onClick={() => setConfirmStep(0)}>
+                {t("uninstall.cancel")}
+              </button>
+              <button className="btn danger" onClick={() => void run()}>
+                {t("uninstall.purgeConfirm")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

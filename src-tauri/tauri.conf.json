@@ -15,15 +15,14 @@
     "windows": [
       {
         "label": "main",
-        "title": "Codex 管理器",
+        "title": "Codex App 管理器",
         "width": 400,
         "height": 640,
         "resizable": false,
         "decorations": false,
         "transparent": true,
-        "visible": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
+        "visible": true,
+        "center": true,
         "shadow": false
       }
     ],

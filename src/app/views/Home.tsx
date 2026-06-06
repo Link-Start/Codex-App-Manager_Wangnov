@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 import { managerApi } from "../../services/managerApi";
 import type {
   AppSettings,
+  DownloadProgress,
   MacInstallStatus,
   MacPerformReport,
   MacUpdateReport,
@@ -39,6 +41,39 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [statusLoaded, setStatusLoaded] = useState(false);
   // Whether it failed (e.g. unsupported platform) — so we don't offer install.
   const [statusFailed, setStatusFailed] = useState(false);
+  // Whether a fresh install just completed — show a done state with an explicit
+  // 〔打开 Codex〕 instead of auto-launching.
+  const [justInstalled, setJustInstalled] = useState(false);
+  // Live download progress (real bytes, emitted by the backend during
+  // install/update); null when not downloading.
+  const [dl, setDl] = useState<DownloadProgress | null>(null);
+  const [speed, setSpeed] = useState(0);
+  const dlSample = useRef<{ t: number; bytes: number } | null>(null);
+
+  const onDlProgress = useCallback((e: { payload: DownloadProgress }) => {
+    const p = e.payload;
+    setDl(p);
+    const now = Date.now();
+    const prev = dlSample.current;
+    if (!prev) {
+      dlSample.current = { t: now, bytes: p.downloaded };
+    } else if (now > prev.t + 400) {
+      setSpeed((p.downloaded - prev.bytes) / ((now - prev.t) / 1000));
+      dlSample.current = { t: now, bytes: p.downloaded };
+    }
+  }, []);
+
+  const startDlListen = useCallback(async () => {
+    setDl(null);
+    setSpeed(0);
+    dlSample.current = null;
+    try {
+      return await listen<DownloadProgress>("mac://download-progress", onDlProgress);
+    } catch {
+      // Non-Tauri (web preview): no event bus — nothing to clean up.
+      return () => {};
+    }
+  }, [onDlProgress]);
 
   const check = useCallback(async () => {
     setBusy("plan");
@@ -94,15 +129,19 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const runInstall = useCallback(async () => {
     setBusy("install");
     setError(null);
+    const un = await startDlListen();
     try {
       setStatus(await managerApi.macInstall());
+      setJustInstalled(true);
       await check();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
+      un();
       setBusy(null);
+      setDl(null);
     }
-  }, [check]);
+  }, [check, startDlListen]);
 
   const runPerform = useCallback(async () => {
     const installed = status?.installed;
@@ -110,6 +149,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     if (!installed || !plan || plan.upToDate) return;
     setBusy("perform");
     setError(null);
+    const un = await startDlListen();
     try {
       const result = await managerApi.macPerformUpdate({
         fromBuild: installed.build,
@@ -124,9 +164,11 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setConfirmOpen(false);
     } finally {
+      un();
       setBusy(null);
+      setDl(null);
     }
-  }, [status, report, refreshStatus, check]);
+  }, [status, report, refreshStatus, check, startDlListen]);
 
   const plan = report?.plan ?? null;
   const installed = status?.installed ?? report?.installed ?? null;
@@ -157,11 +199,18 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     return "uptodate";
   }, [busy, report, error, installed, updateAvailable, status, statusLoaded, statusFailed]);
 
-  const version = plan?.latestShortVersion || (installed ? `build ${installed.build}` : "");
+  // Always show the LOCAL installed version (CFBundleShortVersionString), never
+  // the source's latest — they differ when the mirror lags or Codex was updated
+  // out-of-band. `latestVersion` is the update target, shown only when updating.
+  const installedVersion =
+    installed?.shortVersion || (installed ? `build ${installed.build}` : "");
+  const latestVersion = plan?.latestShortVersion || "";
   const sourceLabel = t(`source.${settings.source}` as TKey);
 
   // ── progress (performing / installing) takes over the whole screen ─────────
   if (busy === "perform" || busy === "install") {
+    const pct =
+      dl && dl.total > 0 ? Math.min(100, Math.round((dl.downloaded / dl.total) * 100)) : null;
     return (
       <div className="pop">
         <TopBar />
@@ -171,10 +220,49 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             <div className="headline">
               {busy === "install" ? t("progress.installing") : t("progress.title")}
             </div>
-            <div className="sub">{t("progress.downloading")}</div>
-            <div className="bar">
-              <div className="bar-fill" style={{ width: "62%" }} />
+            <div className="sub">
+              {dl ? t("progress.downloadingFrom", { source: dl.source }) : t("progress.preparing")}
             </div>
+            <div className="bar">
+              <div
+                className={`bar-fill${pct === null ? " indeterminate" : ""}`}
+                style={pct === null ? undefined : { width: `${pct}%` }}
+              />
+            </div>
+            {dl && dl.total > 0 ? (
+              <div className="dlmeta">
+                {mib(dl.downloaded)} / {mib(dl.total)}
+                {pct !== null ? ` · ${pct}%` : ""}
+                {speed > 0 ? ` · ${mib(speed)}/s` : ""}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Fresh-install completion — opening Codex is the user's explicit choice.
+  if (justInstalled) {
+    return (
+      <div className="pop">
+        <TopBar />
+        <div className="scroll view">
+          <section className="hero" style={{ marginTop: 16 }}>
+            <Ring icon="check" />
+            <div className="headline">{t("install.done.title")}</div>
+            <div className="sub">
+              {installedVersion ? t("home.uptodate.sub", { version: installedVersion }) : ""}
+            </div>
+          </section>
+          <div className="actions">
+            <button className="btn primary big" onClick={() => void managerApi.macLaunch()}>
+              <Icon name="external" />
+              {t("install.done.open")}
+            </button>
+            <button className="btn ghost" onClick={() => setJustInstalled(false)}>
+              {t("success.done")}
+            </button>
           </div>
         </div>
       </div>
@@ -236,7 +324,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               <Ring icon="shield" variant="muted" />
               <div className="headline">{t("home.idle.title")}</div>
               <div className="sub">
-                {installed ? t("home.idle.sub", { build: installed.build }) : ""}
+                {installed ? t("home.idle.sub", { version: installedVersion }) : ""}
               </div>
               <div className="prov">
                 <span className={`dot ${isManaged ? "managed" : "external"}`} />
@@ -248,13 +336,10 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               <Ring icon="arrowUp" />
               <div className="headline">{t("home.update.title")}</div>
               <div className="sub">
-                <span className="ver">{version}</span>
+                <span className="ver">{latestVersion}</span>
               </div>
               <div className="flow">
-                {t("home.update.flow", {
-                  from: `build ${plan?.currentBuild}`,
-                  to: `build ${plan?.latestBuild}`,
-                })}
+                {t("home.update.flow", { from: installedVersion, to: latestVersion })}
                 {plan ? ` · ${t("home.update.size", { size: mib(plan.downloadSize) })}` : ""}
               </div>
             </>
@@ -265,7 +350,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               {/* Show the INSTALLED build here, not plan.latestShortVersion —
                   the latest version belongs to the update / up-to-date states. */}
               <div className="sub">
-                {installed ? t("home.idle.sub", { build: installed.build }) : ""}
+                {installed ? t("home.idle.sub", { version: installedVersion }) : ""}
               </div>
               <div className="prov">
                 <span className="dot external" />
@@ -277,7 +362,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             <>
               <Ring icon="check" />
               <div className="headline">{t("home.uptodate.title")}</div>
-              <div className="sub">{t("home.uptodate.sub", { version })}</div>
+              <div className="sub">{t("home.uptodate.sub", { version: installedVersion })}</div>
               <div className="microcue">
                 <Icon name="shield" />
                 {t("home.official")} · {t("home.checkedJustNow")}
@@ -299,8 +384,11 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           ) : null}
           {kind === "idle" ? (
             <button className="btn primary big" onClick={check} disabled={busy !== null}>
-              <Icon name="refresh" />
-              {t("home.recheck")}
+              <Icon
+                name={busy === "plan" ? "loader" : "refresh"}
+                className={busy === "plan" ? "spinicon" : ""}
+              />
+              {busy === "plan" ? t("home.checking") : t("home.recheck")}
             </button>
           ) : null}
           {kind === "external" ? (
@@ -317,8 +405,11 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           ) : null}
           {kind === "uptodate" ? (
             <button className="btn ghost big" onClick={check} disabled={busy !== null}>
-              <Icon name="refresh" />
-              {t("home.recheck")}
+              <Icon
+                name={busy === "plan" ? "loader" : "refresh"}
+                className={busy === "plan" ? "spinicon" : ""}
+              />
+              {busy === "plan" ? t("home.checking") : t("home.recheck")}
             </button>
           ) : null}
         </div>
@@ -338,7 +429,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         <div className="scrim" onClick={() => setConfirmOpen(false)}>
           <div className="sheet" onClick={(e) => e.stopPropagation()}>
             <Ring icon="arrowUp" className="" />
-            <h3>{t("confirm.title", { version })}</h3>
+            <h3>{t("confirm.title", { version: latestVersion })}</h3>
             <p>{t("confirm.body")}</p>
             <div className="row2">
               <button className="btn ghost" onClick={() => setConfirmOpen(false)}>

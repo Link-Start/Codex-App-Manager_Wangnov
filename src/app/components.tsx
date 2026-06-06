@@ -1,7 +1,28 @@
 import type { ReactNode } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { Icon, type IconName } from "./icons";
 import { useI18n } from "./i18n";
+
+function closeWindow() {
+  try {
+    void getCurrentWindow().close();
+  } catch {
+    /* non-Tauri preview: no window to close */
+  }
+}
+
+/** This is a normal window with no system title bar, so it draws its own close
+ *  control. Closing quits the app (see the CloseRequested handler in lib.rs) —
+ *  the app is meant to be opened when needed, not left resident. */
+function CloseButton() {
+  const { t } = useI18n();
+  return (
+    <button className="winclose" title={t("nav.close")} onClick={closeWindow}>
+      <Icon name="close" />
+    </button>
+  );
+}
 
 export function TopBar({ children }: { children?: ReactNode }) {
   const { t } = useI18n();
@@ -9,8 +30,9 @@ export function TopBar({ children }: { children?: ReactNode }) {
     <div className="topbar">
       <div className="mark">C</div>
       <div className="wordmark">{t("app.name")}</div>
-      <div className="spacer" />
+      <div className="spacer" data-tauri-drag-region />
       {children}
+      <CloseButton />
     </div>
   );
 }
@@ -34,8 +56,9 @@ export function NavBar({
         {t("nav.back")}
       </button>
       <div className="navtitle">{title}</div>
-      <div className="spacer" style={{ flex: 1 }} />
+      <div className="spacer" style={{ flex: 1 }} data-tauri-drag-region />
       {children}
+      <CloseButton />
     </div>
   );
 }

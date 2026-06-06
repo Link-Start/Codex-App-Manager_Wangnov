@@ -4,6 +4,8 @@ export type Architecture = "x64" | "arm64" | "unknown";
 export interface InstalledCodex {
   path: string;
   build: number;
+  /** Human-facing version (CFBundleShortVersionString, e.g. 26.602.40724). */
+  shortVersion: string;
   arch: string;
 }
 
@@ -23,6 +25,13 @@ export interface UpdatePlan {
   edSignature: string | null;
   fullSize: number;
   savingsPct: number;
+}
+
+export interface DownloadProgress {
+  downloaded: number;
+  total: number;
+  /** Host the bytes come from, e.g. codexapp.agentsmirror.com. */
+  source: string;
 }
 
 export interface MacUpdateReport {

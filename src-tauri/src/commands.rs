@@ -1,4 +1,5 @@
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::app::health_service::HealthService;
 use crate::app::mac_update::{
@@ -141,10 +142,16 @@ pub async fn mac_perform_update(
         to_build: expected_to_build,
         install_path: expected_path,
     };
-    tauri::async_runtime::spawn_blocking(move || perform_macos_update(binary_delta, expected))
-        .await
-        .map_err(|e| AppError::Internal(format!("join: {e}")))?
-        .map_err(Into::into)
+    let progress_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = move |p: crate::app::mac_update::DownloadProgress| {
+            let _ = progress_app.emit("mac://download-progress", p);
+        };
+        perform_macos_update(binary_delta, expected, &report)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
 }
 
 /// macOS-only: classify the installed Codex (managed / external / none).
@@ -165,17 +172,31 @@ pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, Com
     crate::app::mac_update::mac_adopt().map_err(Into::into)
 }
 
-/// macOS-only: fresh-install the latest Codex (full package) into /Applications.
-/// Runs the blocking download/verify/install off the main thread.
+/// macOS-only: open the installed Codex.app (explicit 〔打开 Codex〕 action).
 #[tauri::command]
-pub async fn mac_install() -> Result<MacInstallStatus, CommandError> {
+pub fn mac_launch_codex() -> Result<(), CommandError> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    tauri::async_runtime::spawn_blocking(install_macos)
-        .await
-        .map_err(|e| AppError::Internal(format!("join: {e}")))?
-        .map_err(Into::into)
+    crate::app::mac_update::launch_codex().map_err(Into::into)
+}
+
+/// macOS-only: fresh-install the latest Codex (full package) into /Applications.
+/// Runs the blocking download/verify/install off the main thread.
+#[tauri::command]
+pub async fn mac_install(app: tauri::AppHandle) -> Result<MacInstallStatus, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = move |p: crate::app::mac_update::DownloadProgress| {
+            let _ = app.emit("mac://download-progress", p);
+        };
+        install_macos(&report)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
 }
 
 /// Windows-only: detect installed Codex, read mirror manifest/checksums, probe
@@ -269,6 +290,42 @@ pub fn win_cancel_download(state: State<'_, ManagerState>) -> Result<bool, Comma
         return Err(AppError::UnsupportedPlatform.into());
     }
     Ok(cancel_windows_download())
+}
+
+/// Whether "launch at login" is currently enabled (off by default).
+#[tauri::command]
+pub fn get_autostart(app: tauri::AppHandle) -> Result<bool, CommandError> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| AppError::Internal(format!("autostart: {e}")).into())
+}
+
+/// Enable/disable launch at login. The user opts in explicitly from Settings.
+#[tauri::command]
+pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), CommandError> {
+    let mgr = app.autolaunch();
+    let result = if enabled { mgr.enable() } else { mgr.disable() };
+    result.map_err(|e| AppError::Internal(format!("autostart: {e}")).into())
+}
+
+/// Open an external http(s) URL in the user's default browser. Restricted to
+/// http(s) so it can't be coerced into launching arbitrary local handlers.
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), CommandError> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(AppError::Internal("仅支持 http(s) 链接".to_string()).into());
+    }
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url.as_str()])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let spawned = std::process::Command::new("xdg-open").arg(&url).spawn();
+    spawned
+        .map(|_| ())
+        .map_err(|e| AppError::Internal(format!("打开链接失败: {e}")).into())
 }
 
 /// Windows-only: classify the installed Codex (managed / external / none).

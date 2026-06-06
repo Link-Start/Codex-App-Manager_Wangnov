@@ -18,7 +18,8 @@ export type IconName =
   | "sliders"
   | "message"
   | "globe"
-  | "external";
+  | "external"
+  | "close";
 
 const PATHS: Record<IconName, ReactNode> = {
   check: <polyline points="4 12.5 9.5 18 20 6.5" />,
@@ -99,6 +100,12 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M14 5h5v5" />
       <path d="M19 5l-8 8" />
       <path d="M18 14v4.5A1.5 1.5 0 0 1 16.5 20h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10" />
+    </>
+  ),
+  close: (
+    <>
+      <line x1="6" y1="6" x2="18" y2="18" />
+      <line x1="18" y1="6" x2="6" y2="18" />
     </>
   ),
 };

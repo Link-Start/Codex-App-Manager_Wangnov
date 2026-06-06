@@ -52,14 +52,14 @@ export function About({ onBack }: { onBack: () => void }) {
             </span>
             <span className="rval">{mgrBusy ? t("about.mgrChecking") : ""}</span>
           </button>
-          <a className="row" href={REPO_URL} target="_blank" rel="noreferrer">
+          <button className="row" onClick={() => void managerApi.openUrl(REPO_URL)}>
             <Icon name="message" className="ricon" />
             <span className="rtext">
               <span className="rtitle">{t("about.feedback")}</span>
               <span className="rsub">{REPO_URL.replace("https://", "")}</span>
             </span>
             <Icon name="external" className="chev" />
-          </a>
+          </button>
         </div>
       </div>
     </div>

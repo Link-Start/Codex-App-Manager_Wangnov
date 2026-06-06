@@ -254,13 +254,18 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return "（浏览器开发态：manager 自更新在桌面 app 内可用）";
     }
-    const update = await check();
+    // A routine check shouldn't surface a scary error when the release feed
+    // isn't published yet or is unreachable.
+    const update = await check().catch(() => undefined);
+    if (update === undefined) {
+      return "暂时无法检查管理器更新,请稍后再试";
+    }
     if (!update) {
-      return "manager 已是最新版";
+      return "管理器已是最新版";
     }
     await update.downloadAndInstall();
     await relaunch();
-    return `已安装 ${update.version}，正在重启…`;
+    return `已安装 ${update.version},正在重启…`;
   },
   macStatus(): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {
@@ -279,11 +284,33 @@ export const managerApi = {
   macInstall(): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
-        installed: { path: "/Applications/Codex.app", build: 3575, arch: "arm64" },
+        installed: {
+          path: "/Applications/Codex.app",
+          build: 3575,
+          shortVersion: "26.602.30954",
+          arch: "arm64",
+        },
         status: "managed",
       });
     }
     return invoke<MacInstallStatus>("mac_install");
+  },
+  // Open the installed Codex — explicit user action after install (we no longer
+  // auto-launch).
+  macLaunch(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("mac_launch_codex");
+  },
+  // Open an external URL in the system browser (a webview <a target=_blank> is a
+  // no-op under Tauri).
+  openUrl(url: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      window.open(url, "_blank");
+      return Promise.resolve();
+    }
+    return invoke<void>("open_url", { url });
   },
 
   // Settings (update source + general). The backend persists them so the source
@@ -307,6 +334,20 @@ export const managerApi = {
     const saved = await invoke<AppSettings>("set_settings", { settings: safe });
     localStorage.setItem(SETTINGS_LS, JSON.stringify(saved));
     return saved;
+  },
+
+  // Launch-at-login (off by default). Backed by tauri-plugin-autostart.
+  getAutostart(): Promise<boolean> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(false);
+    }
+    return invoke<boolean>("get_autostart");
+  },
+  setAutostart(enabled: boolean): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("set_autostart", { enabled });
   },
 
   // Destructive: remove the Codex app. keepCodexHome defaults to true so the

@@ -28,6 +28,32 @@ pub fn fetch_text(url: &str) -> Result<String, EngineError> {
     String::from_utf8(output.stdout).map_err(|e| EngineError::Io(e.to_string()))
 }
 
+/// Like `fetch_text` but with a caller-set total timeout. Used to probe a
+/// possibly-unreachable source (e.g. OpenAI's official appcast for users behind
+/// a block) without stalling on the default long connect timeout.
+pub fn fetch_text_timeout(url: &str, max_secs: u64) -> Result<String, EngineError> {
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            &max_secs.to_string(),
+            url,
+        ])
+        .output()
+        .map_err(|e| EngineError::Io(format!("spawn curl: {e}")))?;
+
+    if !output.status.success() {
+        return Err(EngineError::Io(format!(
+            "curl failed for {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| EngineError::Io(e.to_string()))
+}
+
 /// Locate an installed `Codex.app` and read its `CFBundleVersion` (build number).
 ///
 /// Returns `(app_path, build)` for the first candidate found, or `None`.
@@ -101,4 +127,28 @@ fn read_bundle_build(app: &str) -> Option<u64> {
         return None;
     }
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Read the human-facing version string (`CFBundleShortVersionString`, e.g.
+/// `26.602.40724`) of an installed bundle. This is what we show the user; the
+/// build number (`CFBundleVersion`) is what Sparkle compares. Returns `None` if
+/// the key is missing.
+pub fn read_bundle_short_version(app: &str) -> Option<String> {
+    let plist = format!("{app}/Contents/Info.plist");
+    if !Path::new(&plist).exists() {
+        return None;
+    }
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleShortVersionString", &plist])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }

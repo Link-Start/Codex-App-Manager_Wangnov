@@ -29,6 +29,9 @@ use crate::errors::AppError;
 pub struct InstalledCodex {
     pub path: String,
     pub build: u64,
+    /// Human-facing version (`CFBundleShortVersionString`, e.g. 26.602.40724) —
+    /// what we display. `build` (CFBundleVersion) is the Sparkle comparison key.
+    pub short_version: String,
     /// `arm64` / `x86_64` of the installed bundle (drives appcast selection).
     pub arch: String,
 }
@@ -98,6 +101,14 @@ fn fetch_one(url: String) -> Result<(String, String), AppError> {
     Ok((url, xml))
 }
 
+/// Latest build number advertised by an appcast XML, or 0 if it can't be parsed.
+fn latest_build_of(xml: &str) -> u64 {
+    parse_appcast(xml)
+        .ok()
+        .and_then(|a| a.latest().map(|i| i.build))
+        .unwrap_or(0)
+}
+
 /// Fetch the appcast XML honoring the configured source — returns (url, xml).
 /// `auto` tries the CN-reachable mirror first and falls back to OpenAI official
 /// when the mirror is unreachable; `mirror` / `official` / `custom` use exactly
@@ -117,11 +128,30 @@ fn fetch_appcast_for_arch(arch: &str) -> Result<(String, String), AppError> {
             fetch_one(url)
         }
         _ => {
-            // auto: mirror first, fall back to OpenAI official if unreachable.
-            let mirror = appcast_for_arch(arch).to_string();
-            match sys::fetch_text(&mirror) {
-                Ok(xml) => Ok((mirror, xml)),
-                Err(_) => fetch_one(official_for_arch(arch).to_string()),
+            // auto: pick the higher build between the CN-reachable mirror and
+            // OpenAI official, among whichever sources are reachable. The mirror
+            // can lag the official feed by a release; when it does and official
+            // is reachable, we still surface the newer build instead of stranding
+            // the user on the stale mirror version. Official is a best-effort
+            // probe with a short timeout so users who can't reach it don't stall.
+            // If only one is reachable, use it; if neither, error.
+            let mirror_url = appcast_for_arch(arch).to_string();
+            let official_url = official_for_arch(arch).to_string();
+            let mirror = sys::fetch_text(&mirror_url).ok();
+            let official = sys::fetch_text_timeout(&official_url, 8).ok();
+            match (mirror, official) {
+                (Some(m), Some(o)) => {
+                    if latest_build_of(&o) > latest_build_of(&m) {
+                        Ok((official_url, o))
+                    } else {
+                        Ok((mirror_url, m))
+                    }
+                }
+                (Some(m), None) => Ok((mirror_url, m)),
+                (None, Some(o)) => Ok((official_url, o)),
+                (None, None) => Err(AppError::Engine(
+                    "both the mirror and OpenAI official appcast are unreachable".to_string(),
+                )),
             }
         }
     }
@@ -171,7 +201,13 @@ fn effective_build(simulated_build: Option<u64>, installed: &Option<InstalledCod
 fn detect_installed() -> Option<InstalledCodex> {
     sys::installed_codex_build().map(|(path, build)| {
         let arch = sys::app_arch(&path).unwrap_or_else(|| std::env::consts::ARCH.to_string());
-        InstalledCodex { path, build, arch }
+        let short_version = sys::read_bundle_short_version(&path).unwrap_or_default();
+        InstalledCodex {
+            path,
+            build,
+            short_version,
+            arch,
+        }
     })
 }
 
@@ -214,13 +250,54 @@ fn strategy_label(strategy: &UpdateStrategy) -> String {
 /// and `perform` (the full install), so the destructive path can never skip the
 /// pinned-key check. Taking explicit fields (rather than a plan) lets `perform`
 /// download the full enclosure when it falls back from a delta.
-fn download_and_verify(url: &str, size: u64, signature: &str) -> Result<PathBuf, AppError> {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: u64,
+    /// Host the bytes are coming from, e.g. `codexapp.agentsmirror.com`.
+    pub source: String,
+}
+
+/// Host portion of a URL, for showing the user which source is downloading.
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// No-op progress sink for downloads whose progress isn't surfaced (e.g. stage).
+fn no_progress(_p: DownloadProgress) {}
+
+fn download_and_verify(
+    url: &str,
+    size: u64,
+    signature: &str,
+    progress: &dyn Fn(DownloadProgress),
+) -> Result<PathBuf, AppError> {
     let file_name = url.rsplit('/').next().unwrap_or("payload.bin");
     let dest = staging_dir().join(file_name);
+    let source = host_of(url);
 
     let already = std::fs::metadata(&dest).map(|m| m.len() == size).unwrap_or(false);
-    if !already {
-        download::download_to(url, &dest).map_err(|e| AppError::Engine(e.to_string()))?;
+    if already {
+        // Cached from a prior stage — report complete so the UI doesn't sit at 0.
+        progress(DownloadProgress {
+            downloaded: size,
+            total: size,
+            source,
+        });
+    } else {
+        download::download_to_with_progress(url, &dest, &|downloaded| {
+            progress(DownloadProgress {
+                downloaded,
+                total: size,
+                source: source.clone(),
+            });
+        })
+        .map_err(|e| AppError::Engine(e.to_string()))?;
     }
 
     let len = std::fs::metadata(&dest)
@@ -268,7 +345,7 @@ pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport
         .ed_signature
         .clone()
         .ok_or_else(|| AppError::Engine("appcast enclosure missing edSignature".to_string()))?;
-    let dest = download_and_verify(&plan.download_url, plan.download_size, &signature)?;
+    let dest = download_and_verify(&plan.download_url, plan.download_size, &signature, &no_progress)?;
 
     Ok(MacStageReport {
         up_to_date: false,
@@ -359,14 +436,19 @@ fn find_dot_app(dir: &Path) -> Option<PathBuf> {
 /// Download the appcast's full enclosure (size + EdDSA verified) and unpack it
 /// into `out_app`. Needs no BinaryDelta — used both as the primary full path and
 /// as the recovery when a delta is unavailable or fails to apply.
-fn reconstruct_full(appcast: &Appcast, work: &Path, out_app: &Path) -> Result<(), AppError> {
+fn reconstruct_full(
+    appcast: &Appcast,
+    work: &Path,
+    out_app: &Path,
+    progress: &dyn Fn(DownloadProgress),
+) -> Result<(), AppError> {
     let latest = appcast
         .latest()
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
     let sig = latest.full.ed_signature.clone().ok_or_else(|| {
         AppError::Engine("appcast full enclosure missing edSignature".to_string())
     })?;
-    let staged = download_and_verify(&latest.full.url, latest.full.length, &sig)?;
+    let staged = download_and_verify(&latest.full.url, latest.full.length, &sig, progress)?;
     unpack_app_zip(&staged, work, out_app)
 }
 
@@ -396,6 +478,7 @@ fn reconstruct_full(appcast: &Appcast, work: &Path, out_app: &Path) -> Result<()
 pub fn perform_macos_update(
     binary_delta: Option<PathBuf>,
     expected: PerformExpectation,
+    progress: &dyn Fn(DownloadProgress),
 ) -> Result<MacPerformReport, AppError> {
     let installed = detect_installed()
         .ok_or_else(|| AppError::Engine("no Codex detected to update".to_string()))?;
@@ -468,20 +551,21 @@ pub fn perform_macos_update(
                 .ed_signature
                 .clone()
                 .ok_or_else(|| AppError::Engine("appcast delta missing edSignature".to_string()))?;
-            let staged = download_and_verify(&plan.download_url, plan.download_size, &sig)?;
+            let staged =
+                download_and_verify(&plan.download_url, plan.download_size, &sig, progress)?;
             match apply_delta(tool, &install_path, &out_app, &staged) {
                 Ok(()) => strategy_label(&plan.strategy),
                 Err(delta_err) => {
-                    reconstruct_full(&appcast, &work, &out_app)?;
+                    reconstruct_full(&appcast, &work, &out_app, progress)?;
                     format!("full (delta 应用失败回退: {delta_err})")
                 }
             }
         } else {
-            reconstruct_full(&appcast, &work, &out_app)?;
+            reconstruct_full(&appcast, &work, &out_app, progress)?;
             "full (delta 工具缺失，回退全量)".to_string()
         }
     } else {
-        reconstruct_full(&appcast, &work, &out_app)?;
+        reconstruct_full(&appcast, &work, &out_app, progress)?;
         "full".to_string()
     };
 
@@ -654,7 +738,7 @@ fn choose_install_dir() -> Result<PathBuf, AppError> {
 /// place it under `/Applications` (or `~/Applications` when the system folder
 /// isn't writable). No delta, no quit (nothing running), no backup (nothing to
 /// replace). Records `manager-installed` provenance and launches the app.
-pub fn install_macos() -> Result<MacInstallStatus, AppError> {
+pub fn install_macos(progress: &dyn Fn(DownloadProgress)) -> Result<MacInstallStatus, AppError> {
     if detect_installed().is_some() {
         return Err(AppError::Engine(
             "已检测到 Codex,请使用更新而非安装".to_string(),
@@ -680,7 +764,7 @@ pub fn install_macos() -> Result<MacInstallStatus, AppError> {
     let _ = std::fs::remove_dir_all(&out_app);
 
     // Full package only — no basis bundle to delta against.
-    reconstruct_full(&appcast, &work, &out_app)?;
+    reconstruct_full(&appcast, &work, &out_app, progress)?;
     gate_reconstructed(&out_app)
         .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝安装）: {e}")))?;
 
@@ -705,8 +789,21 @@ pub fn install_macos() -> Result<MacInstallStatus, AppError> {
             ))
         })?;
     }
-    let _ = relaunch(&install_path);
+    // Do NOT auto-launch — the UI shows a completion state with an explicit
+    // 〔打开 Codex〕 button so opening is the user's choice, not a surprise.
     Ok(mac_install_status())
+}
+
+/// Open the installed Codex.app — invoked by the UI's explicit 〔打开 Codex〕
+/// action (we no longer auto-launch after a fresh install).
+pub fn launch_codex() -> Result<(), AppError> {
+    let installed =
+        detect_installed().ok_or_else(|| AppError::Engine("没有可打开的 Codex".to_string()))?;
+    std::process::Command::new("open")
+        .arg(&installed.path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| AppError::Engine(format!("打开 Codex 失败: {e}")))
 }
 
 #[derive(Debug, Clone, Serialize)]
