@@ -214,8 +214,12 @@ input {
   padding: 4px 6px 4px 2px;
   border-radius: 8px;
 }
-.navback:hover {
+.navback:hover:not(:disabled) {
   color: var(--text);
+}
+.navback:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 .navback svg {
   width: 18px;

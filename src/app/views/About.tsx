@@ -27,7 +27,10 @@ export function About({ onBack }: { onBack: () => void }) {
 
   return (
     <div className="pop">
-      <NavBar title={t("settings.more.about")} onBack={onBack} />
+      {/* Block leaving while a self-update is downloading/installing — it
+          relaunches the manager process and could interrupt a Codex op started
+          back on the home screen. */}
+      <NavBar title={t("settings.more.about")} onBack={onBack} disableBack={mgrBusy} />
       <div className="scroll view">
         <section className="hero" style={{ paddingTop: 8 }}>
           <div className="mark" style={{ width: 56, height: 56, borderRadius: 16, fontSize: 30, marginBottom: 14 }}>

@@ -18,16 +18,18 @@ export function TopBar({ children }: { children?: ReactNode }) {
 export function NavBar({
   title,
   onBack,
+  disableBack = false,
   children,
 }: {
   title: string;
   onBack: () => void;
+  disableBack?: boolean;
   children?: ReactNode;
 }) {
   const { t } = useI18n();
   return (
     <div className="navbar">
-      <button className="navback" onClick={onBack}>
+      <button className="navback" onClick={onBack} disabled={disableBack}>
         <Icon name="back" />
         {t("nav.back")}
       </button>
