@@ -3,16 +3,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { managerApi } from "../../services/managerApi";
 import type {
   AppSettings,
-  MacInstallStatus,
-  MacPerformReport,
-  MacUpdateReport,
+  WinInstallStatus,
+  WinPerformReport,
+  WinUpdateReport,
 } from "../../shared/types";
 import { DEFAULT_SETTINGS } from "../../shared/types";
 import { Icon } from "../icons";
 import { useI18n, type TKey } from "../i18n";
 import { Ring, TopBar } from "../components";
-import { currentPlatform } from "../platform";
-import { WinHome } from "./WinHome";
 
 function mib(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
@@ -20,34 +18,26 @@ function mib(bytes: number): string {
 
 type Kind = "loading" | "error" | "none" | "idle" | "update" | "external" | "uptodate";
 
-/** Platform dispatcher — the backend command surface differs per OS. */
-export function Home(props: { onOpenSettings: () => void }) {
-  return currentPlatform() === "windows" ? <WinHome {...props} /> : <MacHome {...props} />;
-}
-
-function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
+// Windows counterpart of MacHome — same design system + state machine, driven by
+// the win_* backend (codex-win-engine): MSIX sideload or portable fallback.
+export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { t } = useI18n();
-  const [report, setReport] = useState<MacUpdateReport | null>(null);
-  const [status, setStatus] = useState<MacInstallStatus | null>(null);
-  const [perform, setPerform] = useState<MacPerformReport | null>(null);
+  const [report, setReport] = useState<WinUpdateReport | null>(null);
+  const [status, setStatus] = useState<WinInstallStatus | null>(null);
+  const [perform, setPerform] = useState<WinPerformReport | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [busy, setBusy] = useState<"plan" | "perform" | "adopt" | "install" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  // Whether the status request has finished (success OR failure) — distinct from
-  // the value, so a failed macStatus doesn't leave the home stuck on "loading".
   const [statusLoaded, setStatusLoaded] = useState(false);
-  // Whether it failed (e.g. unsupported platform) — so we don't offer install.
   const [statusFailed, setStatusFailed] = useState(false);
 
   const check = useCallback(async () => {
     setBusy("plan");
     setError(null);
     try {
-      setReport(await managerApi.macPlanUpdate());
+      setReport(await managerApi.winPlanUpdate());
     } catch (cause) {
-      // Drop any stale plan so a failed re-check can't keep driving "立即更新"
-      // off an outdated currentBuild/latestBuild.
       setReport(null);
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -57,10 +47,9 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   const refreshStatus = useCallback(async () => {
     try {
-      setStatus(await managerApi.macStatus());
+      setStatus(await managerApi.winStatus());
       setStatusFailed(false);
     } catch {
-      // e.g. unsupported platform — record the failure so we don't offer install.
       setStatusFailed(true);
     } finally {
       setStatusLoaded(true);
@@ -72,7 +61,6 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       const s = await managerApi.getSettings().catch(() => DEFAULT_SETTINGS);
       setSettings(s);
       void refreshStatus();
-      // Honor "自动检查更新": only hit the appcast on open when enabled.
       if (s.autoCheck) {
         void check();
       }
@@ -83,7 +71,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     setBusy("adopt");
     setError(null);
     try {
-      setStatus(await managerApi.macAdopt());
+      setStatus(await managerApi.winAdopt());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -91,64 +79,42 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     }
   }, []);
 
-  const runInstall = useCallback(async () => {
-    setBusy("install");
-    setError(null);
-    try {
-      setStatus(await managerApi.macInstall());
-      await check();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setBusy(null);
-    }
-  }, [check]);
-
-  const runPerform = useCallback(async () => {
-    const installed = status?.installed;
-    const plan = report?.plan;
-    if (!installed || !plan || plan.upToDate) return;
-    setBusy("perform");
-    setError(null);
-    try {
-      const result = await managerApi.macPerformUpdate({
-        fromBuild: installed.build,
-        toBuild: plan.latestBuild,
-        path: installed.path,
-      });
-      setPerform(result);
-      setConfirmOpen(false);
-      await refreshStatus();
-      await check();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      setConfirmOpen(false);
-    } finally {
-      setBusy(null);
-    }
-  }, [status, report, refreshStatus, check]);
+  // Windows install + update both go through win_perform_update (the route —
+  // MSIX sideload or portable fallback — is decided by the backend plan).
+  const runPerform = useCallback(
+    async (mode: "perform" | "install") => {
+      setBusy(mode);
+      setError(null);
+      try {
+        const result = await managerApi.winPerformUpdate(true);
+        setPerform(result);
+        setConfirmOpen(false);
+        await refreshStatus();
+        await check();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+        setConfirmOpen(false);
+      } finally {
+        setBusy(null);
+      }
+    },
+    [refreshStatus, check],
+  );
 
   const plan = report?.plan ?? null;
   const installed = status?.installed ?? report?.installed ?? null;
   const isManaged = status?.status === "managed";
   const updateAvailable = Boolean(plan) && !plan?.upToDate;
+  const routeNote =
+    plan?.route === "portable-fallback" ? t("win.route.portable") : t("win.route.msix");
 
   const kind: Kind = useMemo(() => {
     if (!installed) {
       if (busy === "plan" || !statusLoaded) return "loading";
-      // A failed status (unsupported platform) OR a failed check (OS too old /
-      // appcast unreachable) → error, never an install entry that would just
-      // fail again.
       if (statusFailed || error) return "error";
       return "none";
     }
-    // Don't classify (update / idle / uptodate) until the local adoption status
-    // is known — otherwise report.installed can drive an "update" entry that
-    // bypasses the external→adopt boundary once status resolves to external.
     if (!statusLoaded) return "loading";
-    // Adoption status is local (macStatus) and must not depend on a successful
-    // network check — surface "开始管理" before any network-dependent state so it
-    // is never hidden (auto-check off / appcast error) or bypassed (update).
     if (status?.status === "external") return "external";
     if (busy === "plan" && !report) return "loading";
     if (error && !report) return "error";
@@ -157,10 +123,9 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     return "uptodate";
   }, [busy, report, error, installed, updateAvailable, status, statusLoaded, statusFailed]);
 
-  const version = plan?.latestShortVersion || (installed ? `build ${installed.build}` : "");
+  const version = installed?.version || plan?.latestVersion || "";
   const sourceLabel = t(`source.${settings.source}` as TKey);
 
-  // ── progress (performing / installing) takes over the whole screen ─────────
   if (busy === "perform" || busy === "install") {
     return (
       <div className="pop">
@@ -184,12 +149,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   return (
     <div className="pop">
       <TopBar>
-        <button
-          className="iconbtn"
-          title={t("home.recheck")}
-          onClick={check}
-          disabled={busy !== null}
-        >
+        <button className="iconbtn" title={t("home.recheck")} onClick={check} disabled={busy !== null}>
           <Icon name="refresh" />
         </button>
         <button className="iconbtn" title={t("nav.settings")} onClick={onOpenSettings}>
@@ -199,10 +159,8 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
 
       <div className="scroll view">
         {perform ? (
-          <div className={`banner ${perform.rolledBack ? "err" : "ok"}`}>
-            <Icon name={perform.rolledBack ? "alert" : "check"} />
-            {/* Backend message carries the full outcome: relaunch-failed +
-                backup kept, provenance save failure, rollback, etc. */}
+          <div className={`banner ${perform.success ? "ok" : "err"}`}>
+            <Icon name={perform.success ? "check" : "alert"} />
             <span>{perform.message}</span>
           </div>
         ) : null}
@@ -235,9 +193,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             <>
               <Ring icon="shield" variant="muted" />
               <div className="headline">{t("home.idle.title")}</div>
-              <div className="sub">
-                {installed ? t("home.idle.sub", { build: installed.build }) : ""}
-              </div>
+              <div className="sub">{t("win.installSub", { version })}</div>
               <div className="prov">
                 <span className={`dot ${isManaged ? "managed" : "external"}`} />
                 {isManaged ? t("prov.managed") : t("prov.external")}
@@ -248,25 +204,27 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               <Ring icon="arrowUp" />
               <div className="headline">{t("home.update.title")}</div>
               <div className="sub">
-                <span className="ver">{version}</span>
+                <span className="ver">{plan?.latestVersion}</span>
               </div>
               <div className="flow">
                 {t("home.update.flow", {
-                  from: `build ${plan?.currentBuild}`,
-                  to: `build ${plan?.latestBuild}`,
+                  from: plan?.currentVersion ?? version,
+                  to: plan?.latestVersion ?? "",
                 })}
-                {plan ? ` · ${t("home.update.size", { size: mib(plan.downloadSize) })}` : ""}
+                {plan?.downloadSize
+                  ? ` · ${t("home.update.size", { size: mib(plan.downloadSize) })}`
+                  : ""}
+              </div>
+              <div className="microcue">
+                <Icon name="shield" />
+                {routeNote}
               </div>
             </>
           ) : kind === "external" ? (
             <>
               <Ring icon="shield" variant="amber" />
               <div className="headline">{t("home.external.title")}</div>
-              {/* Show the INSTALLED build here, not plan.latestShortVersion —
-                  the latest version belongs to the update / up-to-date states. */}
-              <div className="sub">
-                {installed ? t("home.idle.sub", { build: installed.build }) : ""}
-              </div>
+              <div className="sub">{t("win.installSub", { version })}</div>
               <div className="prov">
                 <span className="dot external" />
                 {t("prov.external")}
@@ -290,7 +248,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           {kind === "update" ? (
             <button
               className="btn primary big"
-              onClick={() => (settings.askBefore ? setConfirmOpen(true) : void runPerform())}
+              onClick={() => (settings.askBefore ? setConfirmOpen(true) : void runPerform("perform"))}
               disabled={busy !== null}
             >
               <Icon name="download" />
@@ -310,7 +268,11 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             </button>
           ) : null}
           {kind === "none" ? (
-            <button className="btn primary big" onClick={runInstall} disabled={busy !== null}>
+            <button
+              className="btn primary big"
+              onClick={() => runPerform("install")}
+              disabled={busy !== null}
+            >
               <Icon name="download" />
               {t("home.none.cta")}
             </button>
@@ -337,14 +299,18 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       {confirmOpen && plan ? (
         <div className="scrim" onClick={() => setConfirmOpen(false)}>
           <div className="sheet" onClick={(e) => e.stopPropagation()}>
-            <Ring icon="arrowUp" className="" />
-            <h3>{t("confirm.title", { version })}</h3>
-            <p>{t("confirm.body")}</p>
+            <Ring icon="arrowUp" />
+            <h3>{t("confirm.title", { version: plan.latestVersion })}</h3>
+            <p>
+              {t("win.confirm.body")}
+              <br />
+              {routeNote}
+            </p>
             <div className="row2">
               <button className="btn ghost" onClick={() => setConfirmOpen(false)}>
                 {t("confirm.cancel")}
               </button>
-              <button className="btn primary" onClick={runPerform}>
+              <button className="btn primary" onClick={() => runPerform("perform")}>
                 {t("confirm.ok")}
               </button>
             </div>

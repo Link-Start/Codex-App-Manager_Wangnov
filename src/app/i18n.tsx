@@ -113,6 +113,13 @@ const ZH = {
   "source.mirror": "镜像",
   "source.official": "官方直连",
   "source.custom": "自定义",
+
+  "win.confirm.body": "安装时会关闭 Codex,完成后可重新打开,大约一分钟。",
+  "win.route.msix": "通过 MSIX 侧载安装",
+  "win.route.portable": "便携安装 · 免管理员",
+  "win.installSub": "版本 {version}",
+  "win.uninstall.purge": "同时清除我的数据",
+  "win.uninstall.purgeNote": "登录、会话与配置都会被删除;不勾选则保留,重装后可继续使用。",
 } as const;
 
 type Key = keyof typeof ZH;
@@ -220,6 +227,13 @@ const EN: Record<Key, string> = {
   "source.mirror": "Mirror",
   "source.official": "Official",
   "source.custom": "Custom",
+
+  "win.confirm.body": "Codex will close during install and can reopen after — about a minute.",
+  "win.route.msix": "Install via MSIX sideload",
+  "win.route.portable": "Portable install · no admin",
+  "win.installSub": "Version {version}",
+  "win.uninstall.purge": "Also delete my data",
+  "win.uninstall.purgeNote": "Sign-in, sessions and config are removed; leave it off to keep them for a reinstall.",
 };
 
 const CATALOG: Record<Lang, Record<Key, string>> = { "zh-CN": ZH, en: EN };

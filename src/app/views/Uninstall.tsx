@@ -4,10 +4,13 @@ import { managerApi } from "../../services/managerApi";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
 import { NavBar, Ring, Toggle } from "../components";
+import { isWindows } from "../platform";
 
 export function Uninstall({ onBack }: { onBack: () => void }) {
   const { t } = useI18n();
-  // Default to keeping the user's data (~/.codex). Opting out is deliberate.
+  const win = isWindows();
+  // Default to keeping the user's data (~/.codex on mac, %USERPROFILE%\.codex on
+  // Windows). Opting out is deliberate.
   const [keepData, setKeepData] = useState(true);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
@@ -16,18 +19,19 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
   const [managed, setManaged] = useState<boolean | null>(null);
 
   useEffect(() => {
-    void managerApi
-      .macStatus()
-      .then((s) => setManaged(s.status === "managed"))
-      .catch(() => setManaged(false));
-  }, []);
+    const load = win ? managerApi.winStatus() : managerApi.macStatus();
+    void load.then((s) => setManaged(s.status === "managed")).catch(() => setManaged(false));
+  }, [win]);
 
   const run = async () => {
     setBusy(true);
     setError(null);
     try {
-      const r = await managerApi.macUninstall(keepData);
-      // The backend message is the source of truth (covers a failed clear).
+      // mac keeps ~/.codex via keepCodexHome; win purges via purgeUserData (the
+      // inverse) — both surface the backend message as the source of truth.
+      const r = win
+        ? await managerApi.winUninstall(true, !keepData)
+        : await managerApi.macUninstall(keepData);
       setDone(r.message);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
