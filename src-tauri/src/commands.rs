@@ -11,8 +11,9 @@ use crate::app::settings_store::AppSettings as PersistedAppSettings;
 use crate::app::snapshot::ManagerSnapshot;
 use crate::app::update_check::PayloadUpdateCheck;
 use crate::app::win_update::{
-    auto_stage_windows_update, cancel_windows_download, perform_windows_update_with_progress,
-    plan_windows_update, stage_windows_update, uninstall_windows_codex,
+    auto_stage_windows_update_with_install_mode, cancel_windows_download,
+    perform_windows_update_with_install_mode, plan_windows_update_with_install_mode,
+    stage_windows_update_with_install_mode, uninstall_windows_codex,
     win_adopt as adopt_windows_install, win_install_status,
     DownloadProgress as WinDownloadProgress, WinAutoStageReport, WinInstallStatus,
     WinPerformReport, WinStageReport, WinUninstallReport, WinUpdateReport,
@@ -61,6 +62,15 @@ fn windows_endpoints_for_settings(
         // official source exposes the same contract.
         "auto" | "mirror" => Ok(state.endpoints.clone()),
         _ => Ok(state.endpoints.clone()),
+    }
+}
+
+fn windows_install_mode_for_settings() -> String {
+    let saved = PersistedAppSettings::load();
+    if saved.windows_install_mode == "portable" {
+        "portable".to_string()
+    } else {
+        "msix".to_string()
     }
 }
 
@@ -254,7 +264,9 @@ pub fn win_plan_update(state: State<'_, ManagerState>) -> Result<WinUpdateReport
         return Err(AppError::UnsupportedPlatform.into());
     }
     let endpoints = windows_endpoints_for_settings(&state)?;
-    plan_windows_update(&endpoints, &state.settings).map_err(Into::into)
+    let install_mode = windows_install_mode_for_settings();
+    plan_windows_update_with_install_mode(&endpoints, &state.settings, &install_mode)
+        .map_err(Into::into)
 }
 
 /// Windows-only: plan + download + size/SHA256/AuthentiCode/AppxManifest gates
@@ -268,7 +280,10 @@ pub async fn win_stage_update(
     }
     let endpoints = windows_endpoints_for_settings(&state)?;
     let settings = state.settings.clone();
-    tauri::async_runtime::spawn_blocking(move || stage_windows_update(&endpoints, &settings))
+    let install_mode = windows_install_mode_for_settings();
+    tauri::async_runtime::spawn_blocking(move || {
+        stage_windows_update_with_install_mode(&endpoints, &settings, &install_mode, &|_| {})
+    })
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
         .map_err(Into::into)
@@ -322,8 +337,15 @@ pub async fn win_auto_stage_update(
     }
     let endpoints = windows_endpoints_for_settings(&state)?;
     let settings = state.settings.clone();
+    let install_mode = windows_install_mode_for_settings();
     tauri::async_runtime::spawn_blocking(move || {
-        auto_stage_windows_update(&endpoints, &settings, enabled, allow_metered)
+        auto_stage_windows_update_with_install_mode(
+            &endpoints,
+            &settings,
+            enabled,
+            allow_metered,
+            &install_mode,
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -408,12 +430,19 @@ pub async fn win_perform_update(
     }
     let endpoints = windows_endpoints_for_settings(&state)?;
     let settings = state.settings.clone();
+    let install_mode = windows_install_mode_for_settings();
     let progress_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: WinDownloadProgress| {
             let _ = progress_app.emit("win://download-progress", p);
         };
-        perform_windows_update_with_progress(&endpoints, &settings, confirm, &report)
+        perform_windows_update_with_install_mode(
+            &endpoints,
+            &settings,
+            confirm,
+            &install_mode,
+            &report,
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?

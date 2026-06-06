@@ -18,7 +18,7 @@ use codex_win_engine::{
     sha256_file, uninstall_portable, validate_codex_identity, verify_openai_authenticode,
     version_key, AuthenticodeReport, CapabilityState, InstalledWindowsCodex, MsixIdentity,
     MsixRemoveReport, MsixSideloadReport, PortableInstallReport, PortableUninstallReport,
-    WinCapabilityReport, WindowsRelease, WindowsUpdatePlan,
+    WinCapabilityReport, WinInstallRoute, WindowsRelease, WindowsUpdatePlan,
 };
 
 use crate::app::provenance::ProvenanceStore;
@@ -186,10 +186,18 @@ pub fn plan_windows_update(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
 ) -> Result<WinUpdateReport, AppError> {
+    plan_windows_update_with_install_mode(endpoints, settings, "msix")
+}
+
+pub fn plan_windows_update_with_install_mode(
+    endpoints: &MirrorEndpoints,
+    settings: &AppSettings,
+    install_mode: &str,
+) -> Result<WinUpdateReport, AppError> {
     let (release, sha256) = read_windows_release(endpoints)?;
     let installed = detect_managed_codex(settings, &ProvenanceStore::load());
     let capabilities = probe_capabilities();
-    let plan = plan_update(
+    let mut plan = plan_update(
         &release,
         &sha256,
         &endpoints.windows_msix_url,
@@ -197,6 +205,13 @@ pub fn plan_windows_update(
         &capabilities,
         portable_fallback_ready(endpoints),
     );
+    if install_mode == "portable" {
+        plan.route = WinInstallRoute::PortableFallback;
+        plan.warnings.push(
+            "User selected the portable Windows install mode; MSIX sideload will be skipped."
+                .to_string(),
+        );
+    }
 
     Ok(WinUpdateReport {
         manifest_url: endpoints.manifest_url.clone(),
@@ -213,15 +228,16 @@ pub fn stage_windows_update(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
 ) -> Result<WinStageReport, AppError> {
-    stage_windows_update_with_progress(endpoints, settings, &no_progress)
+    stage_windows_update_with_install_mode(endpoints, settings, "msix", &no_progress)
 }
 
-fn stage_windows_update_with_progress(
+pub fn stage_windows_update_with_install_mode(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
+    install_mode: &str,
     progress: &dyn Fn(DownloadProgress),
 ) -> Result<WinStageReport, AppError> {
-    let report = plan_windows_update(endpoints, settings)?;
+    let report = plan_windows_update_with_install_mode(endpoints, settings, install_mode)?;
     let route = route_label(&report.plan);
     if report.plan.up_to_date {
         return Ok(WinStageReport {
@@ -334,6 +350,16 @@ pub fn auto_stage_windows_update(
     enabled: bool,
     allow_metered: bool,
 ) -> Result<WinAutoStageReport, AppError> {
+    auto_stage_windows_update_with_install_mode(endpoints, settings, enabled, allow_metered, "msix")
+}
+
+pub fn auto_stage_windows_update_with_install_mode(
+    endpoints: &MirrorEndpoints,
+    settings: &AppSettings,
+    enabled: bool,
+    allow_metered: bool,
+    install_mode: &str,
+) -> Result<WinAutoStageReport, AppError> {
     if !enabled {
         return Ok(WinAutoStageReport {
             enabled,
@@ -347,7 +373,7 @@ pub fn auto_stage_windows_update(
         });
     }
 
-    let report = plan_windows_update(endpoints, settings)?;
+    let report = plan_windows_update_with_install_mode(endpoints, settings, install_mode)?;
     let capabilities = report.capabilities.clone();
     if report.plan.up_to_date {
         return Ok(WinAutoStageReport {
@@ -400,7 +426,7 @@ pub fn auto_stage_windows_update(
         }
     }
 
-    let stage = stage_windows_update(endpoints, settings)?;
+    let stage = stage_windows_update_with_install_mode(endpoints, settings, install_mode, &no_progress)?;
     let notes = if stage.install_ready {
         vec!["Windows package is staged and ready for user-confirmed installation.".to_string()]
     } else {
@@ -428,13 +454,14 @@ pub fn perform_windows_update(
     settings: &AppSettings,
     confirm: bool,
 ) -> Result<WinPerformReport, AppError> {
-    perform_windows_update_with_progress(endpoints, settings, confirm, &no_progress)
+    perform_windows_update_with_install_mode(endpoints, settings, confirm, "msix", &no_progress)
 }
 
-pub fn perform_windows_update_with_progress(
+pub fn perform_windows_update_with_install_mode(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
     confirm: bool,
+    install_mode: &str,
     progress: &dyn Fn(DownloadProgress),
 ) -> Result<WinPerformReport, AppError> {
     if !confirm {
@@ -445,7 +472,7 @@ pub fn perform_windows_update_with_progress(
 
     let previous_installed =
         detect_installed_codex(PathBuf::from(&settings.install_root).as_path());
-    let stage = stage_windows_update_with_progress(endpoints, settings, progress)?;
+    let stage = stage_windows_update_with_install_mode(endpoints, settings, install_mode, progress)?;
     if stage.up_to_date {
         return Ok(WinPerformReport {
             success: true,

@@ -21,10 +21,18 @@ pub struct AppSettings {
     /// missing in an older settings.json via serde default.
     #[serde(default = "default_true")]
     pub confirm_close: bool,
+    /// "msix" | "portable" — user-facing Windows install preference. MSIX can
+    /// still fall back to portable when the machine blocks sideloading.
+    #[serde(default = "default_windows_install_mode")]
+    pub windows_install_mode: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_windows_install_mode() -> String {
+    "msix".to_string()
 }
 
 impl Default for AppSettings {
@@ -36,6 +44,7 @@ impl Default for AppSettings {
             ask_before: true,
             signed_only: true,
             confirm_close: true,
+            windows_install_mode: default_windows_install_mode(),
         }
     }
 }
@@ -55,6 +64,9 @@ impl AppSettings {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         s.signed_only = true; // enforce regardless of what is on disk
+        if !matches!(s.windows_install_mode.as_str(), "msix" | "portable") {
+            s.windows_install_mode = default_windows_install_mode();
+        }
         s
     }
 
