@@ -34,6 +34,14 @@ pub fn run() {
             commands::mac_uninstall,
             commands::get_settings,
             commands::set_settings,
+            commands::win_plan_update,
+            commands::win_stage_update,
+            commands::win_auto_stage_update,
+            commands::win_cancel_download,
+            commands::win_status,
+            commands::win_adopt,
+            commands::win_perform_update,
+            commands::win_uninstall,
         ])
         // Menu-bar popover behaviour: dismiss when focus leaves the window.
         .on_window_event(|window, event| {

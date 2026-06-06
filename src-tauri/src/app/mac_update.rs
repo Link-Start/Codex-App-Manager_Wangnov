@@ -148,10 +148,8 @@ fn host_macos_version() -> Option<(u32, u32)> {
 /// Reject staging/installing an update the host macOS is too old to run. If the
 /// requirement or host version can't be parsed, we don't block.
 fn require_os_supported(required: Option<&str>) -> Result<(), AppError> {
-    let (Some(req), Some(host)) = (
-        required.and_then(parse_macos_version),
-        host_macos_version(),
-    ) else {
+    let (Some(req), Some(host)) = (required.and_then(parse_macos_version), host_macos_version())
+    else {
         return Ok(());
     };
     if host >= req {

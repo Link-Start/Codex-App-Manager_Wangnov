@@ -5,4 +5,4 @@ pub mod provenance;
 pub mod settings_store;
 pub mod snapshot;
 pub mod update_check;
-
+pub mod win_update;

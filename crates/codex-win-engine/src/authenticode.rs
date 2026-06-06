@@ -1,0 +1,206 @@
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+use crate::EngineError;
+
+// The mirror currently serves Store-re-signed MSIX packages; add a separate
+// exact direct-signing anchor here if the Windows source changes in the future.
+pub const OPENAI_MARKETPLACE_PUBLISHER_SUBJECT: &str =
+    "cn=50bdfd77-8903-4850-9ffe-6e8522f64d5b";
+#[cfg(any(windows, test))]
+const MICROSOFT_MARKETPLACE_ISSUER_CN_PREFIX: &str = "cn=microsoft marketplace ca";
+#[cfg(any(windows, test))]
+const MICROSOFT_MARKETPLACE_ISSUER_ORG: &str = "o=microsoft corporation";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticodeReport {
+    pub trusted: bool,
+    pub publisher_is_openai: bool,
+    pub status: String,
+    pub status_message: String,
+    pub subject: String,
+    pub issuer: String,
+    pub thumbprint: String,
+}
+
+impl AuthenticodeReport {
+    pub fn is_valid_openai(&self) -> bool {
+        self.trusted && self.publisher_is_openai
+    }
+}
+
+#[cfg(windows)]
+fn ps_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(any(windows, test))]
+fn normalized_dn_components(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|component| component.trim().to_ascii_lowercase())
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn has_pinned_marketplace_issuer(issuer: &str) -> bool {
+    let components = normalized_dn_components(issuer);
+    components
+        .iter()
+        .any(|component| component.starts_with(MICROSOFT_MARKETPLACE_ISSUER_CN_PREFIX))
+        && components
+            .iter()
+            .any(|component| component == MICROSOFT_MARKETPLACE_ISSUER_ORG)
+}
+
+#[cfg(any(windows, test))]
+fn is_pinned_openai_publisher(subject: &str, issuer: &str) -> bool {
+    let subject = subject.trim().to_ascii_lowercase();
+    subject == OPENAI_MARKETPLACE_PUBLISHER_SUBJECT && has_pinned_marketplace_issuer(issuer)
+}
+
+#[cfg(any(windows, test))]
+fn report_from_json(json: &str) -> Result<AuthenticodeReport, EngineError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| EngineError::Authenticode(format!("PowerShell JSON: {e}")))?;
+    let s = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let status = s("status");
+    let subject = s("subject");
+    let issuer = s("issuer");
+    let publisher_is_openai = is_pinned_openai_publisher(&subject, &issuer);
+
+    Ok(AuthenticodeReport {
+        trusted: status.eq_ignore_ascii_case("Valid"),
+        publisher_is_openai,
+        status,
+        status_message: s("statusMessage"),
+        subject,
+        issuer,
+        thumbprint: s("thumbprint"),
+    })
+}
+
+#[cfg(windows)]
+fn powershell_exe() -> PathBuf {
+    std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|windir| {
+            windir
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"))
+}
+
+#[cfg(windows)]
+pub fn verify_openai_authenticode(path: &Path) -> Result<AuthenticodeReport, EngineError> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$securityModule = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+Import-Module $securityModule -ErrorAction Stop
+$sig = Get-AuthenticodeSignature -LiteralPath {path}
+[pscustomobject]@{{
+  status = [string]$sig.Status
+  statusMessage = [string]$sig.StatusMessage
+  subject = if ($sig.SignerCertificate) {{ [string]$sig.SignerCertificate.Subject }} else {{ '' }}
+  issuer = if ($sig.SignerCertificate) {{ [string]$sig.SignerCertificate.Issuer }} else {{ '' }}
+  thumbprint = if ($sig.SignerCertificate) {{ [string]$sig.SignerCertificate.Thumbprint }} else {{ '' }}
+}} | ConvertTo-Json -Compress
+"#,
+        path = ps_quote(&path.to_string_lossy())
+    );
+
+    let output = Command::new(powershell_exe())
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| EngineError::Authenticode(format!("spawn powershell: {e}")))?;
+
+    if !output.status.success() {
+        return Err(EngineError::Authenticode(format!(
+            "Get-AuthenticodeSignature failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    report_from_json(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+#[cfg(not(windows))]
+pub fn verify_openai_authenticode(_path: &Path) -> Result<AuthenticodeReport, EngineError> {
+    Ok(AuthenticodeReport {
+        trusted: false,
+        publisher_is_openai: false,
+        status: "unsupported-platform".to_string(),
+        status_message: "Authenticode verification is only available on Windows".to_string(),
+        subject: String::new(),
+        issuer: String::new(),
+        thumbprint: String::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::report_from_json;
+
+    #[test]
+    fn rejects_direct_openai_subject_without_marketplace_anchor() {
+        let report = report_from_json(
+            r#"{
+              "status":"Valid",
+              "statusMessage":"Signature verified.",
+              "subject":"CN=OpenAI OpCo, LLC, O=OpenAI OpCo, LLC, C=US",
+              "issuer":"CN=Trusted CA",
+              "thumbprint":"ABC"
+            }"#,
+        )
+        .unwrap();
+        assert!(!report.is_valid_openai());
+    }
+
+    #[test]
+    fn accepts_current_store_publisher_guid_for_codex() {
+        let report = report_from_json(
+            r#"{
+              "status":"Valid",
+              "statusMessage":"Signature verified.",
+              "subject":"CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B",
+              "issuer":"CN=Microsoft Marketplace CA G 028, O=Microsoft Corporation, C=US",
+              "thumbprint":"ABC"
+            }"#,
+        )
+        .unwrap();
+        assert!(report.is_valid_openai());
+    }
+
+    #[test]
+    fn rejects_marketplace_subject_with_wrong_issuer() {
+        let report = report_from_json(
+            r#"{
+              "status":"Valid",
+              "statusMessage":"Signature verified.",
+              "subject":"CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B",
+              "issuer":"CN=Contoso Marketplace CA, O=Contoso, C=US",
+              "thumbprint":"ABC"
+            }"#,
+        )
+        .unwrap();
+        assert!(!report.is_valid_openai());
+    }
+}

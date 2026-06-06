@@ -25,9 +25,9 @@ impl PayloadUpdateCheck {
         Self {
             status: PayloadUpdateStatus::ReadyToCheck,
             manifest_url: endpoints.manifest_url.clone(),
-            message: "Manifest client boundary is ready; network fetch and signature policy come next."
-                .to_string(),
+            message:
+                "Manifest client boundary is ready; network fetch and signature policy come next."
+                    .to_string(),
         }
     }
 }
-

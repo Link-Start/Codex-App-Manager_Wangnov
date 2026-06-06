@@ -15,4 +15,3 @@ pub struct ManagerSnapshot {
     pub installation: ManagedInstallation,
     pub available_actions: Vec<String>,
 }
-

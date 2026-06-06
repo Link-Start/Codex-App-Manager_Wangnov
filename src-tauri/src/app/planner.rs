@@ -1,7 +1,5 @@
 use crate::domain::manifest::MirrorEndpoints;
-use crate::domain::operations::{
-    OperationKind, OperationPlan, OperationStep, OperationStrategy,
-};
+use crate::domain::operations::{OperationKind, OperationPlan, OperationStep, OperationStrategy};
 use crate::domain::settings::AppSettings;
 use crate::domain::target::{OperatingSystem, Target};
 
@@ -12,7 +10,11 @@ impl InstallPlanner {
     pub fn available_actions(&self, target: &Target) -> Vec<String> {
         match target.os {
             OperatingSystem::Windows | OperatingSystem::Macos => {
-                vec!["install".to_string(), "update".to_string(), "uninstall".to_string()]
+                vec![
+                    "install".to_string(),
+                    "update".to_string(),
+                    "uninstall".to_string(),
+                ]
             }
             _ => vec!["inspect".to_string()],
         }
@@ -160,7 +162,10 @@ mod tests {
     use crate::domain::target::{Architecture, Target};
 
     fn settings() -> AppSettings {
-        AppSettings::new("https://codexapp.agentsmirror.com".to_string(), "root".to_string())
+        AppSettings::new(
+            "https://codexapp.agentsmirror.com".to_string(),
+            "root".to_string(),
+        )
     }
 
     #[test]
@@ -177,7 +182,10 @@ mod tests {
             &MirrorEndpoints::from_base_url("https://example.test"),
         );
 
-        assert!(matches!(plan.strategy, OperationStrategy::WindowsMsixPreferred));
+        assert!(matches!(
+            plan.strategy,
+            OperationStrategy::WindowsMsixPreferred
+        ));
         assert_eq!(plan.steps[0].id, "download-msix");
     }
 

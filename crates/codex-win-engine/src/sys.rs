@@ -1,0 +1,461 @@
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+use crate::capability::WinCapabilityReport;
+#[cfg(windows)]
+use crate::capability::{CapabilityCheck, CapabilityState};
+use crate::msix::parse_appx_manifest_xml;
+use crate::EngineError;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledWindowsCodex {
+    pub path: String,
+    pub version: String,
+    pub arch: Option<String>,
+    /// "msix" | "portable"
+    pub source: String,
+    pub package_family_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsixSideloadReport {
+    pub success: bool,
+    pub message: String,
+    pub installed: Option<InstalledWindowsCodex>,
+    pub fallback_recommended: bool,
+    pub raw_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsixRemoveReport {
+    pub success: bool,
+    pub message: String,
+    pub raw_error: Option<String>,
+}
+
+pub fn fetch_text(url: &str) -> Result<String, EngineError> {
+    let output = Command::new("curl")
+        .args(["-fsSL", "--connect-timeout", "20", url])
+        .output()
+        .map_err(|e| EngineError::Io(format!("spawn curl: {e}")))?;
+
+    if !output.status.success() {
+        return Err(EngineError::Io(format!(
+            "curl failed for {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| EngineError::Io(e.to_string()))
+}
+
+pub fn detect_installed_codex(portable_root: &Path) -> Option<InstalledWindowsCodex> {
+    detect_msix_install().or_else(|| detect_portable_install(portable_root))
+}
+
+#[cfg(windows)]
+fn ps_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn powershell_exe() -> PathBuf {
+    std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|windir| {
+            windir
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"))
+}
+
+#[cfg(windows)]
+fn run_powershell_json(script: &str) -> Result<String, EngineError> {
+    let output = Command::new(powershell_exe())
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| EngineError::Capability(format!("spawn powershell: {e}")))?;
+    if !output.status.success() {
+        return Err(EngineError::Capability(format!(
+            "powershell failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(windows)]
+pub fn install_msix_sideload(path: &Path) -> Result<MsixSideloadReport, EngineError> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+try {{
+  $cmd = Get-Command Add-AppxPackage -ErrorAction Stop
+  $args = @{{ ErrorAction = 'Stop' }}
+  if ($cmd.Parameters.ContainsKey('LiteralPath')) {{
+    $args['LiteralPath'] = {path}
+  }} else {{
+    $args['Path'] = {path}
+  }}
+  if ($cmd.Parameters.ContainsKey('ForceUpdateFromAnyVersion')) {{
+    $args['ForceUpdateFromAnyVersion'] = $true
+  }}
+  Add-AppxPackage @args
+  $p = Get-AppxPackage -Name {name} -ErrorAction SilentlyContinue |
+    Sort-Object -Property Version -Descending |
+    Select-Object -First 1
+  [pscustomobject]@{{
+    success = $true
+    message = 'Add-AppxPackage succeeded'
+    fallbackRecommended = $false
+    rawError = $null
+    installed = if ($null -ne $p) {{
+      [pscustomobject]@{{
+        path = [string]$p.InstallLocation
+        version = [string]$p.Version
+        arch = $null
+        source = 'msix'
+        packageFamilyName = [string]$p.PackageFamilyName
+      }}
+    }} else {{ $null }}
+  }} | ConvertTo-Json -Compress -Depth 4
+}} catch {{
+  [pscustomobject]@{{
+    success = $false
+    message = [string]$_.Exception.Message
+    fallbackRecommended = $true
+    rawError = [string]$_
+    installed = $null
+  }} | ConvertTo-Json -Compress -Depth 4
+}}
+"#,
+        path = ps_quote(&path.to_string_lossy()),
+        name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY)
+    );
+    let json = run_powershell_json(&script)
+        .map_err(|e| EngineError::Install(format!("run Add-AppxPackage: {e}")))?;
+    serde_json::from_str(&json)
+        .map_err(|e| EngineError::Install(format!("parse Add-AppxPackage result: {e}")))
+}
+
+#[cfg(not(windows))]
+pub fn install_msix_sideload(_path: &Path) -> Result<MsixSideloadReport, EngineError> {
+    Ok(MsixSideloadReport {
+        success: false,
+        message: "MSIX sideloading is only available on Windows".to_string(),
+        installed: None,
+        fallback_recommended: true,
+        raw_error: None,
+    })
+}
+
+#[cfg(windows)]
+pub fn remove_msix_package() -> Result<MsixRemoveReport, EngineError> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+try {{
+  $packages = Get-AppxPackage -Name {name} -ErrorAction SilentlyContinue
+  if (-not $packages) {{
+    [pscustomobject]@{{
+      success = $true
+      message = 'MSIX package was not installed'
+      rawError = $null
+    }} | ConvertTo-Json -Compress
+    exit 0
+  }}
+  foreach ($p in $packages) {{
+    Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop
+  }}
+  [pscustomobject]@{{
+    success = $true
+    message = 'Remove-AppxPackage succeeded'
+    rawError = $null
+  }} | ConvertTo-Json -Compress
+}} catch {{
+  [pscustomobject]@{{
+    success = $false
+    message = [string]$_.Exception.Message
+    rawError = [string]$_
+  }} | ConvertTo-Json -Compress
+}}
+"#,
+        name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY)
+    );
+    let json = run_powershell_json(&script)
+        .map_err(|e| EngineError::Install(format!("run Remove-AppxPackage: {e}")))?;
+    serde_json::from_str(&json)
+        .map_err(|e| EngineError::Install(format!("parse Remove-AppxPackage result: {e}")))
+}
+
+#[cfg(not(windows))]
+pub fn remove_msix_package() -> Result<MsixRemoveReport, EngineError> {
+    Ok(MsixRemoveReport {
+        success: false,
+        message: "MSIX removal is only available on Windows".to_string(),
+        raw_error: None,
+    })
+}
+
+#[cfg(windows)]
+fn detect_msix_install() -> Option<InstalledWindowsCodex> {
+    let script = format!(
+        r#"
+$p = Get-AppxPackage -Name {name} -ErrorAction SilentlyContinue |
+  Sort-Object -Property Version -Descending |
+  Select-Object -First 1
+if ($null -ne $p) {{
+  [pscustomobject]@{{
+    path = [string]$p.InstallLocation
+    version = [string]$p.Version
+    arch = $null
+    source = 'msix'
+    packageFamilyName = [string]$p.PackageFamilyName
+  }} | ConvertTo-Json -Compress
+}}
+"#,
+        name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY)
+    );
+    let json = run_powershell_json(&script).ok()?;
+    if json.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(&json).ok()
+}
+
+#[cfg(not(windows))]
+fn detect_msix_install() -> Option<InstalledWindowsCodex> {
+    None
+}
+
+fn detect_portable_install(portable_root: &Path) -> Option<InstalledWindowsCodex> {
+    let exe = portable_root.join("Codex.exe");
+    if !exe.exists() {
+        return None;
+    }
+    let identity = std::fs::read_to_string(portable_root.join("AppxManifest.xml"))
+        .ok()
+        .and_then(|xml| parse_appx_manifest_xml(&xml).ok());
+
+    Some(InstalledWindowsCodex {
+        path: portable_root.to_string_lossy().into_owned(),
+        version: identity
+            .as_ref()
+            .map(|i| i.version.clone())
+            .unwrap_or_else(|| "0.0.0.0".to_string()),
+        arch: identity.as_ref().map(|i| i.processor_architecture.clone()),
+        source: "portable".to_string(),
+        package_family_name: None,
+    })
+}
+
+#[cfg(windows)]
+pub fn probe_capabilities() -> WinCapabilityReport {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$add = Get-Command Add-AppxPackage -ErrorAction SilentlyContinue
+$svc = Get-Service AppXSvc -ErrorAction SilentlyContinue
+$appInstaller = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue |
+  Select-Object -First 1
+
+$policy = $null
+$policySource = ''
+foreach ($p in @(
+  'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx',
+  'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+)) {
+  try {
+    $value = (Get-ItemProperty -Path $p -Name AllowAllTrustedApps -ErrorAction Stop).AllowAllTrustedApps
+    $policy = [int]$value
+    $policySource = $p
+    break
+  } catch {}
+}
+
+$meteredKnown = $false
+$metered = $null
+$costType = ''
+try {
+  $profile = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()
+  if ($null -ne $profile) {
+    $cost = $profile.GetConnectionCost()
+    $meteredKnown = $true
+    $costType = [string]$cost.NetworkCostType
+    $metered = [bool]($cost.NetworkCostType -ne 'Unrestricted' -or $cost.Roaming -or $cost.OverDataLimit)
+  }
+} catch {}
+
+[pscustomobject]@{
+  addAppxPackage = [bool]$add
+  appxSvcExists = [bool]$svc
+  appxSvcStatus = if ($svc) { [string]$svc.Status } else { '' }
+  appxSvcStartType = if ($svc) { [string]$svc.StartType } else { '' }
+  appInstallerInstalled = [bool]$appInstaller
+  appInstallerVersion = if ($appInstaller) { [string]$appInstaller.Version } else { '' }
+  allowAllTrustedApps = $policy
+  allowAllTrustedAppsSource = $policySource
+  meteredKnown = $meteredKnown
+  metered = $metered
+  networkCostType = $costType
+} | ConvertTo-Json -Compress
+"#;
+
+    match run_powershell_json(script)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+    {
+        Some(value) => capabilities_from_probe_json(&value),
+        None => WinCapabilityReport::from_checks(
+            CapabilityCheck::unknown("PowerShell capability probe failed"),
+            CapabilityCheck::unknown("PowerShell capability probe failed"),
+            CapabilityCheck::unknown("PowerShell capability probe failed"),
+            CapabilityCheck::unknown("PowerShell capability probe failed"),
+            CapabilityCheck::unknown("PowerShell capability probe failed"),
+            vec!["Could not complete Windows capability probe.".to_string()],
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn probe_capabilities() -> WinCapabilityReport {
+    WinCapabilityReport::unknown_for_non_windows()
+}
+
+#[cfg(windows)]
+fn capabilities_from_probe_json(value: &serde_json::Value) -> WinCapabilityReport {
+    let add = if value
+        .get("addAppxPackage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        CapabilityCheck::available("Add-AppxPackage command is present")
+    } else {
+        CapabilityCheck::unavailable("Add-AppxPackage command is not present")
+    };
+
+    let svc_exists = value
+        .get("appxSvcExists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let svc_status = value
+        .get("appxSvcStatus")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let svc_start = value
+        .get("appxSvcStartType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let appx_service = if !svc_exists {
+        CapabilityCheck::unavailable("AppXSvc service is missing")
+    } else if svc_start.eq_ignore_ascii_case("Disabled") {
+        CapabilityCheck::unavailable("AppXSvc service is disabled")
+    } else {
+        CapabilityCheck::available(format!("AppXSvc is {svc_status}, start type {svc_start}"))
+    };
+
+    let policy = value.get("allowAllTrustedApps").and_then(|v| v.as_i64());
+    let policy_source = value
+        .get("allowAllTrustedAppsSource")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sideload_policy = match policy {
+        Some(0) => {
+            CapabilityCheck::unavailable(format!("AllowAllTrustedApps=0 at {policy_source}"))
+        }
+        Some(1) => CapabilityCheck::available(format!("AllowAllTrustedApps=1 at {policy_source}")),
+        Some(other) => {
+            CapabilityCheck::unknown(format!("AllowAllTrustedApps={other} at {policy_source}"))
+        }
+        None => CapabilityCheck::unknown("AllowAllTrustedApps is not explicitly set"),
+    };
+
+    let app_installer = if value
+        .get("appInstallerInstalled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let version = value
+            .get("appInstallerVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        CapabilityCheck::available(format!("Desktop App Installer {version}"))
+    } else {
+        CapabilityCheck::unknown("Desktop App Installer package was not detected")
+    };
+
+    let metered_network = if !value
+        .get("meteredKnown")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        CapabilityCheck::unknown("WinRT network cost could not be read")
+    } else if value
+        .get("metered")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let cost = value
+            .get("networkCostType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        CapabilityCheck {
+            state: CapabilityState::Unavailable,
+            detail: format!("current connection is metered ({cost})"),
+        }
+    } else {
+        let cost = value
+            .get("networkCostType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        CapabilityCheck::available(format!("current connection is not metered ({cost})"))
+    };
+
+    WinCapabilityReport::from_checks(
+        add,
+        appx_service,
+        sideload_policy,
+        app_installer,
+        metered_network,
+        vec!["Certificate trust is verified after the MSIX is staged.".to_string()],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_probe_json_into_portable_recommendation_when_policy_blocks() {
+        let value = serde_json::json!({
+            "addAppxPackage": true,
+            "appxSvcExists": true,
+            "appxSvcStatus": "Running",
+            "appxSvcStartType": "Manual",
+            "appInstallerInstalled": true,
+            "appInstallerVersion": "1.0.0.0",
+            "allowAllTrustedApps": 0,
+            "allowAllTrustedAppsSource": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Appx",
+            "meteredKnown": true,
+            "metered": false,
+            "networkCostType": "Unrestricted"
+        });
+        let report = capabilities_from_probe_json(&value);
+        assert_eq!(
+            report.recommendation,
+            crate::capability::SideloadRecommendation::PortableFallback
+        );
+    }
+}

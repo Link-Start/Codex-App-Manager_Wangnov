@@ -22,4 +22,3 @@ pub struct HealthCheck {
 pub struct HealthReport {
     pub checks: Vec<HealthCheck>,
 }
-
