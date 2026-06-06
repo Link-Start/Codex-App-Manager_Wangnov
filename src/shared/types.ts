@@ -73,6 +73,7 @@ export interface MacInstallStatus {
 }
 
 export type UpdateSourceKind = "auto" | "mirror" | "official" | "custom";
+export type WindowsInstallMode = "msix" | "portable";
 
 export interface AppSettings {
   source: UpdateSourceKind;
@@ -83,6 +84,8 @@ export interface AppSettings {
   signedOnly: boolean;
   /** Ask for confirmation before closing (quitting) the window. */
   confirmClose: boolean;
+  /** Windows payload install preference. MSIX still falls back safely if blocked. */
+  windowsInstallMode: WindowsInstallMode;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -92,6 +95,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   askBefore: true,
   signedOnly: true,
   confirmClose: true,
+  windowsInstallMode: "msix",
 };
 
 export interface MacUninstallReport {

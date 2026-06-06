@@ -432,6 +432,22 @@ input {
   color: #fff;
   box-shadow: 0 6px 18px rgba(242, 97, 95, 0.26);
 }
+.btn.danger:hover:not(:disabled) {
+  background: linear-gradient(150deg, #ff7472, var(--danger-2));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 7px 22px rgba(242, 97, 95, 0.34);
+}
+.btn.danger:disabled {
+  opacity: 1;
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--text-faint);
+  box-shadow: none;
+}
+.btn.danger:disabled svg {
+  color: var(--text-faint);
+}
 .btn.ghost {
   background: transparent;
   border-color: var(--line-2);

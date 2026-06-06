@@ -1,18 +1,32 @@
 import { useEffect, useState } from "react";
 
 import { managerApi } from "../../services/managerApi";
-import type { AppSettings, UpdateSourceKind } from "../../shared/types";
+import type { AppSettings, UpdateSourceKind, WindowsInstallMode } from "../../shared/types";
 import { DEFAULT_SETTINGS } from "../../shared/types";
 import { Icon } from "../icons";
 import { useI18n, type Lang, type TKey } from "../i18n";
 import { useTheme, type ThemeMode } from "../theme";
 import { NavBar, Toggle } from "../components";
+import { isWindows } from "../platform";
 
 const SOURCES: { kind: UpdateSourceKind; label: TKey; desc: TKey | "" }[] = [
   { kind: "auto", label: "settings.source.auto", desc: "settings.source.autoDesc" },
   { kind: "mirror", label: "settings.source.mirror", desc: "settings.source.mirrorDesc" },
   { kind: "official", label: "settings.source.official", desc: "settings.source.officialDesc" },
   { kind: "custom", label: "settings.source.custom", desc: "" },
+];
+
+const WINDOWS_INSTALL_MODES: { kind: WindowsInstallMode; label: TKey; desc: TKey }[] = [
+  {
+    kind: "msix",
+    label: "settings.windows.msix",
+    desc: "settings.windows.msixDesc",
+  },
+  {
+    kind: "portable",
+    label: "settings.windows.portable",
+    desc: "settings.windows.portableDesc",
+  },
 ];
 
 export function Settings({
@@ -28,6 +42,7 @@ export function Settings({
 }) {
   const { t, lang, setLang } = useI18n();
   const { mode, setMode } = useTheme();
+  const win = isWindows();
   const [s, setS] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [autostart, setAutostart] = useState(false);
 
@@ -99,6 +114,35 @@ export function Settings({
             ) : null}
           </div>
         </div>
+
+        {win ? (
+          <div className="group">
+            <div className="group-h">{t("settings.windows.header")}</div>
+            <div className="list">
+              {WINDOWS_INSTALL_MODES.map((mode) => (
+                <button
+                  key={mode.kind}
+                  className="row"
+                  aria-checked={s.windowsInstallMode === mode.kind}
+                  onClick={() => save({ ...s, windowsInstallMode: mode.kind })}
+                >
+                  <span className="radio" />
+                  <span className="rtext">
+                    <span className="rtitle">
+                      {t(mode.label)}
+                      {mode.kind === "msix" ? (
+                        <span className="tag" style={{ marginLeft: 8 }}>
+                          {t("settings.source.recommended")}
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="rsub">{t(mode.desc)}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         {/* 通用 */}
         <div className="group">
