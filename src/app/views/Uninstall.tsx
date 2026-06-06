@@ -18,7 +18,8 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
     setError(null);
     try {
       const r = await managerApi.macUninstall(keepData);
-      setDone(r.keptCodexHome ? t("uninstall.doneKept") : t("uninstall.doneCleared"));
+      // The backend message is the source of truth (covers a failed clear).
+      setDone(r.message);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {

@@ -16,7 +16,7 @@ function mib(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
-type Kind = "loading" | "error" | "none" | "update" | "external" | "uptodate";
+type Kind = "loading" | "error" | "none" | "idle" | "update" | "external" | "uptodate";
 
 export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { t } = useI18n();
@@ -45,9 +45,15 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   }, []);
 
   useEffect(() => {
-    void check();
-    void refreshStatus();
-    void managerApi.getSettings().then(setSettings).catch(() => undefined);
+    void (async () => {
+      const s = await managerApi.getSettings().catch(() => DEFAULT_SETTINGS);
+      setSettings(s);
+      void refreshStatus();
+      // Honor "自动检查更新": only hit the appcast on open when enabled.
+      if (s.autoCheck) {
+        void check();
+      }
+    })();
   }, [check, refreshStatus]);
 
   const adopt = useCallback(async () => {
@@ -108,6 +114,8 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
     if (busy === "plan" && !report) return "loading";
     if (error && !report) return "error";
     if (!installed) return "none";
+    // Installed but not checked yet (auto-check disabled) — don't claim a state.
+    if (!report) return "idle";
     if (updateAvailable) return "update";
     if (status?.status === "external") return "external";
     return "uptodate";
@@ -158,7 +166,8 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
           <div className="banner ok">
             <Icon name="check" />
             <span>
-              {t("success.title")} · {t("success.relaunched")}
+              {t("success.title")} ·{" "}
+              {perform.relaunched ? t("success.relaunched") : t("success.manualLaunch")}
             </span>
           </div>
         ) : null}
@@ -192,6 +201,18 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
               <Ring icon="download" variant="muted" />
               <div className="headline">{t("home.none.title")}</div>
               <div className="desc">{t("home.none.sub")}</div>
+            </>
+          ) : kind === "idle" ? (
+            <>
+              <Ring icon="shield" variant="muted" />
+              <div className="headline">{t("home.idle.title")}</div>
+              <div className="sub">
+                {installed ? t("home.idle.sub", { build: installed.build }) : ""}
+              </div>
+              <div className="prov">
+                <span className={`dot ${isManaged ? "managed" : "external"}`} />
+                {isManaged ? t("prov.managed") : t("prov.external")}
+              </div>
             </>
           ) : kind === "update" ? (
             <>
@@ -236,9 +257,18 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
 
         <div className="actions">
           {kind === "update" ? (
-            <button className="btn primary big" onClick={() => setConfirmOpen(true)}>
+            <button
+              className="btn primary big"
+              onClick={() => (settings.askBefore ? setConfirmOpen(true) : void runPerform())}
+            >
               <Icon name="download" />
               {t("home.update.cta")}
+            </button>
+          ) : null}
+          {kind === "idle" ? (
+            <button className="btn primary big" onClick={check} disabled={busy !== null}>
+              <Icon name="refresh" />
+              {t("home.recheck")}
             </button>
           ) : null}
           {kind === "external" ? (

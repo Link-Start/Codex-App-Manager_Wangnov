@@ -691,23 +691,29 @@ pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppE
     }
 
     // Only ever touch ~/.codex when the user explicitly opted out of keeping it.
-    if !keep_codex_home {
+    // If the removal fails (e.g. permissions), report honestly rather than
+    // claiming the data was cleared.
+    let (kept_codex_home, message) = if keep_codex_home {
+        (true, "已卸载 Codex,保留了 ~/.codex".to_string())
+    } else {
+        let mut cleared = true;
         if let Ok(home) = std::env::var("HOME") {
             let codex_home = PathBuf::from(home).join(".codex");
             if codex_home.exists() {
-                let _ = std::fs::remove_dir_all(&codex_home);
+                cleared = std::fs::remove_dir_all(&codex_home).is_ok();
             }
         }
-    }
+        if cleared {
+            (false, "已卸载 Codex,并清除了 ~/.codex".to_string())
+        } else {
+            (true, "已卸载 Codex,但 ~/.codex 清除失败,数据仍保留".to_string())
+        }
+    };
 
     Ok(MacUninstallReport {
         removed: true,
-        kept_codex_home: keep_codex_home,
-        message: if keep_codex_home {
-            "已卸载 Codex,保留了 ~/.codex".to_string()
-        } else {
-            "已卸载 Codex,并清除了 ~/.codex".to_string()
-        },
+        kept_codex_home,
+        message,
     })
 }
 

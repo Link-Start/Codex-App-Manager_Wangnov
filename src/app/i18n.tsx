@@ -21,6 +21,8 @@ const ZH = {
   "nav.config": "Codex 配置管理",
 
   "home.checking": "正在检查…",
+  "home.idle.title": "Codex 已安装",
+  "home.idle.sub": "build {build}",
   "home.uptodate.title": "已是最新",
   "home.uptodate.sub": "当前版本 {version}",
   "home.official": "官方版本",
@@ -55,6 +57,7 @@ const ZH = {
   "success.title": "已更新",
   "success.sub": "现在是 {version}",
   "success.relaunched": "Codex 已重启",
+  "success.manualLaunch": "请手动启动 Codex",
   "success.rolledBack": "更新未完成,已恢复到原版本",
   "success.done": "完成",
 
@@ -124,6 +127,8 @@ const EN: Record<Key, string> = {
   "nav.config": "Codex configuration",
 
   "home.checking": "Checking…",
+  "home.idle.title": "Codex installed",
+  "home.idle.sub": "build {build}",
   "home.uptodate.title": "Up to date",
   "home.uptodate.sub": "Current version {version}",
   "home.official": "Official build",
@@ -158,6 +163,7 @@ const EN: Record<Key, string> = {
   "success.title": "Updated",
   "success.sub": "Now on {version}",
   "success.relaunched": "Codex restarted",
+  "success.manualLaunch": "Please launch Codex manually",
   "success.rolledBack": "Update didn’t finish — restored the previous version",
   "success.done": "Done",
 
@@ -230,7 +236,7 @@ const LS_KEY = "cam.lang";
 function detectLang(): Lang {
   const saved = localStorage.getItem(LS_KEY);
   if (saved === "zh-CN" || saved === "en") return saved;
-  return navigator.language?.toLowerCase().startsWith("zh") ? "zh-CN" : "zh-CN";
+  return navigator.language?.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
 }
 
 export function I18nProvider({ children }: { children: ReactNode }) {
