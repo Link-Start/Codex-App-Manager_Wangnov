@@ -68,6 +68,14 @@ impl ProvenanceStore {
         self.managed.iter().any(|r| r.path == path)
     }
 
+    /// Stricter than [`is_managed`]: the path AND the build must match a record.
+    /// Guards destructive actions against path reuse (e.g. a manually-installed
+    /// official Codex landing where a managed one used to be) and against a stale
+    /// record left by a failed save — those won't match the current build.
+    pub fn is_managed_build(&self, path: &str, build: u64) -> bool {
+        self.managed.iter().any(|r| r.path == path && r.build == build)
+    }
+
     /// Record (or refresh) a managed install, keyed by path.
     pub fn record(&mut self, path: String, build: u64, source: &str) {
         self.managed.retain(|r| r.path != path);

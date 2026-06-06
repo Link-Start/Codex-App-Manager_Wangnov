@@ -604,7 +604,9 @@ pub fn mac_install_status() -> MacInstallStatus {
     let store = ProvenanceStore::load();
     let status = match &installed {
         None => "none",
-        Some(codex) if store.is_managed(&codex.path) => "managed",
+        // Build-aware: a self-updated or path-reused install no longer matches
+        // its record and falls back to "external" (prompting re-adoption).
+        Some(codex) if store.is_managed_build(&codex.path, codex.build) => "managed",
         Some(_) => "external",
     }
     .to_string();
@@ -727,11 +729,13 @@ pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppE
         .ok_or_else(|| AppError::Engine("no Codex detected to uninstall".to_string()))?;
     let install_path = PathBuf::from(&installed.path);
 
-    // Boundary: refuse to delete an install we don't manage.
+    // Boundary: refuse to delete anything that isn't an install we manage at this
+    // exact build (path-only matching could delete a path-reused external install
+    // or one left by a stale record).
     let mut store = ProvenanceStore::load();
-    if !store.is_managed(&installed.path) {
+    if !store.is_managed_build(&installed.path, installed.build) {
         return Err(AppError::Engine(
-            "这是外部安装的 Codex(非本应用安装)。请先在主界面「开始管理」纳入管理后再卸载。"
+            "这是外部安装的 Codex,或版本与托管记录不一致。请先在主界面「开始管理」纳入管理后再卸载。"
                 .to_string(),
         ));
     }
