@@ -611,17 +611,48 @@ pub fn mac_adopt() -> Result<MacInstallStatus, AppError> {
     Ok(mac_install_status())
 }
 
+/// Can we create (and remove) a file in `dir`? Used to decide whether the
+/// system `/Applications` is writable before attempting an install there.
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(".cam-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Choose the install directory: `/Applications` when writable, otherwise the
+/// no-admin `~/Applications` (created if needed). Lets non-admin / managed Macs
+/// install without elevation.
+fn choose_install_dir() -> Result<PathBuf, AppError> {
+    let system = PathBuf::from("/Applications");
+    if dir_writable(&system) {
+        return Ok(system);
+    }
+    let home =
+        std::env::var("HOME").map_err(|_| AppError::Engine("找不到用户主目录".to_string()))?;
+    let user_apps = PathBuf::from(home).join("Applications");
+    std::fs::create_dir_all(&user_apps)
+        .map_err(|e| AppError::Engine(format!("创建 ~/Applications 失败: {e}")))?;
+    Ok(user_apps)
+}
+
 /// Fresh install: download the appcast's full package, verify + gate it, and
-/// place it at `/Applications/Codex.app`. No delta, no quit (nothing running),
-/// no backup (nothing to replace). Records `manager-installed` provenance and
-/// launches the freshly installed app.
+/// place it under `/Applications` (or `~/Applications` when the system folder
+/// isn't writable). No delta, no quit (nothing running), no backup (nothing to
+/// replace). Records `manager-installed` provenance and launches the app.
 pub fn install_macos() -> Result<MacInstallStatus, AppError> {
-    let install_path = PathBuf::from("/Applications/Codex.app");
-    if install_path.exists() {
+    if detect_installed().is_some() {
         return Err(AppError::Engine(
             "已检测到 Codex,请使用更新而非安装".to_string(),
         ));
     }
+
+    let install_dir = choose_install_dir()?;
+    let install_path = install_dir.join("Codex.app");
 
     let arch = if std::env::consts::ARCH == "aarch64" {
         "arm64"
@@ -644,14 +675,14 @@ pub fn install_macos() -> Result<MacInstallStatus, AppError> {
     gate_reconstructed(&out_app)
         .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝安装）: {e}")))?;
 
-    let parent = install_path.parent().unwrap_or(install_path.as_path());
-    if !codex_mac_engine::swap::same_volume(&out_app, parent) {
-        return Err(AppError::Engine(
-            "暂存目录与 /Applications 不在同一卷,无法安装".to_string(),
-        ));
+    if !codex_mac_engine::swap::same_volume(&out_app, &install_dir) {
+        return Err(AppError::Engine(format!(
+            "暂存目录与 {} 不在同一卷,无法安装",
+            install_dir.display()
+        )));
     }
     std::fs::rename(&out_app, &install_path)
-        .map_err(|e| AppError::Engine(format!("写入 /Applications 失败: {e}")))?;
+        .map_err(|e| AppError::Engine(format!("写入 {} 失败: {e}", install_dir.display())))?;
 
     if let Some((path, build)) = sys::installed_codex_build() {
         let mut store = ProvenanceStore::load();

@@ -111,13 +111,15 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const updateAvailable = Boolean(plan) && !plan?.upToDate;
 
   const kind: Kind = useMemo(() => {
+    if (!installed) return busy === "plan" || status === null ? "loading" : "none";
+    // Adoption status is local (macStatus) and must not depend on a successful
+    // network check — surface "开始管理" before any network-dependent state so it
+    // is never hidden (auto-check off / appcast error) or bypassed (update).
+    if (status?.status === "external") return "external";
     if (busy === "plan" && !report) return "loading";
     if (error && !report) return "error";
-    if (!installed) return "none";
-    // Installed but not checked yet (auto-check disabled) — don't claim a state.
     if (!report) return "idle";
     if (updateAvailable) return "update";
-    if (status?.status === "external") return "external";
     return "uptodate";
   }, [busy, report, error, installed, updateAvailable, status]);
 
