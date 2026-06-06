@@ -22,7 +22,9 @@ pub mod portable;
 pub mod sys;
 pub mod version;
 
-pub use authenticode::{verify_openai_authenticode, AuthenticodeReport, OPENAI_PUBLISHER_NEEDLE};
+pub use authenticode::{
+    verify_openai_authenticode, AuthenticodeReport, OPENAI_MARKETPLACE_PUBLISHER_SUBJECT,
+};
 pub use capability::{
     CapabilityCheck, CapabilityState, SideloadRecommendation, WinCapabilityReport,
 };

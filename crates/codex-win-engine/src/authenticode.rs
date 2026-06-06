@@ -8,12 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::EngineError;
 
-pub const OPENAI_PUBLISHER_NEEDLE: &str = "openai";
-#[cfg(windows)]
+// The mirror currently serves Store-re-signed MSIX packages; add a separate
+// exact direct-signing anchor here if the Windows source changes in the future.
 pub const OPENAI_MARKETPLACE_PUBLISHER_SUBJECT: &str =
     "cn=50bdfd77-8903-4850-9ffe-6e8522f64d5b";
-#[cfg(windows)]
-const MICROSOFT_MARKETPLACE_ISSUER_NEEDLE: &str = "microsoft marketplace";
+#[cfg(any(windows, test))]
+const MICROSOFT_MARKETPLACE_ISSUER_CN_PREFIX: &str = "cn=microsoft marketplace ca";
+#[cfg(any(windows, test))]
+const MICROSOFT_MARKETPLACE_ISSUER_ORG: &str = "o=microsoft corporation";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,7 +40,33 @@ fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+fn normalized_dn_components(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|component| component.trim().to_ascii_lowercase())
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn has_pinned_marketplace_issuer(issuer: &str) -> bool {
+    let components = normalized_dn_components(issuer);
+    components
+        .iter()
+        .any(|component| component.starts_with(MICROSOFT_MARKETPLACE_ISSUER_CN_PREFIX))
+        && components
+            .iter()
+            .any(|component| component == MICROSOFT_MARKETPLACE_ISSUER_ORG)
+}
+
+#[cfg(any(windows, test))]
+fn is_pinned_openai_publisher(subject: &str, issuer: &str) -> bool {
+    let subject = subject.trim().to_ascii_lowercase();
+    subject == OPENAI_MARKETPLACE_PUBLISHER_SUBJECT && has_pinned_marketplace_issuer(issuer)
+}
+
+#[cfg(any(windows, test))]
 fn report_from_json(json: &str) -> Result<AuthenticodeReport, EngineError> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| EngineError::Authenticode(format!("PowerShell JSON: {e}")))?;
@@ -52,11 +80,7 @@ fn report_from_json(json: &str) -> Result<AuthenticodeReport, EngineError> {
     let status = s("status");
     let subject = s("subject");
     let issuer = s("issuer");
-    let subject_lower = subject.to_ascii_lowercase();
-    let issuer_lower = issuer.to_ascii_lowercase();
-    let publisher_is_openai = subject_lower.contains(OPENAI_PUBLISHER_NEEDLE)
-        || (subject_lower == OPENAI_MARKETPLACE_PUBLISHER_SUBJECT
-            && issuer_lower.contains(MICROSOFT_MARKETPLACE_ISSUER_NEEDLE));
+    let publisher_is_openai = is_pinned_openai_publisher(&subject, &issuer);
 
     Ok(AuthenticodeReport {
         trusted: status.eq_ignore_ascii_case("Valid"),
@@ -133,12 +157,10 @@ pub fn verify_openai_authenticode(_path: &Path) -> Result<AuthenticodeReport, En
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
     use super::report_from_json;
 
-    #[cfg(windows)]
     #[test]
-    fn parses_valid_openai_signature_report() {
+    fn rejects_direct_openai_subject_without_marketplace_anchor() {
         let report = report_from_json(
             r#"{
               "status":"Valid",
@@ -149,10 +171,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(report.is_valid_openai());
+        assert!(!report.is_valid_openai());
     }
 
-    #[cfg(windows)]
     #[test]
     fn accepts_current_store_publisher_guid_for_codex() {
         let report = report_from_json(
@@ -166,5 +187,20 @@ mod tests {
         )
         .unwrap();
         assert!(report.is_valid_openai());
+    }
+
+    #[test]
+    fn rejects_marketplace_subject_with_wrong_issuer() {
+        let report = report_from_json(
+            r#"{
+              "status":"Valid",
+              "statusMessage":"Signature verified.",
+              "subject":"CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B",
+              "issuer":"CN=Contoso Marketplace CA, O=Contoso, C=US",
+              "thumbprint":"ABC"
+            }"#,
+        )
+        .unwrap();
+        assert!(!report.is_valid_openai());
     }
 }

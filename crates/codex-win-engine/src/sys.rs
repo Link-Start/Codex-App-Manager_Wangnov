@@ -433,6 +433,7 @@ fn capabilities_from_probe_json(value: &serde_json::Value) -> WinCapabilityRepor
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]
