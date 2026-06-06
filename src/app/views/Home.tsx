@@ -27,6 +27,9 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [busy, setBusy] = useState<"plan" | "perform" | "adopt" | "install" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // Whether the status request has finished (success OR failure) — distinct from
+  // the value, so a failed macStatus doesn't leave the home stuck on "loading".
+  const [statusLoaded, setStatusLoaded] = useState(false);
 
   const check = useCallback(async () => {
     setBusy("plan");
@@ -41,7 +44,13 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   }, []);
 
   const refreshStatus = useCallback(async () => {
-    await managerApi.macStatus().then(setStatus).catch(() => undefined);
+    try {
+      setStatus(await managerApi.macStatus());
+    } catch {
+      // leave status as-is; the "loaded" flag below still flips so we don't hang.
+    } finally {
+      setStatusLoaded(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -111,7 +120,7 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const updateAvailable = Boolean(plan) && !plan?.upToDate;
 
   const kind: Kind = useMemo(() => {
-    if (!installed) return busy === "plan" || status === null ? "loading" : "none";
+    if (!installed) return busy === "plan" || !statusLoaded ? "loading" : "none";
     // Adoption status is local (macStatus) and must not depend on a successful
     // network check — surface "开始管理" before any network-dependent state so it
     // is never hidden (auto-check off / appcast error) or bypassed (update).
@@ -121,7 +130,7 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
     if (!report) return "idle";
     if (updateAvailable) return "update";
     return "uptodate";
-  }, [busy, report, error, installed, updateAvailable, status]);
+  }, [busy, report, error, installed, updateAvailable, status, statusLoaded]);
 
   const version = plan?.latestShortVersion || (installed ? `build ${installed.build}` : "");
   const sourceLabel = t(`source.${settings.source}` as TKey);
