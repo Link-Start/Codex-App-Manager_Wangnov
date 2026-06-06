@@ -43,7 +43,7 @@ impl Target {
             _ => Architecture::Unknown,
         };
 
-        let label = format!("{:?} / {:?}", os, arch);
+        let label = format!("{os:?} / {arch:?}");
 
         Self { os, arch, label }
     }
