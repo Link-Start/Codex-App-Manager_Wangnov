@@ -51,10 +51,11 @@ fn partial_path(dest: &Path) -> PathBuf {
     dest.with_file_name(format!("{file_name}.part"))
 }
 
-fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
+fn run_curl(url: &str, dest: &Path, resume: bool, on_progress: &dyn Fn(u64)) -> Result<(), String> {
     let dest = dest.to_string_lossy().into_owned();
     let mut args = vec![
         "-fL".to_string(),
+        "--no-progress-meter".to_string(),
         "--connect-timeout".to_string(),
         "20".to_string(),
         "--retry".to_string(),
@@ -63,7 +64,7 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
     if resume {
         args.extend(["-C".to_string(), "-".to_string()]);
     }
-    args.extend(["-o".to_string(), dest, url.to_string()]);
+    args.extend(["-o".to_string(), dest.clone(), url.to_string()]);
 
     let mut child = Command::new("curl")
         .args(args)
@@ -78,6 +79,8 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
             let _ = child.wait();
             return Err("download cancelled".to_string());
         }
+        let downloaded = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        on_progress(downloaded);
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => thread::sleep(Duration::from_millis(200)),
@@ -99,10 +102,20 @@ fn run_curl(url: &str, dest: &Path, resume: bool) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    let downloaded = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    on_progress(downloaded);
     Ok(())
 }
 
 pub fn download_to(url: &str, dest: &Path) -> Result<(), EngineError> {
+    download_to_with_progress(url, dest, &|_| {})
+}
+
+pub fn download_to_with_progress(
+    url: &str,
+    dest: &Path,
+    on_progress: &dyn Fn(u64),
+) -> Result<(), EngineError> {
     // The manager has one Windows package staging slot. Serialize downloads so
     // auto-stage and manual-stage cannot reset each other's cancel flag.
     let _guard = DownloadGuard::acquire().map_err(EngineError::Io)?;
@@ -114,14 +127,14 @@ pub fn download_to(url: &str, dest: &Path) -> Result<(), EngineError> {
 
     let part = partial_path(dest);
     let should_resume = part.metadata().map(|m| m.len() > 0).unwrap_or(false);
-    let download_result = run_curl(url, &part, should_resume);
+    let download_result = run_curl(url, &part, should_resume, on_progress);
     if let Err(first_err) = download_result {
         if is_cancelled_error(&first_err) {
             return Err(EngineError::Io(first_err));
         }
         if should_resume {
             let _ = std::fs::remove_file(&part);
-            run_curl(url, &part, false).map_err(|second_err| {
+            run_curl(url, &part, false, on_progress).map_err(|second_err| {
                 if is_cancelled_error(&second_err) {
                     return EngineError::Io(second_err);
                 }
@@ -167,6 +180,14 @@ pub fn sha256_file(path: &Path) -> Result<String, EngineError> {
 mod tests {
     use super::*;
 
+    fn file_url(path: &Path) -> String {
+        let mut path = path.to_string_lossy().replace('\\', "/");
+        if !path.starts_with('/') {
+            path = format!("/{path}");
+        }
+        format!("file://{}", path.replace(' ', "%20"))
+    }
+
     #[test]
     fn download_guard_rejects_concurrent_downloads() {
         let guard = DownloadGuard::acquire().unwrap();
@@ -174,5 +195,33 @@ mod tests {
         assert!(DownloadGuard::acquire().is_err());
         drop(guard);
         assert!(!cancel_active_download());
+    }
+
+    #[test]
+    fn download_with_progress_reports_final_size() {
+        if Command::new("curl").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "codex-win-engine-progress-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let dest = root.join("dest.bin");
+        let bytes = vec![0x4d; 1024 * 1024];
+        std::fs::write(&source, &bytes).unwrap();
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        download_to_with_progress(&file_url(&source), &dest, &|downloaded| {
+            seen.lock().unwrap().push(downloaded);
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        assert!(seen.lock().unwrap().contains(&(1024 * 1024)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

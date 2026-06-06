@@ -29,7 +29,9 @@ pub use capability::{
     CapabilityCheck, CapabilityState, SideloadRecommendation, WinCapabilityReport,
 };
 pub use checksums::{find_msix_sha256, parse_checksums, ChecksumEntry};
-pub use download::{cancel_active_download, download_to, read_file, sha256_file};
+pub use download::{
+    cancel_active_download, download_to, download_to_with_progress, read_file, sha256_file,
+};
 pub use manifest::{parse_manifest, WindowsRelease};
 pub use msix::{
     parse_appx_manifest_xml, read_msix_identity, validate_codex_identity, MsixIdentity,

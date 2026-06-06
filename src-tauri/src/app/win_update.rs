@@ -12,13 +12,13 @@ use serde::Serialize;
 
 use codex_win_engine::{
     cancel_active_download, close_codex_gracefully_for_root, detect_installed_codex,
-    detect_portable_install, download_to, fetch_text, find_msix_sha256, install_msix_sideload,
-    install_portable_from_msix, parse_manifest, plan_update, probe_capabilities,
-    purge_codex_user_data, read_msix_identity, remove_msix_package, sha256_file,
-    uninstall_portable, validate_codex_identity, verify_openai_authenticode, version_key,
-    AuthenticodeReport, CapabilityState, InstalledWindowsCodex, MsixIdentity, MsixRemoveReport,
-    MsixSideloadReport, PortableInstallReport, PortableUninstallReport, WinCapabilityReport,
-    WindowsRelease, WindowsUpdatePlan,
+    detect_portable_install, download_to_with_progress, fetch_text, find_msix_sha256,
+    install_msix_sideload, install_portable_from_msix, parse_manifest, plan_update,
+    probe_capabilities, purge_codex_user_data, read_msix_identity, remove_msix_package,
+    sha256_file, uninstall_portable, validate_codex_identity, verify_openai_authenticode,
+    version_key, AuthenticodeReport, CapabilityState, InstalledWindowsCodex, MsixIdentity,
+    MsixRemoveReport, MsixSideloadReport, PortableInstallReport, PortableUninstallReport,
+    WinCapabilityReport, WindowsRelease, WindowsUpdatePlan,
 };
 
 use crate::app::provenance::ProvenanceStore;
@@ -106,9 +106,28 @@ pub struct WinInstallStatus {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: u64,
+    /// Host the bytes are coming from, e.g. `codexapp.agentsmirror.com`.
+    pub source: String,
+}
+
 fn engine_err(err: impl ToString) -> AppError {
     AppError::Engine(err.to_string())
 }
+
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn no_progress(_p: DownloadProgress) {}
 
 fn portable_fallback_ready(_endpoints: &MirrorEndpoints) -> bool {
     true
@@ -194,6 +213,14 @@ pub fn stage_windows_update(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
 ) -> Result<WinStageReport, AppError> {
+    stage_windows_update_with_progress(endpoints, settings, &no_progress)
+}
+
+fn stage_windows_update_with_progress(
+    endpoints: &MirrorEndpoints,
+    settings: &AppSettings,
+    progress: &dyn Fn(DownloadProgress),
+) -> Result<WinStageReport, AppError> {
     let report = plan_windows_update(endpoints, settings)?;
     let route = route_label(&report.plan);
     if report.plan.up_to_date {
@@ -217,6 +244,7 @@ pub fn stage_windows_update(
     let dest = staged_msix_path(&report.release);
     let expected_size = report.release.content_length.unwrap_or(0);
     let expected_sha = report.plan.sha256.clone();
+    let source = host_of(&report.package_url);
 
     let cached_ok = dest.exists()
         && sha256_file(&dest)
@@ -226,7 +254,14 @@ pub fn stage_windows_update(
         if dest.exists() {
             let _ = std::fs::remove_file(&dest);
         }
-        download_to(&report.package_url, &dest).map_err(engine_err)?;
+        download_to_with_progress(&report.package_url, &dest, &|downloaded| {
+            progress(DownloadProgress {
+                downloaded,
+                total: expected_size,
+                source: source.clone(),
+            });
+        })
+        .map_err(engine_err)?;
     }
 
     let actual_size = std::fs::metadata(&dest)
@@ -237,6 +272,15 @@ pub fn stage_windows_update(
             "MSIX size mismatch: {actual_size} != {expected_size}"
         )));
     }
+    progress(DownloadProgress {
+        downloaded: actual_size,
+        total: if expected_size > 0 {
+            expected_size
+        } else {
+            actual_size
+        },
+        source,
+    });
 
     let actual_sha = sha256_file(&dest).map_err(engine_err)?;
     if !actual_sha.eq_ignore_ascii_case(&expected_sha) {
@@ -384,6 +428,15 @@ pub fn perform_windows_update(
     settings: &AppSettings,
     confirm: bool,
 ) -> Result<WinPerformReport, AppError> {
+    perform_windows_update_with_progress(endpoints, settings, confirm, &no_progress)
+}
+
+pub fn perform_windows_update_with_progress(
+    endpoints: &MirrorEndpoints,
+    settings: &AppSettings,
+    confirm: bool,
+    progress: &dyn Fn(DownloadProgress),
+) -> Result<WinPerformReport, AppError> {
     if !confirm {
         return Err(AppError::Internal(
             "explicit confirmation is required before installing Windows Codex".to_string(),
@@ -392,7 +445,7 @@ pub fn perform_windows_update(
 
     let previous_installed =
         detect_installed_codex(PathBuf::from(&settings.install_root).as_path());
-    let stage = stage_windows_update(endpoints, settings)?;
+    let stage = stage_windows_update_with_progress(endpoints, settings, progress)?;
     if stage.up_to_date {
         return Ok(WinPerformReport {
             success: true,

@@ -11,9 +11,10 @@ use crate::app::settings_store::AppSettings as PersistedAppSettings;
 use crate::app::snapshot::ManagerSnapshot;
 use crate::app::update_check::PayloadUpdateCheck;
 use crate::app::win_update::{
-    auto_stage_windows_update, cancel_windows_download, perform_windows_update,
+    auto_stage_windows_update, cancel_windows_download, perform_windows_update_with_progress,
     plan_windows_update, stage_windows_update, uninstall_windows_codex,
-    win_adopt as adopt_windows_install, win_install_status, WinAutoStageReport, WinInstallStatus,
+    win_adopt as adopt_windows_install, win_install_status,
+    DownloadProgress as WinDownloadProgress, WinAutoStageReport, WinInstallStatus,
     WinPerformReport, WinStageReport, WinUninstallReport, WinUpdateReport,
 };
 use crate::domain::health::HealthReport;
@@ -398,6 +399,7 @@ pub fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatus, Com
 /// policy changes. Reports portable fallback need transparently.
 #[tauri::command]
 pub async fn win_perform_update(
+    app: tauri::AppHandle,
     state: State<'_, ManagerState>,
     confirm: bool,
 ) -> Result<WinPerformReport, CommandError> {
@@ -406,8 +408,12 @@ pub async fn win_perform_update(
     }
     let endpoints = windows_endpoints_for_settings(&state)?;
     let settings = state.settings.clone();
+    let progress_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        perform_windows_update(&endpoints, &settings, confirm)
+        let report = move |p: WinDownloadProgress| {
+            let _ = progress_app.emit("win://download-progress", p);
+        };
+        perform_windows_update_with_progress(&endpoints, &settings, confirm, &report)
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
