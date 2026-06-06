@@ -12,3 +12,7 @@ src-tauri/gen/schemas/
 .env
 .env.*
 !.env.example
+
+# Vendored Sparkle BinaryDelta helper (macOS delta updates) — fetched by
+# scripts/vendor-binary-delta.sh, not committed (~1.4 MB universal binary).
+src-tauri/resources/BinaryDelta
