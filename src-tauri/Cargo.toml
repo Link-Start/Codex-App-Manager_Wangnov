@@ -1,5 +1,10 @@
 [package]
 name = "codex-app-manager"
+# Disambiguate the GUI app from the src/bin/* dev harnesses (e.g.
+# win_real_smoke) so `cargo run` and `tauri build` pick the real app, not a
+# test binary. Without this, tauri can bundle a harness and the app exits at
+# launch.
+default-run = "codex-app-manager"
 version = "0.1.0"
 description = "A cross-platform manager for installing and updating mirrored official Codex desktop app packages."
 authors = ["Wangnov"]
