@@ -39,6 +39,9 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
     try {
       setReport(await managerApi.macPlanUpdate());
     } catch (cause) {
+      // Drop any stale plan so a failed re-check can't keep driving "立即更新"
+      // off an outdated currentBuild/latestBuild.
+      setReport(null);
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(null);
@@ -187,19 +190,12 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
       </TopBar>
 
       <div className="scroll view">
-        {perform && !perform.rolledBack ? (
-          <div className="banner ok">
-            <Icon name="check" />
-            <span>
-              {t("success.title")} ·{" "}
-              {perform.relaunched ? t("success.relaunched") : t("success.manualLaunch")}
-            </span>
-          </div>
-        ) : null}
-        {perform && perform.rolledBack ? (
-          <div className="banner err">
-            <Icon name="alert" />
-            <span>{t("success.rolledBack")}</span>
+        {perform ? (
+          <div className={`banner ${perform.rolledBack ? "err" : "ok"}`}>
+            <Icon name={perform.rolledBack ? "alert" : "check"} />
+            {/* Backend message carries the full outcome: relaunch-failed +
+                backup kept, provenance save failure, rollback, etc. */}
+            <span>{perform.message}</span>
           </div>
         ) : null}
         {error ? (
