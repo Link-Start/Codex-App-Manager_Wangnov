@@ -611,6 +611,57 @@ pub fn mac_adopt() -> Result<MacInstallStatus, AppError> {
     Ok(mac_install_status())
 }
 
+/// Fresh install: download the appcast's full package, verify + gate it, and
+/// place it at `/Applications/Codex.app`. No delta, no quit (nothing running),
+/// no backup (nothing to replace). Records `manager-installed` provenance and
+/// launches the freshly installed app.
+pub fn install_macos() -> Result<MacInstallStatus, AppError> {
+    let install_path = PathBuf::from("/Applications/Codex.app");
+    if install_path.exists() {
+        return Err(AppError::Engine(
+            "已检测到 Codex,请使用更新而非安装".to_string(),
+        ));
+    }
+
+    let arch = if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    let appcast_url = resolve_appcast_for_arch(arch);
+    let xml = sys::fetch_text(&appcast_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
+    if let Some(latest) = appcast.latest() {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
+    }
+
+    let work = staging_dir();
+    let out_app = work.join("Codex.app");
+    let _ = std::fs::remove_dir_all(&out_app);
+
+    // Full package only — no basis bundle to delta against.
+    reconstruct_full(&appcast, &work, &out_app)?;
+    gate_reconstructed(&out_app)
+        .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝安装）: {e}")))?;
+
+    let parent = install_path.parent().unwrap_or(install_path.as_path());
+    if !codex_mac_engine::swap::same_volume(&out_app, parent) {
+        return Err(AppError::Engine(
+            "暂存目录与 /Applications 不在同一卷,无法安装".to_string(),
+        ));
+    }
+    std::fs::rename(&out_app, &install_path)
+        .map_err(|e| AppError::Engine(format!("写入 /Applications 失败: {e}")))?;
+
+    if let Some((path, build)) = sys::installed_codex_build() {
+        let mut store = ProvenanceStore::load();
+        store.record(path, build, "manager-installed");
+        let _ = store.save();
+    }
+    let _ = relaunch(&install_path);
+    Ok(mac_install_status())
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MacUninstallReport {

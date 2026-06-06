@@ -141,6 +141,17 @@ export const managerApi = {
     return invoke<MacInstallStatus>("mac_adopt");
   },
 
+  // Fresh-install the latest Codex (full package) into /Applications.
+  macInstall(): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: { path: "/Applications/Codex.app", build: 3575, arch: "arm64" },
+        status: "managed",
+      });
+    }
+    return invoke<MacInstallStatus>("mac_install");
+  },
+
   // Settings (update source + general). The backend persists them so the source
   // choice actually drives which appcast the update flow reads.
   async getSettings(): Promise<AppSettings> {

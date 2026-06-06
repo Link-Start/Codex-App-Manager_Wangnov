@@ -82,7 +82,7 @@ body,
 }
 body {
   font-family: var(--font);
-  background: var(--bg);
+  background: transparent;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -91,6 +91,12 @@ body {
   user-select: none;
   cursor: default;
   overflow: hidden;
+}
+/* Transparent gutter so the frameless popover casts a soft shadow + rounds.
+   The shadow must fade out within the gutter — a large shadow gets clipped at
+   the (transparent) window rect and reads as a faint rectangle. */
+#root {
+  padding: 14px;
 }
 button {
   font-family: inherit;
@@ -107,6 +113,10 @@ input {
   flex-direction: column;
   overflow: hidden;
   background: var(--bg);
+  border: 1px solid var(--line-2);
+  border-radius: 16px;
+  /* Tight shadow that fades within the 14px gutter (no clipped-rectangle edge). */
+  box-shadow: 0 5px 14px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 
 .scroll {

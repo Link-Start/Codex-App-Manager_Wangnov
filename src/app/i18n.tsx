@@ -49,6 +49,7 @@ const ZH = {
   "confirm.ok": "更新",
 
   "progress.title": "正在更新…",
+  "progress.installing": "正在安装…",
   "progress.downloading": "下载中 · 请稍候",
 
   "success.title": "已更新",
@@ -151,6 +152,7 @@ const EN: Record<Key, string> = {
   "confirm.ok": "Update",
 
   "progress.title": "Updating…",
+  "progress.installing": "Installing…",
   "progress.downloading": "Downloading · please wait",
 
   "success.title": "Updated",

@@ -6,8 +6,9 @@ use crate::app::update_check::PayloadUpdateCheck;
 use crate::domain::health::HealthReport;
 use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::app::mac_update::{
-    perform_macos_update, plan_macos_update, stage_macos_update, uninstall_macos, MacInstallStatus,
-    MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport, PerformExpectation,
+    install_macos, perform_macos_update, plan_macos_update, stage_macos_update, uninstall_macos,
+    MacInstallStatus, MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport,
+    PerformExpectation,
 };
 use crate::app::settings_store::AppSettings;
 use crate::domain::target::OperatingSystem;
@@ -152,6 +153,19 @@ pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, Com
         return Err(AppError::UnsupportedPlatform.into());
     }
     crate::app::mac_update::mac_adopt().map_err(Into::into)
+}
+
+/// macOS-only: fresh-install the latest Codex (full package) into /Applications.
+/// Runs the blocking download/verify/install off the main thread.
+#[tauri::command]
+pub async fn mac_install() -> Result<MacInstallStatus, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    tauri::async_runtime::spawn_blocking(install_macos)
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
 }
 
 /// Read persisted app settings (update source + general).

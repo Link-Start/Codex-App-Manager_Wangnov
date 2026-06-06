@@ -24,9 +24,8 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [status, setStatus] = useState<MacInstallStatus | null>(null);
   const [perform, setPerform] = useState<MacPerformReport | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
-  const [busy, setBusy] = useState<"plan" | "perform" | "adopt" | null>(null);
+  const [busy, setBusy] = useState<"plan" | "perform" | "adopt" | "install" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
   const check = useCallback(async () => {
@@ -62,6 +61,19 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
       setBusy(null);
     }
   }, []);
+
+  const runInstall = useCallback(async () => {
+    setBusy("install");
+    setError(null);
+    try {
+      setStatus(await managerApi.macInstall());
+      await check();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(null);
+    }
+  }, [check]);
 
   const runPerform = useCallback(async () => {
     const installed = status?.installed;
@@ -104,15 +116,17 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const version = plan?.latestShortVersion || (installed ? `build ${installed.build}` : "");
   const sourceLabel = t(`source.${settings.source}` as TKey);
 
-  // ── progress (performing) takes over the whole screen ──────────────────────
-  if (busy === "perform") {
+  // ── progress (performing / installing) takes over the whole screen ─────────
+  if (busy === "perform" || busy === "install") {
     return (
       <div className="pop">
         <TopBar />
         <div className="scroll view">
           <div className="hero" style={{ marginTop: 24 }}>
             <Ring icon="loader" spin />
-            <div className="headline">{t("progress.title")}</div>
+            <div className="headline">
+              {busy === "install" ? t("progress.installing") : t("progress.title")}
+            </div>
             <div className="sub">{t("progress.downloading")}</div>
             <div className="bar">
               <div className="bar-fill" style={{ width: "62%" }} />
@@ -158,12 +172,6 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
           <div className="banner err">
             <Icon name="alert" />
             <span>{error}</span>
-          </div>
-        ) : null}
-        {note ? (
-          <div className="banner info">
-            <Icon name="info" />
-            <span>{note}</span>
           </div>
         ) : null}
 
@@ -240,10 +248,7 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
             </button>
           ) : null}
           {kind === "none" ? (
-            <button
-              className="btn primary big"
-              onClick={() => setNote(t("settings.more.soon"))}
-            >
+            <button className="btn primary big" onClick={runInstall} disabled={busy !== null}>
               <Icon name="download" />
               {t("home.none.cta")}
             </button>
