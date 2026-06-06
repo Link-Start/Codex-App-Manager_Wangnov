@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
 import { managerApi } from "../../services/managerApi";
-import { Icon } from "../icons";
+import { Icon, CodexMark } from "../icons";
 import { useI18n } from "../i18n";
 import { NavBar } from "../components";
 
@@ -33,8 +33,8 @@ export function About({ onBack }: { onBack: () => void }) {
       <NavBar title={t("settings.more.about")} onBack={onBack} disableBack={mgrBusy} />
       <div className="scroll view">
         <section className="hero" style={{ paddingTop: 8 }}>
-          <div className="mark" style={{ width: 56, height: 56, borderRadius: 16, fontSize: 30, marginBottom: 14 }}>
-            C
+          <div className="mark mark-lg" style={{ marginBottom: 14 }}>
+            <CodexMark />
           </div>
           <div className="headline" style={{ fontSize: 18 }}>
             {t("app.name")}
