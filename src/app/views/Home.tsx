@@ -129,9 +129,10 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
   const kind: Kind = useMemo(() => {
     if (!installed) {
       if (busy === "plan" || !statusLoaded) return "loading";
-      // Status request failed (e.g. unsupported platform) — show error, never
-      // an install entry that would call a macOS-only command and fail again.
-      if (statusFailed) return "error";
+      // A failed status (unsupported platform) OR a failed check (OS too old /
+      // appcast unreachable) → error, never an install entry that would just
+      // fail again.
+      if (statusFailed || error) return "error";
       return "none";
     }
     // Don't classify (update / idle / uptodate) until the local adoption status
@@ -254,8 +255,10 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
             <>
               <Ring icon="shield" variant="amber" />
               <div className="headline">{t("home.external.title")}</div>
+              {/* Show the INSTALLED build here, not plan.latestShortVersion —
+                  the latest version belongs to the update / up-to-date states. */}
               <div className="sub">
-                <span className="ver">{version}</span>
+                {installed ? t("home.idle.sub", { build: installed.build }) : ""}
               </div>
               <div className="prov">
                 <span className="dot external" />
