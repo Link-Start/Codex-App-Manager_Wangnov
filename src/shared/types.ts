@@ -81,6 +81,8 @@ export interface AppSettings {
   askBefore: boolean;
   /** Always true at the backend; surfaced read-only in the UI. */
   signedOnly: boolean;
+  /** Ask for confirmation before closing (quitting) the window. */
+  confirmClose: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -89,6 +91,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoCheck: true,
   askBefore: true,
   signedOnly: true,
+  confirmClose: true,
 };
 
 export interface MacUninstallReport {

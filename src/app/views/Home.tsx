@@ -272,14 +272,6 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   return (
     <div className="pop">
       <TopBar>
-        <button
-          className="iconbtn"
-          title={t("home.recheck")}
-          onClick={check}
-          disabled={busy !== null}
-        >
-          <Icon name="refresh" />
-        </button>
         <button className="iconbtn" title={t("nav.settings")} onClick={onOpenSettings}>
           <Icon name="gear" />
         </button>

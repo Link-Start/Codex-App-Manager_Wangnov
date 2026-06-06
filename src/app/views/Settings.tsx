@@ -123,6 +123,15 @@ export function Settings({
               </span>
               <Toggle checked={autostart} onChange={toggleAutostart} />
             </div>
+            <div className="row">
+              <span className="rtext">
+                <span className="rtitle">{t("settings.general.confirmClose")}</span>
+              </span>
+              <Toggle
+                checked={s.confirmClose}
+                onChange={(v) => save({ ...s, confirmClose: v })}
+              />
+            </div>
           </div>
         </div>
 

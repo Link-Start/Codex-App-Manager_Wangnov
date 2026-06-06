@@ -51,6 +51,10 @@ const ZH = {
   "confirm.cancel": "取消",
   "confirm.ok": "更新",
 
+  "close.confirm.title": "关闭管理器?",
+  "close.confirm.body": "Codex 会继续运行,只是关掉这个管理器窗口。",
+  "close.confirm.ok": "关闭",
+
   "progress.title": "正在更新…",
   "progress.installing": "正在安装…",
   "progress.downloading": "下载中 · 请稍候",
@@ -82,6 +86,7 @@ const ZH = {
   "settings.general.askBefore": "更新前询问",
   "settings.general.autostart": "开机时启动",
   "settings.general.autostartNote": "默认关闭",
+  "settings.general.confirmClose": "关闭前确认",
   "settings.general.signedOnly": "只安装官方签名的版本",
   "settings.general.signedOnlyNote": "为你的安全,始终开启",
   "settings.appearance.header": "外观",
@@ -179,6 +184,10 @@ const EN: Record<Key, string> = {
   "confirm.cancel": "Cancel",
   "confirm.ok": "Update",
 
+  "close.confirm.title": "Close the manager?",
+  "close.confirm.body": "Codex keeps running — this only closes the manager window.",
+  "close.confirm.ok": "Close",
+
   "progress.title": "Updating…",
   "progress.installing": "Installing…",
   "progress.downloading": "Downloading · please wait",
@@ -210,6 +219,7 @@ const EN: Record<Key, string> = {
   "settings.general.askBefore": "Ask before updating",
   "settings.general.autostart": "Launch at login",
   "settings.general.autostartNote": "Off by default",
+  "settings.general.confirmClose": "Confirm before closing",
   "settings.general.signedOnly": "Only install officially signed builds",
   "settings.general.signedOnlyNote": "Always on, for your safety",
   "settings.appearance.header": "Appearance",

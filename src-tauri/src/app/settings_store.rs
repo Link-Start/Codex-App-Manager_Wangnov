@@ -17,6 +17,14 @@ pub struct AppSettings {
     pub ask_before: bool,
     /// Always true — surfaced read-only. We never install an unsigned bundle.
     pub signed_only: bool,
+    /// Ask before closing (quitting) the window. Defaults true; tolerated as
+    /// missing in an older settings.json via serde default.
+    #[serde(default = "default_true")]
+    pub confirm_close: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -27,6 +35,7 @@ impl Default for AppSettings {
             auto_check: true,
             ask_before: true,
             signed_only: true,
+            confirm_close: true,
         }
     }
 }

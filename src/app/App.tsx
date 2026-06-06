@@ -13,25 +13,27 @@ type View = "home" | "settings" | "about" | "uninstall" | "config";
 function Shell() {
   const [view, setView] = useState<View>("home");
 
-  switch (view) {
-    case "settings":
-      return (
+  // Home stays mounted (just hidden) so returning to it doesn't re-mount and
+  // re-run the network check — it shows its last state instantly. Sub-views
+  // overlay it.
+  return (
+    <>
+      <div style={{ display: view === "home" ? "contents" : "none" }}>
+        <Home onOpenSettings={() => setView("settings")} />
+      </div>
+      {view === "settings" ? (
         <Settings
           onBack={() => setView("home")}
           onOpenAbout={() => setView("about")}
           onOpenUninstall={() => setView("uninstall")}
           onOpenConfig={() => setView("config")}
         />
-      );
-    case "about":
-      return <About onBack={() => setView("settings")} />;
-    case "uninstall":
-      return <Uninstall onBack={() => setView("settings")} />;
-    case "config":
-      return <CodexConfig onBack={() => setView("settings")} />;
-    default:
-      return <Home onOpenSettings={() => setView("settings")} />;
-  }
+      ) : null}
+      {view === "about" ? <About onBack={() => setView("settings")} /> : null}
+      {view === "uninstall" ? <Uninstall onBack={() => setView("settings")} /> : null}
+      {view === "config" ? <CodexConfig onBack={() => setView("settings")} /> : null}
+    </>
+  );
 }
 
 export function App() {

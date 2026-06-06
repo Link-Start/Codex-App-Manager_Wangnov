@@ -66,14 +66,19 @@ pub fn run_health_check(state: State<'_, ManagerState>) -> Result<HealthReport, 
 /// macOS-only: detect the installed Codex build, read the Sparkle appcast, and
 /// return an update plan (delta vs full). Read-only — performs no install.
 #[tauri::command]
-pub fn mac_plan_update(
-    state: State<'_, ManagerState>,
+pub async fn mac_plan_update(
     simulated_build: Option<u64>,
 ) -> Result<MacUpdateReport, CommandError> {
-    if !matches!(state.target.os, OperatingSystem::Macos) {
+    if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    plan_macos_update(simulated_build).map_err(Into::into)
+    // Off the main thread: the appcast fetch (plus the auto-source official
+    // probe) is network IO — running it inline froze the webview, so the
+    // re-check spinner never animated ("卡一下没动画").
+    tauri::async_runtime::spawn_blocking(move || plan_macos_update(simulated_build))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
 }
 
 /// macOS-only: plan + download + size/EdDSA verify into staging. Non-destructive
