@@ -40,3 +40,9 @@ impl ManagerState {
         }
     }
 }
+
+impl Default for ManagerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
