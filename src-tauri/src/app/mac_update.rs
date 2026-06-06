@@ -701,25 +701,33 @@ pub struct MacUninstallReport {
     pub message: String,
 }
 
-/// Remove the installed Codex app. `keep_codex_home` is true by default at the
-/// UI: the user's `~/.codex` (sign-in, sessions, config) survives unless they
-/// explicitly opt out. Quits Codex first (never force-kills).
+/// Remove the installed Codex app. Only uninstalls an install THIS manager
+/// manages — an external (official / manual) install must be explicitly adopted
+/// first, so we never delete something we didn't create. `keep_codex_home` is
+/// true by default at the UI: the user's `~/.codex` (sign-in, sessions, config)
+/// survives unless they explicitly opt out. Quits Codex first (never force-kills).
 pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppError> {
     let installed = detect_installed()
         .ok_or_else(|| AppError::Engine("no Codex detected to uninstall".to_string()))?;
     let install_path = PathBuf::from(&installed.path);
+
+    // Boundary: refuse to delete an install we don't manage.
+    let mut store = ProvenanceStore::load();
+    if !store.is_managed(&installed.path) {
+        return Err(AppError::Engine(
+            "这是外部安装的 Codex(非本应用安装)。请先在主界面「开始管理」纳入管理后再卸载。"
+                .to_string(),
+        ));
+    }
 
     quit_codex(30).map_err(|e| AppError::Engine(e.to_string()))?;
 
     std::fs::remove_dir_all(&install_path)
         .map_err(|e| AppError::Engine(format!("remove app bundle: {e}")))?;
 
-    // Drop our provenance record for this path (best-effort).
-    let mut store = ProvenanceStore::load();
-    if store.is_managed(&installed.path) {
-        store.managed.retain(|r| r.path != installed.path);
-        let _ = store.save();
-    }
+    // Drop our provenance record for this path.
+    store.managed.retain(|r| r.path != installed.path);
+    let _ = store.save();
 
     // Only ever touch ~/.codex when the user explicitly opted out of keeping it.
     // If the removal fails (e.g. permissions), report honestly rather than

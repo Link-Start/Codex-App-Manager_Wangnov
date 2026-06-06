@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { managerApi } from "../../services/managerApi";
 import { Icon } from "../icons";
@@ -12,6 +12,15 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Only a managed install may be uninstalled — mirror the backend boundary.
+  const [managed, setManaged] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    void managerApi
+      .macStatus()
+      .then((s) => setManaged(s.status === "managed"))
+      .catch(() => setManaged(false));
+  }, []);
 
   const run = async () => {
     setBusy(true);
@@ -62,6 +71,13 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
               </div>
             </div>
 
+            {managed === false ? (
+              <div className="banner info">
+                <Icon name="info" />
+                <span>{t("uninstall.needAdopt")}</span>
+              </div>
+            ) : null}
+
             {error ? (
               <div className="banner err">
                 <Icon name="alert" />
@@ -70,7 +86,11 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
             ) : null}
 
             <div className="actions">
-              <button className="btn danger big" onClick={run} disabled={busy}>
+              <button
+                className="btn danger big"
+                onClick={run}
+                disabled={busy || managed !== true}
+              >
                 <Icon name="trash" />
                 {busy ? t("uninstall.working") : t("uninstall.confirm")}
               </button>

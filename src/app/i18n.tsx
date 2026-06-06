@@ -97,6 +97,7 @@ const ZH = {
 
   "uninstall.heading": "卸载 Codex",
   "uninstall.warn": "这会从你的电脑上移除 Codex 应用。",
+  "uninstall.needAdopt": "这是外部安装的 Codex。请先在主界面「开始管理」,再回来卸载。",
   "uninstall.keepData": "保留我的数据",
   "uninstall.keepDataNote": "登录状态、会话与配置(~/.codex)都会保留;重新安装后可继续使用。",
   "uninstall.confirm": "卸载",
@@ -203,6 +204,7 @@ const EN: Record<Key, string> = {
 
   "uninstall.heading": "Uninstall Codex",
   "uninstall.warn": "This removes the Codex app from your computer.",
+  "uninstall.needAdopt": "This is an external Codex. Start managing it from the main screen first, then come back to uninstall.",
   "uninstall.keepData": "Keep my data",
   "uninstall.keepDataNote": "Sign-in, sessions and config (~/.codex) are kept; reinstalling resumes where you left off.",
   "uninstall.confirm": "Uninstall",
