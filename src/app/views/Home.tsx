@@ -121,6 +121,10 @@ export function Home({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   const kind: Kind = useMemo(() => {
     if (!installed) return busy === "plan" || !statusLoaded ? "loading" : "none";
+    // Don't classify (update / idle / uptodate) until the local adoption status
+    // is known — otherwise report.installed can drive an "update" entry that
+    // bypasses the external→adopt boundary once status resolves to external.
+    if (!statusLoaded) return "loading";
     // Adoption status is local (macStatus) and must not depend on a successful
     // network check — surface "开始管理" before any network-dependent state so it
     // is never hidden (auto-check off / appcast error) or bypassed (update).
