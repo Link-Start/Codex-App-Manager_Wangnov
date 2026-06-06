@@ -440,6 +440,50 @@ fn dir_size_kb(root: &Path) -> u64 {
     total / 1024
 }
 
+fn restore_previous_install(
+    install_root: &Path,
+    backup: &Path,
+    had_previous: bool,
+) -> Result<(), EngineError> {
+    if install_root.exists() {
+        fs::remove_dir_all(install_root).map_err(|e| io_err("remove failed portable install", e))?;
+    }
+    if had_previous && backup.exists() {
+        fs::rename(backup, install_root)
+            .map_err(|e| io_err("restore portable rollback backup", e))?;
+    }
+    Ok(())
+}
+
+fn rollback_install_error(
+    install_root: &Path,
+    backup: &Path,
+    had_previous: bool,
+    err: EngineError,
+) -> EngineError {
+    match restore_previous_install(install_root, backup, had_previous) {
+        Ok(()) => EngineError::Install(format!("{err}; previous install was restored")),
+        Err(rollback_err) => EngineError::Install(format!("{err}; rollback failed: {rollback_err}")),
+    }
+}
+
+fn health_check_portable_install(install_root: &Path, launch: bool) -> Result<bool, EngineError> {
+    let exe = install_root.join("Codex.exe");
+    if !exe.is_file() {
+        return Err(EngineError::Install(format!(
+            "portable health check failed: {} is missing",
+            exe.display()
+        )));
+    }
+    if !launch {
+        return Ok(false);
+    }
+    Command::new(&exe)
+        .spawn()
+        .map(|_| true)
+        .map_err(|e| io_err("portable health check launch", e))
+}
+
 pub fn install_portable_from_msix(
     msix_path: &Path,
     install_root: &Path,
@@ -486,12 +530,24 @@ fn install_portable_from_msix_inner(
     match fs::rename(&payload, install_root) {
         Ok(()) => {}
         Err(err) => {
-            if had_previous {
-                let _ = fs::rename(&backup, install_root);
-            }
+            let _ = restore_previous_install(install_root, &backup, had_previous);
             return Err(io_err("install portable payload (rolled back)", err));
         }
     }
+
+    let relaunched =
+        match health_check_portable_install(install_root, manage_process && relaunch) {
+            Ok(relaunched) => relaunched,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&work_dir);
+                return Err(rollback_install_error(
+                    install_root,
+                    &backup,
+                    had_previous,
+                    err,
+                ));
+            }
+        };
 
     let shortcut_created = match create_start_menu_shortcut(install_root) {
         Ok(created) => created,
@@ -515,15 +571,16 @@ fn install_portable_from_msix_inner(
     };
 
     let exe = install_root.join("Codex.exe");
-    let mut relaunched = false;
-    if relaunch && exe.exists() {
-        match Command::new(&exe).spawn() {
-            Ok(_) => {
-                relaunched = true;
+    let mut backup_path = None;
+    if had_previous && backup.exists() {
+        match fs::remove_dir_all(&backup) {
+            Ok(()) => {}
+            Err(err) => {
+                notes.push(format!(
+                    "Portable rollback backup could not be removed after successful install: {err}"
+                ));
+                backup_path = Some(backup.to_string_lossy().into_owned());
             }
-            Err(err) => notes.push(format!(
-                "Codex was installed but could not be relaunched: {err}"
-            )),
         }
     }
 
@@ -534,7 +591,7 @@ fn install_portable_from_msix_inner(
         install_root: install_root.to_string_lossy().into_owned(),
         executable_path: exe.exists().then(|| exe.to_string_lossy().into_owned()),
         version: prepared.identity.version,
-        backup_path: had_previous.then(|| backup.to_string_lossy().into_owned()),
+        backup_path,
         shortcut_created,
         uninstall_entry_created,
         relaunched,
@@ -628,6 +685,56 @@ mod tests {
         assert!(install_root.join("resources/app.asar").exists());
         assert!(install_root.join("AppxManifest.xml").exists());
         assert_eq!(report.version, "26.602.3474.0");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replaces_existing_portable_and_removes_rollback_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-replace-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let msix = root.join("codex.msix");
+        let install_root = root.join("Codex");
+        write_fake_msix(&msix);
+
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("Codex.exe"), b"old exe").unwrap();
+        fs::write(install_root.join("old-marker.txt"), b"old").unwrap();
+
+        let report = install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap();
+        assert!(report.success);
+        assert!(report.backup_path.is_none());
+        assert!(!root.join("Codex.rollback").exists());
+        assert!(!install_root.join("old-marker.txt").exists());
+        assert!(install_root.join("resources/app.asar").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_previous_install_removes_failed_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-rollback-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let install_root = root.join("Codex");
+        let backup = root.join("Codex.rollback");
+
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("old-marker.txt"), b"old").unwrap();
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("new-marker.txt"), b"new").unwrap();
+
+        restore_previous_install(&install_root, &backup, true).unwrap();
+        assert!(install_root.join("old-marker.txt").exists());
+        assert!(!install_root.join("new-marker.txt").exists());
+        assert!(!backup.exists());
 
         let _ = fs::remove_dir_all(&root);
     }
