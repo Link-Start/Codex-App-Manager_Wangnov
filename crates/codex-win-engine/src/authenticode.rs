@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::EngineError;
 
+// The mirror currently serves Store-re-signed MSIX packages; add a separate
+// exact direct-signing anchor here if the Windows source changes in the future.
 pub const OPENAI_MARKETPLACE_PUBLISHER_SUBJECT: &str =
     "cn=50bdfd77-8903-4850-9ffe-6e8522f64d5b";
 #[cfg(any(windows, test))]
