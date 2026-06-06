@@ -1,14 +1,20 @@
 use tauri::{Manager, State};
 
 use crate::app::health_service::HealthService;
-use crate::app::snapshot::ManagerSnapshot;
-use crate::app::update_check::PayloadUpdateCheck;
-use crate::domain::health::HealthReport;
-use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::app::mac_update::{
     perform_macos_update, plan_macos_update, stage_macos_update, MacInstallStatus, MacPerformReport,
     MacStageReport, MacUpdateReport, PerformExpectation,
 };
+use crate::app::snapshot::ManagerSnapshot;
+use crate::app::update_check::PayloadUpdateCheck;
+use crate::app::win_update::{
+    auto_stage_windows_update, cancel_windows_download, perform_windows_update,
+    plan_windows_update, stage_windows_update, uninstall_windows_codex,
+    win_adopt as adopt_windows_install, win_install_status, WinAutoStageReport, WinInstallStatus,
+    WinPerformReport, WinStageReport, WinUninstallReport, WinUpdateReport,
+};
+use crate::domain::health::HealthReport;
+use crate::domain::operations::{OperationKind, OperationPlan};
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
 use crate::state::ManagerState;
@@ -47,7 +53,11 @@ pub fn check_payload_updates(
 
 #[tauri::command]
 pub fn run_health_check(state: State<'_, ManagerState>) -> Result<HealthReport, CommandError> {
-    Ok(HealthService::run(&state.target, &state.settings, &state.endpoints))
+    Ok(HealthService::run(
+        &state.target,
+        &state.settings,
+        &state.endpoints,
+    ))
 }
 
 /// macOS-only: detect the installed Codex build, read the Sparkle appcast, and
@@ -73,9 +83,9 @@ pub async fn mac_stage_update(
         return Err(AppError::UnsupportedPlatform.into());
     }
     tauri::async_runtime::spawn_blocking(move || stage_macos_update(simulated_build))
-    .await
-    .map_err(|e| AppError::Internal(format!("join: {e}")))?
-    .map_err(Into::into)
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
 }
 
 /// Locate the vendored Sparkle `BinaryDelta` tool, if present: an explicit
@@ -153,3 +163,119 @@ pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, Com
     crate::app::mac_update::mac_adopt().map_err(Into::into)
 }
 
+/// Windows-only: detect installed Codex, read mirror manifest/checksums, probe
+/// sideload capabilities, and return the preferred update path. Read-only.
+#[tauri::command]
+pub fn win_plan_update(state: State<'_, ManagerState>) -> Result<WinUpdateReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    plan_windows_update(&state.endpoints, &state.settings).map_err(Into::into)
+}
+
+/// Windows-only: plan + download + size/SHA256/AuthentiCode/AppxManifest gates
+/// into staging. Non-destructive (no install yet).
+#[tauri::command]
+pub async fn win_stage_update(
+    state: State<'_, ManagerState>,
+) -> Result<WinStageReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let endpoints = state.endpoints.clone();
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || stage_windows_update(&endpoints, &settings))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Windows-only: background pre-download guard. It stages only when the user
+/// enabled auto download and the current network passes the metered policy.
+#[tauri::command]
+pub async fn win_auto_stage_update(
+    state: State<'_, ManagerState>,
+    enabled: bool,
+    allow_metered: bool,
+) -> Result<WinAutoStageReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let endpoints = state.endpoints.clone();
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        auto_stage_windows_update(&endpoints, &settings, enabled, allow_metered)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// Windows-only: request cancellation of an active background/manual download.
+/// Partial bytes are left in place for the next resume-capable staging run.
+#[tauri::command]
+pub fn win_cancel_download(state: State<'_, ManagerState>) -> Result<bool, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(cancel_windows_download())
+}
+
+/// Windows-only: classify the installed Codex (managed / external / none).
+#[tauri::command]
+pub fn win_status(state: State<'_, ManagerState>) -> Result<WinInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(win_install_status(&state.settings))
+}
+
+/// Windows-only: adopt the detected external install (after explicit consent).
+#[tauri::command]
+pub fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    adopt_windows_install(&state.settings).map_err(Into::into)
+}
+
+/// Windows-only: guarded execution. Requires explicit confirmation, stages and
+/// verifies the MSIX first, then attempts Add-AppxPackage without elevation or
+/// policy changes. Reports portable fallback need transparently.
+#[tauri::command]
+pub async fn win_perform_update(
+    state: State<'_, ManagerState>,
+    confirm: bool,
+) -> Result<WinPerformReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let endpoints = state.endpoints.clone();
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        perform_windows_update(&endpoints, &settings, confirm)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// Windows-only: guarded uninstall. Only removes installs recorded as managed
+/// by this app. User data is preserved unless `purge_user_data` is true.
+#[tauri::command]
+pub async fn win_uninstall(
+    state: State<'_, ManagerState>,
+    confirm: bool,
+    purge_user_data: bool,
+) -> Result<WinUninstallReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        uninstall_windows_codex(&settings, confirm, purge_user_data)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}

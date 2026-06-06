@@ -24,8 +24,15 @@ pub fn run() {
             commands::mac_perform_update,
             commands::mac_status,
             commands::mac_adopt,
+            commands::win_plan_update,
+            commands::win_stage_update,
+            commands::win_auto_stage_update,
+            commands::win_cancel_download,
+            commands::win_status,
+            commands::win_adopt,
+            commands::win_perform_update,
+            commands::win_uninstall,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex App Manager");
 }
-

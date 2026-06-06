@@ -61,11 +61,16 @@ impl ProvenanceStore {
         }
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| AppError::Internal(format!("serialize provenance: {e}")))?;
-        std::fs::write(&path, json).map_err(|e| AppError::Internal(format!("write provenance: {e}")))
+        std::fs::write(&path, json)
+            .map_err(|e| AppError::Internal(format!("write provenance: {e}")))
     }
 
     pub fn is_managed(&self, path: &str) -> bool {
         self.managed.iter().any(|r| r.path == path)
+    }
+
+    pub fn remove(&mut self, path: &str) {
+        self.managed.retain(|r| r.path != path);
     }
 
     /// Record (or refresh) a managed install, keyed by path.
@@ -89,12 +94,20 @@ mod tests {
         let mut store = ProvenanceStore::default();
         assert!(!store.is_managed("/Applications/Codex.app"));
 
-        store.record("/Applications/Codex.app".to_string(), 3575, "adopted-external");
+        store.record(
+            "/Applications/Codex.app".to_string(),
+            3575,
+            "adopted-external",
+        );
         assert!(store.is_managed("/Applications/Codex.app"));
         assert_eq!(store.managed.len(), 1);
 
         // Re-recording the same path updates in place (no duplicate).
-        store.record("/Applications/Codex.app".to_string(), 3600, "manager-installed");
+        store.record(
+            "/Applications/Codex.app".to_string(),
+            3600,
+            "manager-installed",
+        );
         assert_eq!(store.managed.len(), 1);
         assert_eq!(store.managed[0].build, 3600);
     }
