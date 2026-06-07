@@ -39,7 +39,7 @@ fi
 if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
   TAR="$BUNDLE/macos/$NAME.app.tar.gz"
   tar -C "$BUNDLE/macos" -czf "$TAR" "$NAME.app"
-  npx --yes @tauri-apps/cli signer sign "$TAR" >/dev/null
+  npx tauri signer sign "$TAR" >/dev/null
   log "updater tarball repacked + re-signed: ${TAR##*/}"
 else
   log "TAURI_SIGNING_PRIVATE_KEY not set — leaving updater tarball untouched"

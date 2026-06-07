@@ -28,25 +28,33 @@ if [ ! -d "$APP" ]; then
   echo "  build it first (npm run tauri build) or pass the .app path explicitly." >&2
   exit 1
 fi
-if ! xcrun --find actool >/dev/null 2>&1; then
-  echo "error: actool not found — install Xcode 26+." >&2
-  exit 1
+# Prefer the prebuilt Assets.car vendored in the repo. GitHub's macOS runners
+# ship an older Xcode whose actool can't compile the macOS 26 .icon format, so
+# we compile it locally (Xcode 26+) and commit src-tauri/macos/Assets.car. Fall
+# back to a live actool compile only when the prebuilt file is absent.
+PREBUILT="$ROOT/src-tauri/macos/Assets.car"
+if [ -f "$PREBUILT" ]; then
+  echo "→ using prebuilt Assets.car ($PREBUILT)"
+  cp "$PREBUILT" "$APP/Contents/Resources/Assets.car"
+else
+  if ! xcrun --find actool >/dev/null 2>&1; then
+    echo "error: no prebuilt Assets.car and actool not found — install Xcode 26+." >&2
+    exit 1
+  fi
+  echo "→ compiling $ICON_SRC with actool (needs Xcode 26+)"
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "$TMP"' EXIT
+  xcrun actool "$ICON_SRC" \
+    --compile "$TMP" \
+    --app-icon icon \
+    --enable-on-demand-resources NO \
+    --development-region en \
+    --target-device mac --platform macosx \
+    --minimum-deployment-target 11.0 \
+    --output-partial-info-plist "$TMP/partial.plist" >/dev/null
+  echo "→ injecting Assets.car into Resources/"
+  cp "$TMP/Assets.car" "$APP/Contents/Resources/Assets.car"
 fi
-
-echo "→ compiling $ICON_SRC with actool"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-xcrun actool "$ICON_SRC" \
-  --compile "$TMP" \
-  --app-icon icon \
-  --enable-on-demand-resources NO \
-  --development-region en \
-  --target-device mac --platform macosx \
-  --minimum-deployment-target 11.0 \
-  --output-partial-info-plist "$TMP/partial.plist" >/dev/null
-
-echo "→ injecting Assets.car into Resources/"
-cp "$TMP/Assets.car" "$APP/Contents/Resources/Assets.car"
 
 echo "→ patching Info.plist (CFBundleIconName = icon)"
 PLIST="$APP/Contents/Info.plist"
