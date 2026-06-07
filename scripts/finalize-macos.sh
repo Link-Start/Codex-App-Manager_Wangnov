@@ -45,12 +45,24 @@ else
   log "TAURI_SIGNING_PRIVATE_KEY not set — leaving updater tarball untouched"
 fi
 
-# 5) repackage dmg so its embedded copy is the finalized, stapled app
+# 5) swap the finalized app into Tauri's dmg, PRESERVING its drag-to-Applications
+#    layout (Applications symlink, window/.DS_Store icon positions, volume icon).
+#    A plain `hdiutil create -srcfolder app` would drop all of that and ship a
+#    bare .app with no Applications target — not a real installer dmg.
 DMG="$(/usr/bin/find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' 2>/dev/null | head -1 || true)"
 if [[ -n "$DMG" ]]; then
+  RW="$(mktemp -u).dmg"
+  hdiutil convert "$DMG" -format UDRW -o "$RW" >/dev/null
+  MNT="$(mktemp -d)"
+  hdiutil attach "$RW" -nobrowse -noverify -mountpoint "$MNT" >/dev/null
+  rm -rf "$MNT/$NAME.app"
+  cp -R "$APP" "$MNT/$NAME.app"
+  hdiutil detach "$MNT" >/dev/null
   rm -f "$DMG"
-  hdiutil create -volname "$NAME" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
-  log "dmg repacked: ${DMG##*/}"
+  hdiutil convert "$RW" -format UDZO -o "$DMG" >/dev/null
+  rm -f "$RW"
+  codesign --force --sign "${APPLE_SIGNING_IDENTITY:--}" "$DMG" 2>/dev/null || true
+  log "dmg repacked (Tauri layout kept, finalized app swapped in): ${DMG##*/}"
 fi
 
 log "done — every macOS artifact now carries the signed, stapled, adaptive-icon app."
