@@ -54,7 +54,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYyODlFMDY3NzM1QTQ4OUQKUldTZFNGcHpaK0NKWWcvUm9URTQ4aG45TG00N3V6U2doUjN5a05rSnhvUXh5TVl5RFRQUk04bEUK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxQThDQzg4QjlFNjE5QTEKUldTaEdlYTVpTXlvSWNQYVRHMjRNQmtLQ25HdE1aV2FoY0hLSldsZHpHM3NMYkJHMk8zVDR0WDEK",
       "endpoints": [
         "https://codexapp.agentsmirror.com/manager/latest.json",
         "https://github.com/Wangnov/Codex-App-Manager/releases/latest/download/latest.json"
