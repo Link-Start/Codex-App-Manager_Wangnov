@@ -31,7 +31,9 @@ jobs:
       matrix:
         include:
           - { platform: macos-latest, target: aarch64-apple-darwin, os: macos }
-          - { platform: macos-13, target: x86_64-apple-darwin, os: macos }
+          # Intel build on GitHub's current x86_64 image — macos-13 retired
+          # 2025-12; macos-15-intel is the last Intel image (until ~2027-08).
+          - { platform: macos-15-intel, target: x86_64-apple-darwin, os: macos }
           - { platform: windows-latest, target: x86_64-pc-windows-msvc, os: windows }
     runs-on: ${{ matrix.platform }}
     steps:
