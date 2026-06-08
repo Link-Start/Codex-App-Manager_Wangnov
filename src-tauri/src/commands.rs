@@ -499,6 +499,16 @@ pub fn set_settings(settings: PersistedAppSettings) -> Result<PersistedAppSettin
     Ok(s)
 }
 
+/// The user confirmed quitting from the close dialog — flag it and exit so the
+/// CloseRequested / ExitRequested guards stop intercepting and let it go.
+#[tauri::command]
+pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) {
+    state
+        .force_quit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    app.exit(0);
+}
+
 /// Windows-only: return the current user's default portable install root.
 #[tauri::command]
 pub fn win_default_install_root(state: State<'_, ManagerState>) -> Result<String, CommandError> {
@@ -691,6 +701,16 @@ pub fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatus, Com
     }
     let settings = windows_domain_settings_for_persisted(&state);
     adopt_windows_install(&settings).map_err(Into::into)
+}
+
+/// Windows-only: open the installed Codex.
+#[tauri::command]
+pub fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let settings = windows_domain_settings_for_persisted(&state);
+    crate::app::win_update::launch_codex(&settings).map_err(Into::into)
 }
 
 /// Windows-only: guarded execution. Requires explicit confirmation, stages and
