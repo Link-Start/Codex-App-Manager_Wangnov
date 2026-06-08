@@ -53,6 +53,30 @@ pub struct MsixRemoveReport {
     pub raw_error: Option<String>,
 }
 
+/// Post-install sanity check for a sideloaded MSIX. `Add-AppxPackage` returning
+/// success only means the cmdlet did not throw — on a stripped Windows (no
+/// Store / App Installer, missing framework packages) the package can register
+/// yet fail to launch, which is exactly the failure users hit. We verify the
+/// package is registered, its Status is Ok, the app entry (AUMID) resolves, and
+/// every declared framework dependency is actually present; when any of these
+/// fail the caller removes the package and falls back to the portable build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsixHealthReport {
+    pub healthy: bool,
+    pub package_registered: bool,
+    /// Raw `Get-AppxPackage` Status string (e.g. "Ok", "Modified").
+    pub status: String,
+    pub status_ok: bool,
+    /// The app entry (AUMID) could be resolved from the package manifest.
+    pub aumid_resolved: bool,
+    /// Declared framework dependencies that are NOT installed on this machine —
+    /// the usual reason an MSIX installs but won't launch on a stripped Windows.
+    pub missing_dependencies: Vec<String>,
+    /// Human-facing reason when unhealthy; empty when healthy.
+    pub reason: String,
+}
+
 pub fn fetch_text(url: &str) -> Result<String, EngineError> {
     let output = hidden_command("curl")
         .args(["-fsSL", "--connect-timeout", "20", url])
@@ -219,6 +243,184 @@ pub fn remove_msix_package() -> Result<MsixRemoveReport, EngineError> {
         message: "MSIX removal is only available on Windows".to_string(),
         raw_error: None,
     })
+}
+
+#[cfg(windows)]
+pub fn verify_msix_health() -> MsixHealthReport {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$pkg = Get-AppxPackage -Name {name} |
+  Sort-Object -Property Version -Descending |
+  Select-Object -First 1
+if ($null -eq $pkg) {{
+  [pscustomobject]@{{
+    packageRegistered = $false
+    statusOk = $false
+    status = 'not-registered'
+    aumidResolved = $false
+    missingDependencies = ''
+  }} | ConvertTo-Json -Compress
+  exit 0
+}}
+$statusStr = [string]$pkg.Status
+$statusOk = ([string]::IsNullOrEmpty($statusStr) -or $statusStr -eq 'Ok')
+$aumidResolved = $false
+$missing = @()
+function Convert-ToVersion($value) {{
+  try {{
+    $text = [string]$value
+    if ([string]::IsNullOrWhiteSpace($text)) {{ return $null }}
+    return [version]$text
+  }} catch {{
+    return $null
+  }}
+}}
+function Same-Publisher($package, [string]$publisher) {{
+  if ([string]::IsNullOrWhiteSpace($publisher)) {{ return $true }}
+  return [string]$package.Publisher -eq $publisher
+}}
+function Same-Architecture($package, [string]$required) {{
+  if ([string]::IsNullOrWhiteSpace($required) -or $required -eq 'neutral') {{ return $true }}
+  $arch = [string]$package.Architecture
+  return [string]::IsNullOrWhiteSpace($arch) -or $arch -eq 'Neutral' -or $arch -eq $required
+}}
+try {{
+  $manifest = Get-AppxPackageManifest $pkg -ErrorAction Stop
+  $app = $manifest.Package.Applications.Application
+  if ($app -is [array]) {{ $app = $app[0] }}
+  $appId = [string]$app.Id
+  if (-not [string]::IsNullOrEmpty($appId)) {{ $aumidResolved = $true }}
+  $mainArch = [string]$pkg.Architecture
+  $deps = $manifest.Package.Dependencies.PackageDependency
+  foreach ($d in @($deps)) {{
+    if ($null -ne $d) {{
+      $dn = [string]$d.Name
+      if (-not [string]::IsNullOrEmpty($dn)) {{
+        $depPublisher = [string]$d.Publisher
+        $depMinText = [string]$d.MinVersion
+        $depMin = Convert-ToVersion $depMinText
+        $depArch = [string]$d.ProcessorArchitecture
+        if ([string]::IsNullOrWhiteSpace($depArch)) {{ $depArch = $mainArch }}
+        $candidates = @(Get-AppxPackage -Name $dn -ErrorAction SilentlyContinue |
+          Where-Object {{ Same-Publisher $_ $depPublisher }})
+        $archCandidates = @($candidates | Where-Object {{ Same-Architecture $_ $depArch }})
+        if ($candidates.Count -gt 0 -and $archCandidates.Count -eq 0) {{
+          $missing += "$dn architecture $depArch not installed"
+          continue
+        }}
+        $depPkg = $archCandidates |
+          Sort-Object -Property @{{ Expression = {{ Convert-ToVersion $_.Version }}; Descending = $true }} |
+          Select-Object -First 1
+        if ($null -eq $depPkg) {{
+          $missing += "$dn not installed"
+        }} else {{
+          $installedVersion = Convert-ToVersion $depPkg.Version
+          if ($null -ne $depMin -and $null -ne $installedVersion -and $installedVersion -lt $depMin) {{
+            $missing += "$dn >= $depMinText required (installed $($depPkg.Version))"
+          }}
+        }}
+      }}
+    }}
+  }}
+}} catch {{}}
+[pscustomobject]@{{
+  packageRegistered = $true
+  statusOk = $statusOk
+  status = $statusStr
+  aumidResolved = $aumidResolved
+  missingDependencies = ($missing -join ', ')
+}} | ConvertTo-Json -Compress
+"#,
+        name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY)
+    );
+
+    let parsed = run_powershell_json(&script)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+
+    let Some(value) = parsed else {
+        // The health probe itself could not run. Don't overturn a successful
+        // Add-AppxPackage on an unverifiable signal — keep the MSIX install.
+        return MsixHealthReport {
+            healthy: true,
+            package_registered: true,
+            status: "probe-failed".to_string(),
+            status_ok: true,
+            aumid_resolved: true,
+            missing_dependencies: vec![],
+            reason: "health probe could not run; keeping the MSIX install".to_string(),
+        };
+    };
+
+    let package_registered = value
+        .get("packageRegistered")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let status_ok = value
+        .get("statusOk")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let aumid_resolved = value
+        .get("aumidResolved")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let missing_text = value
+        .get("missingDependencies")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let missing_dependencies: Vec<String> = missing_text
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let healthy =
+        package_registered && status_ok && aumid_resolved && missing_dependencies.is_empty();
+    let reason = if healthy {
+        String::new()
+    } else if !package_registered {
+        "the package is not registered after install".to_string()
+    } else if !status_ok {
+        format!("package status is {status}")
+    } else if !aumid_resolved {
+        "could not resolve the app entry (AUMID)".to_string()
+    } else {
+        format!(
+            "missing framework dependencies: {}",
+            missing_dependencies.join(", ")
+        )
+    };
+
+    MsixHealthReport {
+        healthy,
+        package_registered,
+        status,
+        status_ok,
+        aumid_resolved,
+        missing_dependencies,
+        reason,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn verify_msix_health() -> MsixHealthReport {
+    // Non-Windows builds never sideload, so there is nothing to verify; report
+    // healthy so this can never be the thing that blocks a (non-existent) path.
+    MsixHealthReport {
+        healthy: true,
+        package_registered: false,
+        status: "not-windows".to_string(),
+        status_ok: true,
+        aumid_resolved: true,
+        missing_dependencies: vec![],
+        reason: "MSIX health checks are only meaningful on Windows".to_string(),
+    }
 }
 
 #[cfg(windows)]
