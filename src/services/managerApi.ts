@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { check } from "@tauri-apps/plugin-updater";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 
 import type {
   AppSettings,
@@ -19,6 +19,21 @@ import type {
 import { DEFAULT_SETTINGS } from "../shared/types";
 
 const SETTINGS_LS = "cam.settings";
+
+export type ManagerUpdateCheck =
+  | { kind: "development" }
+  | { kind: "unavailable" }
+  | { kind: "none" }
+  | ManagerUpdateAvailable;
+
+export interface ManagerUpdateAvailable {
+  kind: "available";
+  version: string;
+  currentVersion: string;
+  body?: string;
+  installAndRelaunch: () => Promise<void>;
+  discard: () => Promise<void>;
+}
 
 function localSettings(): AppSettings {
   try {
@@ -274,22 +289,20 @@ export const managerApi = {
   },
   // Self-update the manager itself via the Tauri updater (minisign-signed,
   // full bundle). Endpoints + signing are server-side (see roadmap §4).
-  async checkManagerUpdate(): Promise<string> {
+  async checkManagerUpdate(): Promise<ManagerUpdateCheck> {
     if (!hasTauriRuntime()) {
-      return "（浏览器开发态：manager 自更新在桌面 app 内可用）";
+      return { kind: "development" };
     }
     // A routine check shouldn't surface a scary error when the release feed
     // isn't published yet or is unreachable.
     const update = await check().catch(() => undefined);
     if (update === undefined) {
-      return "暂时无法检查管理器更新,请稍后再试";
+      return { kind: "unavailable" };
     }
     if (!update) {
-      return "管理器已是最新版";
+      return { kind: "none" };
     }
-    await update.downloadAndInstall();
-    await relaunch();
-    return `已安装 ${update.version},正在重启…`;
+    return managerUpdateAvailable(update);
   },
   macStatus(): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {
@@ -486,3 +499,19 @@ export const managerApi = {
     return invoke<WinInstallStatus>("win_adopt");
   },
 };
+
+function managerUpdateAvailable(update: Update): ManagerUpdateAvailable {
+  return {
+    kind: "available",
+    version: update.version,
+    currentVersion: update.currentVersion,
+    body: update.body,
+    installAndRelaunch: async () => {
+      await update.downloadAndInstall();
+      await relaunch();
+    },
+    discard: async () => {
+      await update.close().catch(() => undefined);
+    },
+  };
+}

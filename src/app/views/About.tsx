@@ -1,29 +1,64 @@
 import { useCallback, useState } from "react";
 
-import { errorMessage, managerApi } from "../../services/managerApi";
+import { errorMessage, managerApi, type ManagerUpdateAvailable } from "../../services/managerApi";
 import { Icon, CodexMark } from "../icons";
 import { useI18n } from "../i18n";
-import { NavBar } from "../components";
+import { NavBar, Ring } from "../components";
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.0.0";
 const REPO_URL = "https://github.com/Wangnov/Codex-App-Manager";
 
 export function About({ onBack }: { onBack: () => void }) {
   const { t } = useI18n();
   const [mgrBusy, setMgrBusy] = useState(false);
   const [mgrMsg, setMgrMsg] = useState<string | null>(null);
+  const [pendingUpdate, setPendingUpdate] = useState<ManagerUpdateAvailable | null>(null);
+
+  const closeUpdateConfirm = useCallback(() => {
+    if (mgrBusy) return;
+    void pendingUpdate?.discard();
+    setPendingUpdate(null);
+  }, [mgrBusy, pendingUpdate]);
 
   const checkManager = useCallback(async () => {
     setMgrBusy(true);
     setMgrMsg(null);
+    if (pendingUpdate) {
+      void pendingUpdate.discard();
+      setPendingUpdate(null);
+    }
     try {
-      setMgrMsg(await managerApi.checkManagerUpdate());
+      const result = await managerApi.checkManagerUpdate();
+      if (result.kind === "available") {
+        setPendingUpdate(result);
+        setMgrMsg(t("about.mgrFound", { version: result.version }));
+      } else if (result.kind === "none") {
+        setMgrMsg(t("about.mgrUpToDate"));
+      } else if (result.kind === "development") {
+        setMgrMsg(t("about.mgrDev"));
+      } else {
+        setMgrMsg(t("about.mgrUnavailable"));
+      }
     } catch (cause) {
       setMgrMsg(errorMessage(cause));
     } finally {
       setMgrBusy(false);
     }
-  }, []);
+  }, [pendingUpdate, t]);
+
+  const installManagerUpdate = useCallback(async () => {
+    if (!pendingUpdate) return;
+    setMgrBusy(true);
+    setMgrMsg(t("progress.installing"));
+    try {
+      await pendingUpdate.installAndRelaunch();
+    } catch (cause) {
+      setMgrMsg(errorMessage(cause));
+      setPendingUpdate(null);
+    } finally {
+      setMgrBusy(false);
+    }
+  }, [pendingUpdate, t]);
 
   return (
     <div className="pop">
@@ -62,6 +97,23 @@ export function About({ onBack }: { onBack: () => void }) {
           </button>
         </div>
       </div>
+      {pendingUpdate ? (
+        <div className="scrim" onClick={closeUpdateConfirm}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <Ring icon="arrowUp" />
+            <h3>{t("confirm.title", { version: pendingUpdate.version })}</h3>
+            <p>{t("about.mgrConfirmBody")}</p>
+            <div className="row2">
+              <button className="btn ghost" onClick={closeUpdateConfirm} disabled={mgrBusy}>
+                {t("confirm.cancel")}
+              </button>
+              <button className="btn primary" onClick={installManagerUpdate} disabled={mgrBusy}>
+                {mgrBusy ? t("progress.installing") : t("confirm.ok")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
