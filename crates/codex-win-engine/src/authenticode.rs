@@ -1,7 +1,6 @@
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
-#[cfg(windows)]
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
