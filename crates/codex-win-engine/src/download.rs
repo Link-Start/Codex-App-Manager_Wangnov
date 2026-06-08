@@ -1,12 +1,13 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::process::hidden_command;
 use crate::EngineError;
 
 static DOWNLOAD_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -66,7 +67,7 @@ fn run_curl(url: &str, dest: &Path, resume: bool, on_progress: &dyn Fn(u64)) -> 
     }
     args.extend(["-o".to_string(), dest.clone(), url.to_string()]);
 
-    let mut child = Command::new("curl")
+    let mut child = hidden_command("curl")
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -199,7 +200,7 @@ mod tests {
 
     #[test]
     fn download_with_progress_reports_final_size() {
-        if Command::new("curl").arg("--version").output().is_err() {
+        if hidden_command("curl").arg("--version").output().is_err() {
             return;
         }
 

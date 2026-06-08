@@ -1,11 +1,11 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use crate::msix::{parse_appx_manifest_xml, MsixIdentity};
+use crate::process::hidden_command;
 use crate::EngineError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,7 +178,7 @@ fn powershell_exe() -> PathBuf {
 
 #[cfg(windows)]
 fn run_powershell(script: &str) -> Result<String, EngineError> {
-    let output = Command::new(powershell_exe())
+    let output = hidden_command(powershell_exe())
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|e| EngineError::Install(format!("spawn powershell: {e}")))?;
@@ -482,7 +482,7 @@ fn health_check_portable_install(install_root: &Path, launch: bool) -> Result<bo
     if !launch {
         return Ok(false);
     }
-    Command::new(&exe)
+    hidden_command(&exe)
         .spawn()
         .map(|_| true)
         .map_err(|e| io_err("portable health check launch", e))

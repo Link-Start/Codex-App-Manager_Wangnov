@@ -1,7 +1,6 @@
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +8,7 @@ use crate::capability::WinCapabilityReport;
 #[cfg(windows)]
 use crate::capability::{CapabilityCheck, CapabilityState};
 use crate::msix::parse_appx_manifest_xml;
+use crate::process::hidden_command;
 use crate::EngineError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ pub struct MsixRemoveReport {
 }
 
 pub fn fetch_text(url: &str) -> Result<String, EngineError> {
-    let output = Command::new("curl")
+    let output = hidden_command("curl")
         .args(["-fsSL", "--connect-timeout", "20", url])
         .output()
         .map_err(|e| EngineError::Io(format!("spawn curl: {e}")))?;
@@ -82,7 +82,7 @@ fn powershell_exe() -> PathBuf {
 
 #[cfg(windows)]
 fn run_powershell_json(script: &str) -> Result<String, EngineError> {
-    let output = Command::new(powershell_exe())
+    let output = hidden_command(powershell_exe())
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|e| EngineError::Capability(format!("spawn powershell: {e}")))?;

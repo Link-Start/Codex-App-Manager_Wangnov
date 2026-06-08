@@ -657,9 +657,15 @@ pub fn open_url(url: String) -> Result<(), CommandError> {
     #[cfg(target_os = "macos")]
     let spawned = std::process::Command::new("open").arg(&url).spawn();
     #[cfg(target_os = "windows")]
-    let spawned = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url.as_str()])
-        .spawn();
+    let spawned = {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url.as_str()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let spawned = std::process::Command::new("xdg-open").arg(&url).spawn();
     spawned

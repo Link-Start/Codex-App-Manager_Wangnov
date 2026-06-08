@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod msix;
 pub mod plan;
 pub mod portable;
+mod process;
 pub mod sys;
 pub mod version;
 

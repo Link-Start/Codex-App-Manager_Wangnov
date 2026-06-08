@@ -2,10 +2,10 @@ use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 #[cfg(windows)]
-use std::process::Command;
-
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
+use crate::process::hidden_command;
 use crate::EngineError;
 
 // The mirror currently serves Store-re-signed MSIX packages; add a separate
@@ -127,7 +127,7 @@ $sig = Get-AuthenticodeSignature -LiteralPath {path}
         path = ps_quote(&path.to_string_lossy())
     );
 
-    let output = Command::new(powershell_exe())
+    let output = hidden_command(powershell_exe())
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|e| EngineError::Authenticode(format!("spawn powershell: {e}")))?;
