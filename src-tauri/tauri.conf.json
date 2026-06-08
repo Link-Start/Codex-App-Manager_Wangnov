@@ -47,8 +47,38 @@
     "resources": ["resources/*"],
     "windows": {
       "nsis": {
-        "displayLanguageSelector": false,
-        "installMode": "currentUser"
+        "displayLanguageSelector": true,
+        "installMode": "currentUser",
+        "template": "installer/installer.nsi",
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "languages": [
+          "English",
+          "SimpChinese",
+          "TradChinese",
+          "Japanese",
+          "Korean",
+          "French",
+          "German",
+          "Spanish",
+          "PortugueseBR",
+          "Russian",
+          "Arabic"
+        ],
+        "customLanguageFiles": {
+          "English": "installer/languages/English.nsh",
+          "SimpChinese": "installer/languages/SimpChinese.nsh",
+          "TradChinese": "installer/languages/TradChinese.nsh",
+          "Japanese": "installer/languages/Japanese.nsh",
+          "Korean": "installer/languages/Korean.nsh",
+          "French": "installer/languages/French.nsh",
+          "German": "installer/languages/German.nsh",
+          "Spanish": "installer/languages/Spanish.nsh",
+          "PortugueseBR": "installer/languages/PortugueseBR.nsh",
+          "Russian": "installer/languages/Russian.nsh",
+          "Arabic": "installer/languages/Arabic.nsh"
+        }
       }
     }
   },
