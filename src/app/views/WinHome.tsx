@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 
-import { errorMessage, managerApi } from "../../services/managerApi";
+import { errorCode, errorMessage, managerApi } from "../../services/managerApi";
 import type {
   AppSettings,
   DownloadProgress,
@@ -39,6 +39,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [defaultInstallRoot, setDefaultInstallRoot] = useState(DEFAULT_SETTINGS.installRoot);
   const [busy, setBusy] = useState<"plan" | "perform" | "adopt" | "install" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [installDirOpen, setInstallDirOpen] = useState(false);
   const [installDirBusy, setInstallDirBusy] = useState(false);
@@ -81,11 +82,14 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const check = useCallback(async () => {
     setBusy("plan");
     setError(null);
+    setNotice(null);
     try {
       setReport(await managerApi.winPlanUpdate());
+      return true;
     } catch (cause) {
       setReport(null);
       setError(errorMessage(cause));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -117,6 +121,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const adopt = useCallback(async () => {
     setBusy("adopt");
     setError(null);
+    setNotice(null);
     try {
       setStatus(await managerApi.winAdopt());
     } catch (cause) {
@@ -149,6 +154,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     async (mode: "perform" | "install", installRoot?: string) => {
       setBusy(mode);
       setError(null);
+      setNotice(null);
       // For an in-place update (not a fresh install) capture the human-facing
       // versions before the swap, so the outcome strip can show "X → Y".
       // Prefer the report (one atomic snapshot of installed + plan) so the
@@ -158,7 +164,15 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       const toVersion = report?.plan?.latestVersion ?? "";
       const unlisten = await startDlListen();
       try {
-        const result = await managerApi.winPerformUpdate(true, installRoot);
+        const expected = report?.plan
+          ? {
+              currentVersion: report.plan.currentVersion,
+              latestVersion: report.plan.latestVersion,
+              packageMoniker: report.plan.packageMoniker,
+              route: report.plan.route,
+            }
+          : undefined;
+        const result = await managerApi.winPerformUpdate(true, expected, installRoot);
         setPerform(result);
         setUpdatedVer(
           mode === "perform" && fromVersion && toVersion
@@ -170,16 +184,23 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         await refreshStatus();
         await check();
       } catch (cause) {
-        setError(errorMessage(cause));
         setConfirmOpen(false);
         setInstallDirOpen(false);
+        if (errorCode(cause) === "stale_expectation") {
+          await refreshStatus();
+          if (await check()) {
+            setNotice(t("home.stale.rechecked"));
+          }
+        } else {
+          setError(errorMessage(cause));
+        }
       } finally {
         unlisten();
         setBusy(null);
         setDl(null);
       }
     },
-    [status, report, refreshStatus, check, startDlListen],
+    [status, report, refreshStatus, check, startDlListen, t],
   );
 
   const freshInstallNeedsLocation = useCallback(async () => {
@@ -241,8 +262,14 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   }, [runPerform]);
 
   const plan = report?.plan ?? null;
-  const installed = status?.installed ?? report?.installed ?? null;
-  const isManaged = status?.status === "managed";
+  const installed = report ? report.installed : status?.installed ?? null;
+  const statusMatchesInstalled = Boolean(
+    installed &&
+      status?.installed &&
+      samePath(installed.path, status.installed.path) &&
+      installed.version === status.installed.version,
+  );
+  const isManaged = statusMatchesInstalled && status?.status === "managed";
   const updateAvailable = Boolean(plan) && !plan?.upToDate;
   const routeNote =
     plan?.route === "portable-fallback" ? t("win.route.portable") : t("win.route.msix");
@@ -261,13 +288,23 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       return "none";
     }
     if (!statusLoaded) return "loading";
-    if (status?.status === "external") return "external";
+    if (statusMatchesInstalled && status?.status === "external") return "external";
     if (busy === "plan" && !report) return "loading";
     if (error && !report) return "error";
     if (!report) return "idle";
     if (updateAvailable) return "update";
     return "uptodate";
-  }, [busy, report, error, installed, updateAvailable, status, statusLoaded, statusFailed]);
+  }, [
+    busy,
+    report,
+    error,
+    installed,
+    updateAvailable,
+    status,
+    statusMatchesInstalled,
+    statusLoaded,
+    statusFailed,
+  ]);
 
   const version = installed?.version || plan?.latestVersion || "";
   const sourceLabel = t(`source.${settings.source}` as TKey);
@@ -371,6 +408,12 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               setUpdatedVer(null);
             }}
           />
+        ) : null}
+        {notice ? (
+          <div className="banner info">
+            <Icon name="info" />
+            <span>{notice}</span>
+          </div>
         ) : null}
         {error ? (
           <div className="banner err">
