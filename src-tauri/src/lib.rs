@@ -62,6 +62,13 @@ fn install_macos_menu(app: &tauri::App) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
@@ -85,6 +92,11 @@ pub fn run() {
             commands::mac_uninstall,
             commands::get_settings,
             commands::set_settings,
+            commands::get_config_health,
+            commands::restore_config_backup,
+            commands::reset_config,
+            commands::begin_operation,
+            commands::end_operation,
             commands::confirm_quit,
             commands::win_default_install_root,
             commands::win_pick_install_dir,
@@ -107,7 +119,15 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             install_macos_menu(app)?;
-            let _ = &app;
+            let health = app
+                .state::<state::ManagerState>()
+                .config_health
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            if !health.is_ok() {
+                let _ = app.emit("app://config-health", health);
+            }
             Ok(())
         })
         // Our custom macOS Quit item lands here (Cmd+Q). Same guard as the

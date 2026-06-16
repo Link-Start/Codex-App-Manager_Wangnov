@@ -4,12 +4,20 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
+use crate::app::atomic_file;
+use crate::app::config_health::ConfigHealth;
+use crate::app::disk::available_space;
 use crate::app::mac_update::{
     cancel_macos_download, install_macos, pause_macos_download, perform_macos_update,
     plan_macos_update, stage_macos_update, uninstall_macos, MacInstallStatus, MacPerformReport,
     MacStageReport, MacUninstallReport, MacUpdateReport, PerformExpectation,
 };
+use crate::app::oplock::{OperationError, OperationGuard, OperationKind, OperationToken};
+use crate::app::paths;
+use crate::app::provenance::ProvenanceStore;
 use crate::app::settings_store::AppSettings as PersistedAppSettings;
+use crate::app::settings_store::UpdateSource;
+use crate::app::url_guard::validate_custom_source;
 use crate::app::win_update::{
     auto_stage_windows_update_with_install_mode, cancel_windows_download, pause_windows_download,
     perform_windows_update_with_install_mode, plan_windows_update_with_install_mode,
@@ -48,26 +56,34 @@ fn windows_endpoints_for_settings(
 ) -> Result<crate::domain::manifest::MirrorEndpoints, AppError> {
     let mut saved = PersistedAppSettings::load();
     normalize_settings_for_target(&mut saved, &state.target);
-    match saved.source.as_str() {
-        "custom" => {
-            let base = normalize_windows_source_base(&saved.custom_url)
-                .unwrap_or_else(|| state.settings.mirror_base_url.clone());
+    match saved.source {
+        UpdateSource::Custom => {
+            let base = if saved.custom_url.trim().is_empty() {
+                state.settings.mirror_base_url.clone()
+            } else {
+                let normalized = validate_custom_source(&saved.custom_url)
+                    .map_err(|e| AppError::Engine(e.to_string()))?;
+                normalize_windows_source_base(&normalized)
+                    .unwrap_or_else(|| state.settings.mirror_base_url.clone())
+            };
             Ok(crate::domain::manifest::MirrorEndpoints::from_base_url(&base))
         }
-        "official" => Err(AppError::Engine(
+        UpdateSource::Official => Err(AppError::Engine(
             "Windows official update source is not available yet; choose mirror, auto, or a custom source that serves latest/manifest, latest/checksums, and latest/win.".to_string(),
         )),
         // Windows currently depends on the mirror-style manifest/checksum/MSIX
         // endpoints. `auto` therefore resolves to the known-good mirror until an
         // official source exposes the same contract.
-        "auto" | "mirror" => Ok(state.endpoints.clone()),
-        _ => Ok(state.endpoints.clone()),
+        UpdateSource::Auto | UpdateSource::Mirror => Ok(state.endpoints.clone()),
     }
 }
 
-fn normalize_settings_for_target(settings: &mut PersistedAppSettings, target: &crate::domain::target::Target) {
-    if matches!(target.os, OperatingSystem::Windows) && settings.source == "official" {
-        settings.source = "auto".to_string();
+fn normalize_settings_for_target(
+    settings: &mut PersistedAppSettings,
+    target: &crate::domain::target::Target,
+) {
+    if matches!(target.os, OperatingSystem::Windows) && settings.source == UpdateSource::Official {
+        settings.source = UpdateSource::Auto;
     }
 }
 
@@ -99,6 +115,54 @@ fn dialog_start_dir(path: &str) -> PathBuf {
 }
 
 const MIN_PORTABLE_FREE_SPACE_BYTES: u64 = 1_073_741_824;
+
+fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGuard, CommandError> {
+    state
+        .operations
+        .begin(kind)
+        .map_err(AppError::from)
+        .map_err(Into::into)
+}
+
+fn refresh_config_health(state: &ManagerState) -> ConfigHealth {
+    let (_, settings_health) = PersistedAppSettings::load_with_health();
+    let (_, provenance_health) = ProvenanceStore::load_with_health();
+    let health = ConfigHealth::from_parts(settings_health, provenance_health);
+    let mut slot = state
+        .config_health
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *slot = health.clone();
+    health
+}
+
+fn config_path(which: &str) -> Result<PathBuf, AppError> {
+    match which {
+        "settings" => paths::settings_path()
+            .ok_or_else(|| AppError::Internal("无法定位 settings.json 数据目录".to_string())),
+        "provenance" => paths::provenance_path()
+            .ok_or_else(|| AppError::Internal("无法定位 provenance.json 数据目录".to_string())),
+        _ => Err(AppError::Internal(
+            "配置类型必须是 settings 或 provenance".to_string(),
+        )),
+    }
+}
+
+fn auto_stage_busy_report(enabled: bool, allow_metered: bool) -> WinAutoStageReport {
+    WinAutoStageReport {
+        enabled,
+        allow_metered,
+        attempted: false,
+        skipped: true,
+        reason: "operation-busy".to_string(),
+        stage: None,
+        capabilities: None,
+        notes: vec![
+            "Automatic Windows pre-download was skipped because another operation is running."
+                .to_string(),
+        ],
+    }
+}
 
 fn path_key(path: &Path) -> String {
     path.to_string_lossy()
@@ -154,38 +218,6 @@ fn directory_is_empty(path: &Path) -> Result<bool, AppError> {
     let mut entries = std::fs::read_dir(path)
         .map_err(|e| AppError::Internal(format!("读取安装位置失败: {e}")))?;
     Ok(entries.next().is_none())
-}
-
-#[cfg(windows)]
-fn available_space(path: &Path) -> Result<Option<u64>, AppError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    wide.push(0);
-    let mut free_to_caller = 0_u64;
-    let mut total = 0_u64;
-    let mut total_free = 0_u64;
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free_to_caller,
-            &mut total,
-            &mut total_free,
-        )
-    };
-    if ok == 0 {
-        return Err(AppError::Internal(format!(
-            "读取磁盘剩余空间失败: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(Some(free_to_caller))
-}
-
-#[cfg(not(windows))]
-fn available_space(_path: &Path) -> Result<Option<u64>, AppError> {
-    Ok(None)
 }
 
 fn validate_install_root_path(raw: &str) -> Result<String, AppError> {
@@ -293,11 +325,13 @@ pub async fn mac_plan_update(
 /// (no apply/swap). Runs the blocking download off the main thread.
 #[tauri::command]
 pub async fn mac_stage_update(
+    state: State<'_, ManagerState>,
     simulated_build: Option<u64>,
 ) -> Result<MacStageReport, CommandError> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = begin_guard(&state, OperationKind::Update)?;
     tauri::async_runtime::spawn_blocking(move || stage_macos_update(simulated_build))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -317,7 +351,10 @@ fn resolve_binary_delta(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
         }
     }
     for rel in ["resources/BinaryDelta", "BinaryDelta"] {
-        if let Ok(res) = app.path().resolve(rel, tauri::path::BaseDirectory::Resource) {
+        if let Ok(res) = app
+            .path()
+            .resolve(rel, tauri::path::BaseDirectory::Resource)
+        {
             if res.exists() {
                 return Some(res);
             }
@@ -333,6 +370,7 @@ fn resolve_binary_delta(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 #[tauri::command]
 pub async fn mac_perform_update(
     app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
     confirm: bool,
     expected_from_build: u64,
     expected_to_build: u64,
@@ -342,8 +380,11 @@ pub async fn mac_perform_update(
         return Err(AppError::UnsupportedPlatform.into());
     }
     if !confirm {
-        return Err(AppError::Internal("拒绝执行：破坏性更新必须带显式 confirm".to_string()).into());
+        return Err(
+            AppError::Internal("拒绝执行：破坏性更新必须带显式 confirm".to_string()).into(),
+        );
     }
+    let _op = begin_guard(&state, OperationKind::Update)?;
     // Best-effort: a full-package update needs no delta tool, so don't reject the
     // whole operation when it's absent — only the delta branch requires it.
     let binary_delta = resolve_binary_delta(&app);
@@ -382,6 +423,7 @@ pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, Com
     if !matches!(state.target.os, OperatingSystem::Macos) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = begin_guard(&state, OperationKind::Adopt)?;
     crate::app::mac_update::mac_adopt().map_err(Into::into)
 }
 
@@ -397,10 +439,14 @@ pub fn mac_launch_codex() -> Result<(), CommandError> {
 /// macOS-only: fresh-install the latest Codex (full package) into /Applications.
 /// Runs the blocking download/verify/install off the main thread.
 #[tauri::command]
-pub async fn mac_install(app: tauri::AppHandle) -> Result<MacInstallStatus, CommandError> {
+pub async fn mac_install(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<MacInstallStatus, CommandError> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = begin_guard(&state, OperationKind::Install)?;
     tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: crate::app::mac_update::DownloadProgress| {
             let _ = app.emit("mac://download-progress", p);
@@ -461,6 +507,7 @@ pub async fn win_stage_update(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = begin_guard(&state, OperationKind::Update)?;
     let endpoints = windows_endpoints_for_settings(&state)?;
     let settings = windows_domain_settings_for_persisted(&state);
     let install_mode = windows_install_mode_for_settings();
@@ -489,8 +536,103 @@ pub fn set_settings(
     let mut s = settings;
     s.normalize();
     normalize_settings_for_target(&mut s, &state.target);
+    if s.source == UpdateSource::Custom && !s.custom_url.trim().is_empty() {
+        s.custom_url =
+            validate_custom_source(&s.custom_url).map_err(|e| AppError::Engine(e.to_string()))?;
+    }
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
     s.save()?;
+    refresh_config_health(&state);
     Ok(s)
+}
+
+#[tauri::command]
+pub fn get_config_health(state: State<'_, ManagerState>) -> ConfigHealth {
+    state
+        .config_health
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+#[tauri::command]
+pub fn restore_config_backup(
+    state: State<'_, ManagerState>,
+    which: String,
+) -> Result<ConfigHealth, CommandError> {
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    let path = config_path(which.as_str())?;
+    let backup = atomic_file::backup_path(&path);
+    if !backup.exists() {
+        return Err(AppError::Internal(format!("找不到 {} 的 .bak 备份", which)).into());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::Internal(format!("create data dir: {e}")))?;
+    }
+    let current_tmp = path.with_extension(format!("restore-current-{}", std::process::id()));
+    if path.exists() {
+        std::fs::rename(&path, &current_tmp)
+            .map_err(|e| AppError::Internal(format!("move current config aside: {e}")))?;
+    }
+    if let Err(err) = std::fs::rename(&backup, &path) {
+        if current_tmp.exists() {
+            let _ = std::fs::rename(&current_tmp, &path);
+        }
+        return Err(AppError::Internal(format!("restore config backup: {err}")).into());
+    }
+    if current_tmp.exists() {
+        let _ = std::fs::remove_file(current_tmp);
+    }
+    Ok(refresh_config_health(&state))
+}
+
+#[tauri::command]
+pub fn reset_config(
+    state: State<'_, ManagerState>,
+    which: String,
+) -> Result<ConfigHealth, CommandError> {
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    match which.as_str() {
+        "settings" => {
+            let mut settings = PersistedAppSettings::default();
+            normalize_settings_for_target(&mut settings, &state.target);
+            settings.save()?;
+        }
+        "provenance" => {
+            ProvenanceStore::default().save()?;
+        }
+        _ => {
+            return Err(
+                AppError::Internal("配置类型必须是 settings 或 provenance".to_string()).into(),
+            )
+        }
+    }
+    Ok(refresh_config_health(&state))
+}
+
+#[tauri::command]
+pub fn begin_operation(
+    state: State<'_, ManagerState>,
+    kind: OperationKind,
+) -> Result<OperationToken, CommandError> {
+    state
+        .operations
+        .begin_detached(kind)
+        .map_err(AppError::from)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn end_operation(
+    state: State<'_, ManagerState>,
+    token: OperationToken,
+) -> Result<(), CommandError> {
+    state
+        .operations
+        .end(token)
+        .map_err(AppError::from)
+        .map_err(Into::into)
 }
 
 /// The user confirmed quitting from the close dialog — flag it and exit so the
@@ -553,6 +695,7 @@ pub fn win_set_install_root(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
     let install_root = validate_install_root_path(&path)?;
     let mut settings = PersistedAppSettings::load();
     settings.install_root = install_root;
@@ -569,6 +712,7 @@ pub fn win_reset_install_root(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
     let install_root = validate_install_root_path(&PersistedAppSettings::default().install_root)?;
     let mut settings = PersistedAppSettings::load();
     settings.install_root = install_root;
@@ -582,6 +726,7 @@ pub fn win_reset_install_root(
 /// user opts out. Runs the blocking work off the main thread.
 #[tauri::command]
 pub async fn mac_uninstall(
+    state: State<'_, ManagerState>,
     confirm: bool,
     keep_codex_home: bool,
 ) -> Result<MacUninstallReport, CommandError> {
@@ -591,6 +736,7 @@ pub async fn mac_uninstall(
     if !confirm {
         return Err(AppError::Internal("拒绝执行：卸载必须带显式 confirm".to_string()).into());
     }
+    let _op = begin_guard(&state, OperationKind::Uninstall)?;
     tauri::async_runtime::spawn_blocking(move || uninstall_macos(keep_codex_home))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -608,6 +754,17 @@ pub async fn win_auto_stage_update(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = if enabled {
+        match state.operations.begin(OperationKind::Update) {
+            Ok(guard) => Some(guard),
+            Err(OperationError::BusySameProcess(_) | OperationError::BusyOtherProcess) => {
+                return Ok(auto_stage_busy_report(enabled, allow_metered));
+            }
+            Err(err) => return Err(AppError::from(err).into()),
+        }
+    } else {
+        None
+    };
     let endpoints = windows_endpoints_for_settings(&state)?;
     let settings = windows_domain_settings_for_persisted(&state);
     let install_mode = windows_install_mode_for_settings();
@@ -756,7 +913,10 @@ mod open_url_tests {
             "https://user@example.com/",
             "https://",
         ] {
-            assert!(validate_external_http_url(url).is_err(), "{url} should be rejected");
+            assert!(
+                validate_external_http_url(url).is_err(),
+                "{url} should be rejected"
+            );
         }
     }
 }
@@ -777,6 +937,7 @@ pub fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatus, Com
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    let _op = begin_guard(&state, OperationKind::Adopt)?;
     let settings = windows_domain_settings_for_persisted(&state);
     adopt_windows_install(&settings).map_err(Into::into)
 }
@@ -805,6 +966,12 @@ pub async fn win_perform_update(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    if !confirm {
+        return Err(
+            AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
+        );
+    }
+    let _op = begin_guard(&state, OperationKind::Update)?;
     let endpoints = windows_endpoints_for_settings(&state)?;
     let mut settings = windows_domain_settings_for_persisted(&state);
     // Validate (but don't yet persist) an explicitly chosen install root: it
@@ -857,6 +1024,12 @@ pub async fn win_uninstall(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    if !confirm {
+        return Err(
+            AppError::Internal("拒绝执行：Windows 卸载必须带显式 confirm".to_string()).into(),
+        );
+    }
+    let _op = begin_guard(&state, OperationKind::Uninstall)?;
     let settings = windows_domain_settings_for_persisted(&state);
     tauri::async_runtime::spawn_blocking(move || {
         uninstall_windows_codex(&settings, confirm, purge_user_data)
@@ -902,10 +1075,9 @@ mod tests {
         fs::write(root.join("notes.txt"), b"not codex").unwrap();
 
         let err = validate_install_root_path(&root.to_string_lossy()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("安装位置必须是空文件夹，或已有的 Codex 免安装版目录")
-        );
+        assert!(err
+            .to_string()
+            .contains("安装位置必须是空文件夹，或已有的 Codex 免安装版目录"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -948,7 +1120,10 @@ mod tests {
         let validated = validate_install_root_path(&root.to_string_lossy()).unwrap();
         assert_eq!(validated, root.to_string_lossy());
         // Validating a fresh location must leave the filesystem untouched.
-        assert!(!root.exists(), "validation must not create the install root");
+        assert!(
+            !root.exists(),
+            "validation must not create the install root"
+        );
 
         let _ = fs::remove_dir_all(root.parent().unwrap());
     }
@@ -962,9 +1137,8 @@ mod tests {
         let root = std::path::PathBuf::from(program_files).join("Codex");
 
         let err = validate_install_root_path(&root.to_string_lossy()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("安装位置不能放在系统目录、管理员目录或磁盘根目录")
-        );
+        assert!(err
+            .to_string()
+            .contains("安装位置不能放在系统目录、管理员目录或磁盘根目录"));
     }
 }
