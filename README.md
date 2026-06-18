@@ -42,7 +42,7 @@
     </td>
     <td width="560">
       <b>本项目由 <a href="https://duckcoding.ai">DuckCoding</a> 赞助支持</b><br>
-      面向国内开发者的 Claude Code / Codex / Gemini CLI API 中转,国内直连、按量计费。<br>
+      为 Claude Code / Codex / Gemini CLI 提供按量计费的 API 中转服务。<br>
       <b>Sponsored by <a href="https://duckcoding.ai">DuckCoding</a></b> — a pay-as-you-go API relay for Claude Code / Codex / Gemini CLI.
     </td>
   </tr>
