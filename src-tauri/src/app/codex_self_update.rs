@@ -126,15 +126,11 @@ fn install_macos_launch_agent() -> Result<(), AppError> {
     std::fs::write(&path, plist)
         .map_err(|e| AppError::Internal(format!("write LaunchAgent: {e}")))?;
 
-    let target = launchctl_gui_target();
-    let path_str = path.to_string_lossy().to_string();
-    launchctl_best_effort(&["bootout".to_string(), target.clone(), path_str.clone()]);
-    launchctl_best_effort(&["bootstrap".to_string(), target.clone(), path_str]);
-    launchctl_best_effort(&[
-        "kickstart".to_string(),
-        "-k".to_string(),
-        format!("{target}/{LAUNCH_AGENT_LABEL}"),
-    ]);
+    // The current GUI session is already updated by `launchctl setenv` before
+    // this function runs. Leave the LaunchAgent on disk for the next login
+    // instead of bootstrapping it immediately: immediate bootstrap/kickstart is
+    // noticeably slow and makes macOS show a "launchctl can run in background"
+    // notification for a one-shot helper.
     Ok(())
 }
 

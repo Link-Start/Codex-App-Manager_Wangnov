@@ -430,7 +430,6 @@ export function Settings({
             <div className="row">
               <span className="rtext">
                 <span className="rtitle">{t("settings.general.disableCodexSelfUpdates")}</span>
-                <span className="rsub">{t("settings.general.disableCodexSelfUpdatesNote")}</span>
               </span>
               <Toggle
                 checked={s.disableCodexSelfUpdates}

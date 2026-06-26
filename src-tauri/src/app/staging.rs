@@ -256,9 +256,13 @@ mod tests {
     };
     use crate::app::oplock::{OperationKind, OperationManager};
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    };
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+    static DOWNLOAD_CACHE_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_path(name: &str) -> std::path::PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -301,6 +305,7 @@ mod tests {
 
     #[test]
     fn download_cache_path_is_stable_per_url_and_collision_free() {
+        let _guard = DOWNLOAD_CACHE_LOCK.lock().unwrap();
         // Same URL → same path across calls (so a second run resumes the .part).
         let a1 = download_cache_path("https://m.example/codex-1.zip", "codex-1.zip").unwrap();
         let a2 = download_cache_path("https://m.example/codex-1.zip", "codex-1.zip").unwrap();
@@ -321,6 +326,7 @@ mod tests {
 
     #[test]
     fn clear_download_cache_removes_the_root() {
+        let _guard = DOWNLOAD_CACHE_LOCK.lock().unwrap();
         let p = download_cache_path("https://m.example/clear-me.zip", "clear-me.zip").unwrap();
         fs::write(&p, b"partial").unwrap();
         assert!(p.exists());
