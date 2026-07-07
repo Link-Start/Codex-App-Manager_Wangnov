@@ -4,9 +4,9 @@ import { errorMessage, managerApi } from "../../services/managerApi";
 import type { AppSettings, ProxyMode, UpdateSourceKind, WindowsInstallMode } from "../../shared/types";
 import { DEFAULT_SETTINGS } from "../../shared/types";
 import { Icon } from "../icons";
-import { useI18n, LANGS, type TFn, type TKey } from "../i18n";
+import { useI18n, LANGS, type Lang, type TFn, type TKey } from "../i18n";
 import { useTheme, type ThemeMode } from "../theme";
-import { NavBar, Segmented, Toggle } from "../components";
+import { NavBar, Segmented, Toggle, radioNavTarget } from "../components";
 import { isWindows } from "../platform";
 import { Sheet } from "../Sheet";
 import { useSettingsSaver } from "./useSettingsSaver";
@@ -115,6 +115,9 @@ export function Settings({
   const [langSheet, setLangSheet] = useState(false);
   const [customIntervalOpen, setCustomIntervalOpen] = useState(false);
   const langTitleId = useId();
+  // Prefix for the switch-row title ids — each Toggle names itself off its
+  // visible row title via aria-labelledby.
+  const switchId = useId();
 
   useEffect(() => {
     void managerApi.getSettings().then(reset).catch(() => undefined);
@@ -211,12 +214,29 @@ export function Settings({
         {/* 更新源 */}
         <div className="group">
           <div className="group-h">{t("settings.source.header")}</div>
-          <div className="list">
+          <div
+            className="list"
+            role="radiogroup"
+            aria-label={t("settings.source.header")}
+            onKeyDown={(event) => {
+              const next = radioNavTarget(
+                availableSources.map((src) => src.kind),
+                s.source,
+                event,
+                event.currentTarget,
+              );
+              if (next === null) return;
+              setCommandError(null);
+              update({ ...s, source: next as UpdateSourceKind });
+            }}
+          >
             {availableSources.map((src) => (
               <button
                 key={src.kind}
                 className="row"
+                role="radio"
                 aria-checked={s.source === src.kind}
+                tabIndex={s.source === src.kind ? 0 : -1}
                 onClick={() => {
                   setCommandError(null);
                   update({ ...s, source: src.kind });
@@ -240,6 +260,7 @@ export function Settings({
               <div className="row" style={{ display: "block" }}>
                 <input
                   className="input mono"
+                  aria-label={t("settings.source.custom")}
                   value={s.customUrl}
                   placeholder={t("settings.source.customPlaceholder")}
                   onChange={(e) => setDraft({ ...s, customUrl: e.target.value })}
@@ -256,12 +277,29 @@ export function Settings({
         {win ? (
           <div className="group">
             <div className="group-h">{t("settings.windows.header")}</div>
-            <div className="list">
+            <div
+              className="list"
+              role="radiogroup"
+              aria-label={t("settings.windows.header")}
+              onKeyDown={(event) => {
+                const next = radioNavTarget(
+                  WINDOWS_INSTALL_MODES.map((mode) => mode.kind),
+                  s.windowsInstallMode,
+                  event,
+                  event.currentTarget,
+                );
+                if (next === null) return;
+                setCommandError(null);
+                update({ ...s, windowsInstallMode: next as WindowsInstallMode });
+              }}
+            >
               {WINDOWS_INSTALL_MODES.map((mode) => (
                 <button
                   key={mode.kind}
                   className="row"
+                  role="radio"
                   aria-checked={s.windowsInstallMode === mode.kind}
+                  tabIndex={s.windowsInstallMode === mode.kind ? 0 : -1}
                   onClick={() => {
                     setCommandError(null);
                     update({ ...s, windowsInstallMode: mode.kind });
@@ -356,9 +394,10 @@ export function Settings({
           <div className="list">
             <div className="row">
               <span className="rtext">
-                <span className="rtitle">{t("settings.general.checkOnStartup")}</span>
+                <span className="rtitle" id={`${switchId}-startup`}>{t("settings.general.checkOnStartup")}</span>
               </span>
               <Toggle
+                ariaLabelledBy={`${switchId}-startup`}
                 checked={s.checkOnStartup}
                 onChange={(v) => {
                   setCommandError(null);
@@ -368,9 +407,10 @@ export function Settings({
             </div>
             <div className="row">
               <span className="rtext">
-                <span className="rtitle">{t("settings.general.periodicCheck")}</span>
+                <span className="rtitle" id={`${switchId}-periodic`}>{t("settings.general.periodicCheck")}</span>
               </span>
               <Toggle
+                ariaLabelledBy={`${switchId}-periodic`}
                 checked={s.periodicCheck}
                 onChange={(v) => {
                   setCommandError(null);
@@ -454,9 +494,10 @@ export function Settings({
             </div>
             <div className="row">
               <span className="rtext">
-                <span className="rtitle">{t("settings.general.askBefore")}</span>
+                <span className="rtitle" id={`${switchId}-ask`}>{t("settings.general.askBefore")}</span>
               </span>
               <Toggle
+                ariaLabelledBy={`${switchId}-ask`}
                 checked={s.askBefore}
                 onChange={(v) => {
                   setCommandError(null);
@@ -466,9 +507,10 @@ export function Settings({
             </div>
             <div className="row">
               <span className="rtext">
-                <span className="rtitle">{t("settings.general.disableCodexSelfUpdates")}</span>
+                <span className="rtitle" id={`${switchId}-noselfupdate`}>{t("settings.general.disableCodexSelfUpdates")}</span>
               </span>
               <Toggle
+                ariaLabelledBy={`${switchId}-noselfupdate`}
                 checked={s.disableCodexSelfUpdates}
                 onChange={(v) => {
                   setCommandError(null);
@@ -478,16 +520,21 @@ export function Settings({
             </div>
             <div className="row">
               <span className="rtext">
-                <span className="rtitle">{t("settings.general.autostart")}</span>
+                <span className="rtitle" id={`${switchId}-autostart`}>{t("settings.general.autostart")}</span>
                 <span className="rsub">{t("settings.general.autostartNote")}</span>
               </span>
-              <Toggle checked={autostart} onChange={toggleAutostart} />
+              <Toggle
+                ariaLabelledBy={`${switchId}-autostart`}
+                checked={autostart}
+                onChange={toggleAutostart}
+              />
             </div>
             <div className="row">
               <span className="rtext">
-                <span className="rtitle">{t("settings.general.confirmClose")}</span>
+                <span className="rtitle" id={`${switchId}-confirmclose`}>{t("settings.general.confirmClose")}</span>
               </span>
               <Toggle
+                ariaLabelledBy={`${switchId}-confirmclose`}
                 checked={s.confirmClose}
                 onChange={(v) => {
                   setCommandError(null);
@@ -600,12 +647,31 @@ export function Settings({
         initialFocus="first"
       >
         <h3 id={langTitleId}>{t("settings.appearance.language")}</h3>
-        <div className="langgrid" style={{ marginTop: 14 }}>
+        <div
+          className="langgrid"
+          style={{ marginTop: 14 }}
+          role="radiogroup"
+          aria-labelledby={langTitleId}
+          onKeyDown={(event) => {
+            // Arrow-selecting previews the language in place; activating
+            // (Enter/Space → click) is what commits AND closes the sheet.
+            const next = radioNavTarget(
+              LANGS.map((l) => l.code),
+              lang,
+              event,
+              event.currentTarget,
+            );
+            if (next === null) return;
+            setLang(next as Lang);
+          }}
+        >
           {LANGS.map((l) => (
             <button
               key={l.code}
               lang={l.code}
-              aria-selected={lang === l.code}
+              role="radio"
+              aria-checked={lang === l.code}
+              tabIndex={lang === l.code ? 0 : -1}
               onClick={() => {
                 setLangSheet(false);
                 setLang(l.code);

@@ -5,6 +5,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type KeyboardEvent,
   type ReactNode,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -290,6 +291,42 @@ export function ResultBanner({
   );
 }
 
+/** Shared arrow-key contract for the button-based radio groups (Segmented,
+ *  the settings source / install-mode lists, the language grid): arrows move
+ *  AND select, wrapping at the ends; roving tabindex keeps Tab a single stop.
+ *  Horizontal arrows follow the group's writing direction so RTL (Arabic)
+ *  isn't mirrored. Returns the key to select (focus moves with it via the
+ *  roving tabIndex render), or null for keys the group doesn't own. Ignores
+ *  events from non-radio targets so inputs inside the group keep their caret
+ *  keys. */
+export function radioNavTarget(
+  keys: string[],
+  value: string,
+  event: KeyboardEvent<HTMLElement>,
+  container: HTMLElement | null,
+): string | null {
+  const { key } = event;
+  if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "ArrowUp" && key !== "ArrowDown") {
+    return null;
+  }
+  const target = event.target as HTMLElement | null;
+  if (target && target.getAttribute("role") !== "radio") return null;
+  event.preventDefault();
+  // Only the horizontal pair mirrors with the writing direction; Up/Down are
+  // direction-agnostic.
+  const rtl = container ? getComputedStyle(container).direction === "rtl" : false;
+  const horizontal = key === "ArrowLeft" || key === "ArrowRight";
+  const forward = horizontal ? (key === "ArrowRight") !== rtl : key === "ArrowDown";
+  const idx = keys.indexOf(value);
+  const next = keys[(idx + (forward ? 1 : keys.length - 1)) % keys.length];
+  // Focus the radio that is about to become checked. It carries tabIndex=-1
+  // until the re-render lands, so look it up positionally.
+  container
+    ?.querySelectorAll<HTMLElement>('[role="radio"]')
+    [keys.indexOf(next)]?.focus();
+  return next;
+}
+
 export interface SegmentedItem {
   key: string;
   label: ReactNode;
@@ -321,7 +358,7 @@ export function Segmented({
     const bar = barRef.current;
     const pill = pillRef.current;
     if (!bar || !pill) return;
-    const active = bar.querySelector<HTMLElement>('[aria-selected="true"]');
+    const active = bar.querySelector<HTMLElement>('[aria-checked="true"]');
     // offsetWidth is 0 while collapsed (e.g. inside a closed schedule panel) or
     // under jsdom — skip so we don't pin the pill to a zero-width ghost.
     if (!active || active.offsetWidth === 0) return;
@@ -359,13 +396,26 @@ export function Segmented({
     return () => ro.disconnect();
   }, [place]);
 
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const next = radioNavTarget(
+      items.map((item) => item.key),
+      value,
+      event,
+      barRef.current,
+    );
+    if (next === null) return;
+    onChange(next);
+  };
+
   return (
-    <div className="seg" ref={barRef} aria-label={ariaLabel}>
+    <div className="seg" ref={barRef} role="radiogroup" aria-label={ariaLabel} onKeyDown={onKeyDown}>
       <span className="seg-pill" aria-hidden="true" ref={pillRef} />
       {items.map((item) => (
         <button
           key={item.key}
-          aria-selected={value === item.key}
+          role="radio"
+          aria-checked={value === item.key}
+          tabIndex={value === item.key ? 0 : -1}
           onClick={() => onChange(item.key)}
         >
           {item.label}
@@ -379,16 +429,21 @@ export function Toggle({
   checked,
   onChange,
   disabled = false,
+  ariaLabelledBy,
 }: {
   checked: boolean;
   onChange?: (v: boolean) => void;
   disabled?: boolean;
+  /** id of the visible row title — the switch itself renders no text, so
+   *  without this a screen reader announces a nameless "switch, on". */
+  ariaLabelledBy?: string;
 }) {
   return (
     <button
       className="toggle"
       role="switch"
       aria-checked={checked}
+      aria-labelledby={ariaLabelledBy}
       disabled={disabled}
       onClick={() => onChange?.(!checked)}
     />

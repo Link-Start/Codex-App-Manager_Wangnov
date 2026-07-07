@@ -1,7 +1,10 @@
 import { useEffect, type RefObject } from "react";
 
+// tabindex="-1" is excluded everywhere so a roving-tabindex radio group (the
+// language grid) counts as ONE Tab stop — otherwise the trap's first/last
+// cycling would disagree with what the browser actually tabs to.
 const FOCUSABLE =
-  'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])';
+  'button:not(:disabled):not([tabindex="-1"]), [href]:not([tabindex="-1"]), input:not(:disabled):not([tabindex="-1"]), select:not(:disabled):not([tabindex="-1"]), textarea:not(:disabled):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
 
 export function getFocusable(root: HTMLElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => {
@@ -68,7 +71,9 @@ export function useFocusTrap(
         node.tabIndex = -1;
         return node;
       }
-      return node.querySelector<HTMLElement>('[aria-selected="true"]') ?? focusables[0];
+      return (
+        node.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]') ?? focusables[0]
+      );
     };
     pick()?.focus();
 
