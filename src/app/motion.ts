@@ -8,11 +8,10 @@ import { useGSAP } from "@gsap/react";
 import gsap from "gsap";
 import { CustomEase } from "gsap/CustomEase";
 import { DrawSVGPlugin } from "gsap/DrawSVGPlugin";
-import { Flip } from "gsap/Flip";
 import { SplitText } from "gsap/SplitText";
 import type { RefObject } from "react";
 
-gsap.registerPlugin(useGSAP, CustomEase, DrawSVGPlugin, Flip, SplitText);
+gsap.registerPlugin(useGSAP, CustomEase, DrawSVGPlugin, SplitText);
 
 // Signature curves — smooth deceleration (no tacky bounce); "pop" is a
 // restrained overshoot reserved for the focal medallion.
@@ -20,7 +19,7 @@ CustomEase.create("cam-out", "0.16, 1, 0.3, 1"); // expo-out settle
 CustomEase.create("cam-in-out", "0.65, 0, 0.35, 1");
 CustomEase.create("cam-pop", "0.34, 1.3, 0.5, 1"); // gentle overshoot
 
-export { gsap, useGSAP, Flip, SplitText };
+export { gsap, useGSAP, SplitText };
 
 interface HomeMotionOpts {
   /** Reveal the headline character-by-character (skip for shimmer/loading text,
