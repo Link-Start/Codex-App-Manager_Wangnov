@@ -58,6 +58,10 @@
   --sheet-slide-distance: 28px;
   --sheet-bottom-skirt: calc(var(--sheet-slide-distance) + 4px);
 
+  /* stacking order — one place to reason about who sits above whom */
+  --z-scrim: 50;
+  --z-quit-scrim: 100;
+
   --window-gutter-x: 14px;
   --window-gutter-top: 14px;
   --window-gutter-bottom: 24px;
@@ -841,10 +845,6 @@ input {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
 }
-.flow .new {
-  color: var(--accent-deep);
-  font-weight: 600;
-}
 /* provenance — a small pill rather than a bare dot+label */
 .prov {
   margin-top: var(--space-sm);
@@ -1123,12 +1123,6 @@ input {
 }
 
 /* ── Cards / panels / rows ───────────────────────────────────────────────── */
-.card {
-  background: linear-gradient(180deg, var(--surface-top), var(--surface));
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  box-shadow: var(--elev-2);
-}
 .group {
   display: flex;
   flex-direction: column;
@@ -1871,12 +1865,6 @@ button.row.danger:hover {
   }
 }
 
-.note {
-  font-size: var(--fs-label);
-  color: var(--text-faint);
-  line-height: 1.55;
-  padding: 0 2px;
-}
 
 /* ── Footer ──────────────────────────────────────────────────────────────── */
 .foot {
@@ -1916,7 +1904,7 @@ button.row.danger:hover {
   -webkit-backdrop-filter: blur(7px) saturate(1.1);
   display: flex;
   align-items: flex-end;
-  z-index: 50;
+  z-index: var(--z-scrim);
   animation: fade 0.18s var(--ease);
 }
 /* Global quit-confirm overlay — raised by the backend close/exit guard so the
@@ -1933,7 +1921,7 @@ button.row.danger:hover {
   -webkit-backdrop-filter: blur(7px) saturate(1.1);
   display: flex;
   align-items: flex-end;
-  z-index: 100;
+  z-index: var(--z-quit-scrim);
   animation: fade 0.18s var(--ease);
 }
 @keyframes fade {
@@ -2404,7 +2392,6 @@ button.row.danger:hover {
 [data-platform="windows"] .row .rtitle,
 [data-platform="windows"] .install-root-copy .rtitle,
 [data-platform="windows"] .prov,
-[data-platform="windows"] .flow .new,
 [data-platform="windows"] .seg button,
 [data-platform="windows"] .langgrid button,
 [data-platform="windows"] .foot .gobtn,
