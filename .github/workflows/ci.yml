@@ -29,6 +29,8 @@ jobs:
       - run: npm ci
       - name: Type-check
         run: npm run check
+      - name: Lint
+        run: npm run lint
       - name: Unit tests
         run: npm run test --if-present
       - name: Build frontend

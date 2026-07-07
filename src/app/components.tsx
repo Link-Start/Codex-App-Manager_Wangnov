@@ -321,9 +321,8 @@ export function radioNavTarget(
   const next = keys[(idx + (forward ? 1 : keys.length - 1)) % keys.length];
   // Focus the radio that is about to become checked. It carries tabIndex=-1
   // until the re-render lands, so look it up positionally.
-  container
-    ?.querySelectorAll<HTMLElement>('[role="radio"]')
-    [keys.indexOf(next)]?.focus();
+  const radios = container?.querySelectorAll<HTMLElement>('[role="radio"]');
+  radios?.[keys.indexOf(next)]?.focus();
   return next;
 }
 
@@ -408,6 +407,10 @@ export function Segmented({
   };
 
   return (
+    // Roving-tabindex radiogroup: focus + Tab live on the child radios, so the
+    // group itself is correctly non-focusable (WAI-ARIA APG). The arrow-key
+    // handler reads keydown bubbling up from the focused radio.
+    // eslint-disable-next-line jsx-a11y/interactive-supports-focus
     <div className="seg" ref={barRef} role="radiogroup" aria-label={ariaLabel} onKeyDown={onKeyDown}>
       <span className="seg-pill" aria-hidden="true" ref={pillRef} />
       {items.map((item) => (

@@ -75,7 +75,6 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // stop commands differ.
   const {
     dl,
-    setDl,
     dlRef,
     dlPct,
     dlBytes,
@@ -289,7 +288,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         resetStop();
       }
     },
-    [status, report, refreshStatus, check, startDlListen, resetStop, t],
+    [status, report, refreshStatus, check, startDlListen, resetStop, dlRef, downloadStopRef, t],
   );
 
   // 〔继续〕from the paused state — re-run the same operation (same install

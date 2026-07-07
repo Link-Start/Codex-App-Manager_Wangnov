@@ -85,7 +85,15 @@ export function Sheet({
 
   const closing = !open;
   return (
+    // Backdrop click-to-dismiss is a mouse convenience; the keyboard path is Esc
+    // (handled by the focus trap's onEsc). The dialog itself carries the
+    // interactive semantics (role=dialog + aria-modal), so the scrim is inert
+    // chrome, not a control.
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events
     <div className={`${scrimClass}${closing ? " is-closing" : ""}`} onClick={dismiss}>
+      {/* onClick here is pure event plumbing — it stops a click INSIDE the sheet
+          from bubbling to the backdrop-dismiss handler; it is not a control. */}
+      {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events */}
       <div
         ref={frameRef}
         className={`sheet-frame${closing ? " is-closing" : ""}`}
