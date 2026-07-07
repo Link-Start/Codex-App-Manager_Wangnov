@@ -35,7 +35,6 @@ const ZH = {
 
   "home.checking": "正在检查…",
   "home.idle.title": "Codex 已安装",
-  "home.idle.sub": "版本 {version}",
   "home.uptodate.title": "已是最新",
   "home.uptodate.sub": "当前版本 {version}",
   "home.official": "官方版本",
@@ -95,7 +94,6 @@ const ZH = {
   "progress.pausePending": "正在暂停…",
   "progress.cancel": "取消",
   "progress.cancelPending": "正在取消…",
-  "progress.paused": "下载已暂停,再次更新会继续下载。",
   "progress.cancelled": "下载已取消。",
   "progress.cannotCancel": "当前阶段不能取消。",
   "progress.resume": "继续",
@@ -122,7 +120,6 @@ const ZH = {
   "settings.source.custom": "自定义",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "通用",
-  "settings.general.autoCheck": "自动检查更新",
   "settings.general.checkOnStartup": "启动时自动检查更新",
   "settings.general.periodicCheck": "定时自动检查更新",
   "settings.general.checkFrequency": "每隔多久检查一次",
@@ -233,7 +230,6 @@ const ZH = {
   "win.installDir.useDefault": "安装到默认位置",
   "win.installDir.useCurrent": "安装到此位置",
   "win.installDir.browse": "浏览…",
-  "win.installSub": "版本 {version}",
 } as const;
 
 type Key = keyof typeof ZH;
@@ -250,7 +246,6 @@ const EN: Record<Key, string> = {
 
   "home.checking": "Checking…",
   "home.idle.title": "Codex installed",
-  "home.idle.sub": "Version {version}",
   "home.uptodate.title": "Up to date",
   "home.uptodate.sub": "Current version {version}",
   "home.official": "Official build",
@@ -310,7 +305,6 @@ const EN: Record<Key, string> = {
   "progress.pausePending": "Pausing…",
   "progress.cancel": "Cancel",
   "progress.cancelPending": "Cancelling…",
-  "progress.paused": "Download paused. Start again to resume.",
   "progress.cancelled": "Download cancelled.",
   "progress.cannotCancel": "This phase cannot be cancelled.",
   "progress.resume": "Resume",
@@ -337,7 +331,6 @@ const EN: Record<Key, string> = {
   "settings.source.custom": "Custom",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "General",
-  "settings.general.autoCheck": "Check for updates automatically",
   "settings.general.checkOnStartup": "Check for updates on startup",
   "settings.general.periodicCheck": "Check for updates periodically",
   "settings.general.checkFrequency": "Check every",
@@ -448,7 +441,6 @@ const EN: Record<Key, string> = {
   "win.installDir.useDefault": "Install to default",
   "win.installDir.useCurrent": "Install here",
   "win.installDir.browse": "Browse…",
-  "win.installSub": "Version {version}",
 };
 
 const FR: Record<Key, string> = {
@@ -462,7 +454,6 @@ const FR: Record<Key, string> = {
 
   "home.checking": "Vérification…",
   "home.idle.title": "Codex est installé",
-  "home.idle.sub": "Version {version}",
   "home.uptodate.title": "À jour",
   "home.uptodate.sub": "Version actuelle {version}",
   "home.official": "Version officielle",
@@ -522,7 +513,6 @@ const FR: Record<Key, string> = {
   "progress.pausePending": "Pause…",
   "progress.cancel": "Annuler",
   "progress.cancelPending": "Annulation…",
-  "progress.paused": "Téléchargement mis en pause. Relancez pour reprendre.",
   "progress.cancelled": "Téléchargement annulé.",
   "progress.cannotCancel": "Cette étape ne peut pas être annulée.",
   "progress.resume": "Reprendre",
@@ -549,7 +539,6 @@ const FR: Record<Key, string> = {
   "settings.source.custom": "Personnalisée",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "Général",
-  "settings.general.autoCheck": "Vérifier les mises à jour automatiquement",
   "settings.general.checkOnStartup": "Vérifier les mises à jour au démarrage",
   "settings.general.periodicCheck": "Vérifier les mises à jour périodiquement",
   "settings.general.checkFrequency": "Vérifier toutes les",
@@ -660,7 +649,6 @@ const FR: Record<Key, string> = {
   "win.installDir.useDefault": "Installer à l'emplacement par défaut",
   "win.installDir.useCurrent": "Installer ici",
   "win.installDir.browse": "Parcourir…",
-  "win.installSub": "Version {version}",
 };
 
 const ZH_TW: Record<Key, string> = {
@@ -674,7 +662,6 @@ const ZH_TW: Record<Key, string> = {
 
   "home.checking": "檢查中…",
   "home.idle.title": "Codex 已安裝",
-  "home.idle.sub": "版本 {version}",
   "home.uptodate.title": "已是最新版",
   "home.uptodate.sub": "目前版本 {version}",
   "home.official": "官方版本",
@@ -735,7 +722,6 @@ const ZH_TW: Record<Key, string> = {
   "progress.pausePending": "正在暫停…",
   "progress.cancel": "取消",
   "progress.cancelPending": "正在取消…",
-  "progress.paused": "下載已暫停,再次更新會繼續下載。",
   "progress.cancelled": "下載已取消。",
   "progress.cannotCancel": "目前階段不能取消。",
   "progress.resume": "繼續",
@@ -762,7 +748,6 @@ const ZH_TW: Record<Key, string> = {
   "settings.source.custom": "自訂",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "一般",
-  "settings.general.autoCheck": "自動檢查更新",
   "settings.general.checkOnStartup": "啟動時自動檢查更新",
   "settings.general.periodicCheck": "定時自動檢查更新",
   "settings.general.checkFrequency": "每隔多久檢查一次",
@@ -883,7 +868,6 @@ const ZH_TW: Record<Key, string> = {
   "win.installDir.useDefault": "安裝到預設位置",
   "win.installDir.useCurrent": "安裝到此位置",
   "win.installDir.browse": "瀏覽…",
-  "win.installSub": "版本 {version}",
 };
 
 const DE: Record<Key, string> = {
@@ -897,7 +881,6 @@ const DE: Record<Key, string> = {
 
   "home.checking": "Wird geprüft…",
   "home.idle.title": "Codex installiert",
-  "home.idle.sub": "Version {version}",
   "home.uptodate.title": "Aktuell",
   "home.uptodate.sub": "Aktuelle Version {version}",
   "home.official": "Offizieller Build",
@@ -958,7 +941,6 @@ const DE: Record<Key, string> = {
   "progress.pausePending": "Pausiert…",
   "progress.cancel": "Abbrechen",
   "progress.cancelPending": "Abbrechen…",
-  "progress.paused": "Download pausiert. Starte erneut, um fortzufahren.",
   "progress.cancelled": "Download abgebrochen.",
   "progress.cannotCancel": "Diese Phase kann nicht abgebrochen werden.",
   "progress.resume": "Fortsetzen",
@@ -985,7 +967,6 @@ const DE: Record<Key, string> = {
   "settings.source.custom": "Benutzerdefiniert",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "Allgemein",
-  "settings.general.autoCheck": "Automatisch auf Updates prüfen",
   "settings.general.checkOnStartup": "Beim Start auf Updates prüfen",
   "settings.general.periodicCheck": "Regelmäßig auf Updates prüfen",
   "settings.general.checkFrequency": "Prüfen alle",
@@ -1106,7 +1087,6 @@ const DE: Record<Key, string> = {
   "win.installDir.useDefault": "Am Standardort installieren",
   "win.installDir.useCurrent": "Hier installieren",
   "win.installDir.browse": "Durchsuchen…",
-  "win.installSub": "Version {version}",
 };
 
 const KO: Record<Key, string> = {
@@ -1120,7 +1100,6 @@ const KO: Record<Key, string> = {
 
   "home.checking": "확인 중…",
   "home.idle.title": "Codex 설치됨",
-  "home.idle.sub": "버전 {version}",
   "home.uptodate.title": "최신 상태",
   "home.uptodate.sub": "현재 버전 {version}",
   "home.official": "공식 빌드",
@@ -1181,7 +1160,6 @@ const KO: Record<Key, string> = {
   "progress.pausePending": "일시 중지 중…",
   "progress.cancel": "취소",
   "progress.cancelPending": "취소 중…",
-  "progress.paused": "다운로드가 일시 중지되었습니다. 다시 시작하면 이어받습니다.",
   "progress.cancelled": "다운로드가 취소되었습니다.",
   "progress.cannotCancel": "이 단계는 취소할 수 없습니다.",
   "progress.resume": "계속",
@@ -1208,7 +1186,6 @@ const KO: Record<Key, string> = {
   "settings.source.custom": "직접 입력",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "일반",
-  "settings.general.autoCheck": "자동으로 업데이트 확인",
   "settings.general.checkOnStartup": "시작 시 업데이트 자동 확인",
   "settings.general.periodicCheck": "정기적으로 업데이트 자동 확인",
   "settings.general.checkFrequency": "확인 주기",
@@ -1328,7 +1305,6 @@ const KO: Record<Key, string> = {
   "win.installDir.useDefault": "기본 위치에 설치",
   "win.installDir.useCurrent": "여기에 설치",
   "win.installDir.browse": "찾아보기…",
-  "win.installSub": "버전 {version}",
 };
 
 const JA: Record<Key, string> = {
@@ -1340,7 +1316,6 @@ const JA: Record<Key, string> = {
   "nav.close": "閉じる",
   "home.checking": "確認中…",
   "home.idle.title": "Codex インストール済み",
-  "home.idle.sub": "バージョン {version}",
   "home.uptodate.title": "最新バージョンです",
   "home.uptodate.sub": "現在のバージョン {version}",
   "home.official": "公式ビルド",
@@ -1396,7 +1371,6 @@ const JA: Record<Key, string> = {
   "progress.pausePending": "一時停止中…",
   "progress.cancel": "キャンセル",
   "progress.cancelPending": "キャンセル中…",
-  "progress.paused": "ダウンロードを一時停止しました。再開すると続きから始まります。",
   "progress.cancelled": "ダウンロードをキャンセルしました。",
   "progress.cannotCancel": "この段階はキャンセルできません。",
   "progress.resume": "再開",
@@ -1421,7 +1395,6 @@ const JA: Record<Key, string> = {
   "settings.source.custom": "カスタム",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "一般",
-  "settings.general.autoCheck": "アップデートを自動確認",
   "settings.general.checkOnStartup": "起動時にアップデートを自動確認",
   "settings.general.periodicCheck": "定期的にアップデートを自動確認",
   "settings.general.checkFrequency": "確認間隔",
@@ -1531,7 +1504,6 @@ const JA: Record<Key, string> = {
   "win.installDir.useDefault": "既定の場所にインストール",
   "win.installDir.useCurrent": "この場所にインストール",
   "win.installDir.browse": "参照…",
-  "win.installSub": "バージョン {version}",
 };
 
 const RU: Record<Key, string> = {
@@ -1543,7 +1515,6 @@ const RU: Record<Key, string> = {
   "nav.close": "Закрыть",
   "home.checking": "Проверка…",
   "home.idle.title": "Codex установлен",
-  "home.idle.sub": "Версия {version}",
   "home.uptodate.title": "Актуальная версия",
   "home.uptodate.sub": "Текущая версия {version}",
   "home.official": "Официальная сборка",
@@ -1599,7 +1570,6 @@ const RU: Record<Key, string> = {
   "progress.pausePending": "Приостановка…",
   "progress.cancel": "Отмена",
   "progress.cancelPending": "Отмена…",
-  "progress.paused": "Загрузка приостановлена. Запустите снова, чтобы продолжить.",
   "progress.cancelled": "Загрузка отменена.",
   "progress.cannotCancel": "Этот этап нельзя отменить.",
   "progress.resume": "Продолжить",
@@ -1624,7 +1594,6 @@ const RU: Record<Key, string> = {
   "settings.source.custom": "Свой",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "Основные",
-  "settings.general.autoCheck": "Автоматически проверять обновления",
   "settings.general.checkOnStartup": "Проверять обновления при запуске",
   "settings.general.periodicCheck": "Проверять обновления периодически",
   "settings.general.checkFrequency": "Проверять каждые",
@@ -1734,7 +1703,6 @@ const RU: Record<Key, string> = {
   "win.installDir.useDefault": "Установить в место по умолчанию",
   "win.installDir.useCurrent": "Установить сюда",
   "win.installDir.browse": "Обзор…",
-  "win.installSub": "Версия {version}",
 };
 
 const AR: Record<Key, string> = {
@@ -1746,7 +1714,6 @@ const AR: Record<Key, string> = {
   "nav.close": "إغلاق",
   "home.checking": "جارٍ التحقق…",
   "home.idle.title": "Codex مثبّت",
-  "home.idle.sub": "الإصدار {version}",
   "home.uptodate.title": "محدَّث",
   "home.uptodate.sub": "الإصدار الحالي {version}",
   "home.official": "إصدار رسمي",
@@ -1802,7 +1769,6 @@ const AR: Record<Key, string> = {
   "progress.pausePending": "جارٍ الإيقاف…",
   "progress.cancel": "إلغاء",
   "progress.cancelPending": "جارٍ الإلغاء…",
-  "progress.paused": "تم إيقاف التنزيل مؤقتًا. ابدأ مرة أخرى للمتابعة.",
   "progress.cancelled": "تم إلغاء التنزيل.",
   "progress.cannotCancel": "لا يمكن إلغاء هذه المرحلة.",
   "progress.resume": "استئناف",
@@ -1827,7 +1793,6 @@ const AR: Record<Key, string> = {
   "settings.source.custom": "مخصص",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "عام",
-  "settings.general.autoCheck": "التحقق من التحديثات تلقائياً",
   "settings.general.checkOnStartup": "التحقق من التحديثات عند البدء",
   "settings.general.periodicCheck": "التحقق من التحديثات دورياً",
   "settings.general.checkFrequency": "التحقق كل",
@@ -1937,7 +1902,6 @@ const AR: Record<Key, string> = {
   "win.installDir.useDefault": "التثبيت في الموقع الافتراضي",
   "win.installDir.useCurrent": "التثبيت هنا",
   "win.installDir.browse": "استعراض…",
-  "win.installSub": "الإصدار {version}",
 };
 
 const ES: Record<Key, string> = {
@@ -1949,7 +1913,6 @@ const ES: Record<Key, string> = {
   "nav.close": "Cerrar",
   "home.checking": "Comprobando…",
   "home.idle.title": "Codex instalado",
-  "home.idle.sub": "Versión {version}",
   "home.uptodate.title": "Todo al día",
   "home.uptodate.sub": "Versión actual {version}",
   "home.official": "Versión oficial",
@@ -2005,7 +1968,6 @@ const ES: Record<Key, string> = {
   "progress.pausePending": "Pausando…",
   "progress.cancel": "Cancelar",
   "progress.cancelPending": "Cancelando…",
-  "progress.paused": "Descarga pausada. Inicia de nuevo para reanudar.",
   "progress.cancelled": "Descarga cancelada.",
   "progress.cannotCancel": "Esta fase no se puede cancelar.",
   "progress.resume": "Reanudar",
@@ -2030,7 +1992,6 @@ const ES: Record<Key, string> = {
   "settings.source.custom": "Personalizado",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "General",
-  "settings.general.autoCheck": "Buscar actualizaciones automáticamente",
   "settings.general.checkOnStartup": "Buscar actualizaciones al iniciar",
   "settings.general.periodicCheck": "Buscar actualizaciones periódicamente",
   "settings.general.checkFrequency": "Buscar cada",
@@ -2140,7 +2101,6 @@ const ES: Record<Key, string> = {
   "win.installDir.useDefault": "Instalar en la ubicación predeterminada",
   "win.installDir.useCurrent": "Instalar aquí",
   "win.installDir.browse": "Explorar…",
-  "win.installSub": "Versión {version}",
 };
 
 const PT_BR: Record<Key, string> = {
@@ -2152,7 +2112,6 @@ const PT_BR: Record<Key, string> = {
   "nav.close": "Fechar",
   "home.checking": "Verificando…",
   "home.idle.title": "Codex instalado",
-  "home.idle.sub": "Versão {version}",
   "home.uptodate.title": "Tudo atualizado",
   "home.uptodate.sub": "Versão atual {version}",
   "home.official": "Versão oficial",
@@ -2208,7 +2167,6 @@ const PT_BR: Record<Key, string> = {
   "progress.pausePending": "Pausando…",
   "progress.cancel": "Cancelar",
   "progress.cancelPending": "Cancelando…",
-  "progress.paused": "Download pausado. Inicie de novo para continuar.",
   "progress.cancelled": "Download cancelado.",
   "progress.cannotCancel": "Esta fase não pode ser cancelada.",
   "progress.resume": "Retomar",
@@ -2233,7 +2191,6 @@ const PT_BR: Record<Key, string> = {
   "settings.source.custom": "Personalizado",
   "settings.source.customPlaceholder": "https://…",
   "settings.general.header": "Geral",
-  "settings.general.autoCheck": "Verificar atualizações automaticamente",
   "settings.general.checkOnStartup": "Verificar atualizações ao iniciar",
   "settings.general.periodicCheck": "Verificar atualizações periodicamente",
   "settings.general.checkFrequency": "Verificar a cada",
@@ -2343,7 +2300,6 @@ const PT_BR: Record<Key, string> = {
   "win.installDir.useDefault": "Instalar no local padrão",
   "win.installDir.useCurrent": "Instalar aqui",
   "win.installDir.browse": "Procurar…",
-  "win.installSub": "Versão {version}",
 };
 
 export const CATALOG: Record<Lang, Record<Key, string>> = {

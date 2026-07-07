@@ -31,15 +31,35 @@ function systemPrefersDark(): boolean {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
 }
 
+/** The resolved theme for first paint — main.tsx stamps this on <html> before
+ *  React mounts, so a light-theme user never sees a dark first frame (the bare
+ *  `:root` carries the dark tokens). */
+export function resolveInitialTheme(): Resolved {
+  const mode = readMode();
+  return mode === "system" ? (systemPrefersDark() ? "dark" : "light") : mode;
+}
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<ThemeMode>(readMode);
   const [systemDark, setSystemDark] = useState<boolean>(systemPrefersDark);
 
-  // Track the OS appearance so "system" mode stays live.
+  // Track the OS appearance so "system" mode stays live. When the switch is
+  // actually visible (mode === system) it cross-fades like a manual theme
+  // change, instead of hard-cutting — same withViewTransition + synchronous
+  // stamp as setMode, so the transition's "after" snapshot is already themed.
   useEffect(() => {
     const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
     if (!mq) return;
-    const onChange = () => setSystemDark(mq.matches);
+    const onChange = () => {
+      if (readMode() === "system") {
+        withViewTransition(() => {
+          setSystemDark(mq.matches);
+          document.documentElement.dataset.theme = mq.matches ? "dark" : "light";
+        });
+      } else {
+        setSystemDark(mq.matches);
+      }
+    };
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
   }, []);
