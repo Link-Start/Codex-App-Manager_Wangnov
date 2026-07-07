@@ -36,6 +36,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
   const confirm1BodyId = useId();
   const confirm2TitleId = useId();
   const confirm2BodyId = useId();
+  const keepDataTitleId = useId();
 
   useEffect(() => {
     const load = win ? managerApi.winStatus() : managerApi.macStatus();
@@ -118,10 +119,15 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
             <div className="list">
               <div className="row">
                 <span className="rtext">
-                  <span className="rtitle">{t("uninstall.keepData")}</span>
+                  <span className="rtitle" id={keepDataTitleId}>{t("uninstall.keepData")}</span>
                   <span className="rsub">{t("uninstall.keepDataNote", { path: codexHome })}</span>
                 </span>
-                <Toggle checked={keepData} onChange={setKeepData} disabled={busy} />
+                <Toggle
+                  ariaLabelledBy={keepDataTitleId}
+                  checked={keepData}
+                  onChange={setKeepData}
+                  disabled={busy}
+                />
               </div>
             </div>
 
