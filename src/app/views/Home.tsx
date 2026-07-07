@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 
 import {
   errorCode,
@@ -10,7 +9,6 @@ import {
 } from "../../services/managerApi";
 import type {
   AppSettings,
-  DownloadProgress,
   MacInstallStatus,
   MacPerformReport,
   MacUpdateReport,
@@ -22,7 +20,6 @@ import { useI18n, dirOf, type TKey } from "../i18n";
 import { Ring, TopBar, ResultBanner, ErrorHero } from "../components";
 import { currentPlatform } from "../platform";
 import { WinHome } from "./WinHome";
-import { useCountUp } from "../useCountUp";
 import { mib, fmtDateTime } from "../format";
 import { useHomeMotion } from "../motion";
 import { Sheet } from "../Sheet";
@@ -31,9 +28,11 @@ import {
   ManualExistingInstallSheet,
   type ManualExistingCandidate,
 } from "./ManualExistingInstall";
+import { ProgressScreen, type PausedDownload } from "./ProgressScreen";
+import { useDownloadProgress } from "./useDownloadProgress";
+import { useFocusRecheck, installIdentity } from "./useFocusRecheck";
 
 type Kind = "loading" | "error" | "none" | "idle" | "update" | "external" | "uptodate";
-type DownloadStopIntent = "pause" | "cancel";
 
 /** Platform dispatcher — the backend command surface differs per OS. */
 export function Home(props: { onOpenSettings: () => void }) {
@@ -71,87 +70,37 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // Whether a fresh install just completed — show a done state with an explicit
   // 〔打开 Codex〕 instead of auto-launching.
   const [justInstalled, setJustInstalled] = useState(false);
-  // Live download progress (real bytes, emitted by the backend during
-  // install/update); null when not downloading.
-  const [dl, setDl] = useState<DownloadProgress | null>(null);
-  const [speed, setSpeed] = useState(0);
-  const dlSample = useRef<{ t: number; bytes: number } | null>(null);
-  const [downloadStop, setDownloadStop] = useState<DownloadStopIntent | null>(null);
-  const [downloadStopBusy, setDownloadStopBusy] = useState(false);
-  const downloadStopRef = useRef<DownloadStopIntent | null>(null);
-  // Latest live progress, read at pause time to snapshot the paused figures
-  // (the `dl` state is cleared when the perform call unwinds).
-  const dlRef = useRef<DownloadProgress | null>(null);
   // A paused download: the progress screen stays up (not routed home) offering
   // 〔继续〕/〔取消〕. `dl` is the byte snapshot captured at the moment of pause.
-  const [paused, setPaused] = useState<{
-    kind: "perform" | "install";
-    dl: DownloadProgress | null;
-  } | null>(null);
+  const [paused, setPaused] = useState<PausedDownload | null>(null);
   const scopeRef = useRef<HTMLDivElement>(null);
   const confirmTitleId = useId();
   const confirmBodyId = useId();
   const manualExistingTitleId = useId();
   const manualExistingBodyId = useId();
-  // Smoothly roll the live download figures instead of snapping per event.
-  const dlPctTarget = dl && dl.total > 0 ? Math.min(100, (dl.downloaded / dl.total) * 100) : 0;
-  const dlPct = useCountUp(dlPctTarget);
-  const dlBytes = useCountUp(dl?.downloaded ?? 0);
-  const dlSpeed = useCountUp(speed);
 
-  const onDlProgress = useCallback((e: { payload: DownloadProgress }) => {
-    const p = e.payload;
-    setDl(p);
-    dlRef.current = p;
-    const now = Date.now();
-    const prev = dlSample.current;
-    if (!prev) {
-      dlSample.current = { t: now, bytes: p.downloaded };
-    } else if (now > prev.t + 400) {
-      setSpeed((p.downloaded - prev.bytes) / ((now - prev.t) / 1000));
-      dlSample.current = { t: now, bytes: p.downloaded };
-    }
-  }, []);
-
-  const startDlListen = useCallback(async () => {
-    setDl(null);
-    dlRef.current = null;
-    setSpeed(0);
-    dlSample.current = null;
-    try {
-      return await listen<DownloadProgress>("mac://download-progress", onDlProgress);
-    } catch {
-      // Non-Tauri (web preview): no event bus — nothing to clean up.
-      return () => {};
-    }
-  }, [onDlProgress]);
-
-  const requestDownloadStop = useCallback(
-    async (intent: DownloadStopIntent) => {
-      setActionError(null);
-      setDownloadStop(intent);
-      setDownloadStopBusy(true);
-      downloadStopRef.current = intent;
-      try {
-        const active =
-          intent === "pause"
-            ? await managerApi.macPauseDownload()
-            : await managerApi.macCancelDownload();
-        if (!active) {
-          downloadStopRef.current = null;
-          setDownloadStop(null);
-          setDownloadStopBusy(false);
-          setActionError(t("progress.cannotCancel"));
-        }
-      } catch (cause) {
-        downloadStopRef.current = null;
-        setDownloadStop(null);
-        setDownloadStopBusy(false);
-        setActionError(userErrorMessage(cause, t));
-      }
-    },
-    [t],
-  );
+  // Live download state machine (bytes + eased readouts + pause/cancel intent),
+  // shared with the Windows home; only the channel + stop commands differ.
+  const {
+    dl,
+    setDl,
+    dlRef,
+    dlPct,
+    dlBytes,
+    dlSpeed,
+    downloadStop,
+    downloadStopBusy,
+    downloadStopRef,
+    startDlListen,
+    requestDownloadStop,
+    resetStop,
+  } = useDownloadProgress({
+    eventName: "mac://download-progress",
+    pauseDownload: () => managerApi.macPauseDownload(),
+    cancelDownload: () => managerApi.macCancelDownload(),
+    cannotCancelMessage: t("progress.cannotCancel"),
+    onError: setActionError,
+  });
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -234,60 +183,28 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     return () => window.clearInterval(id);
   }, [settings.periodicCheck, settings.periodicCheckIntervalSeconds]);
 
-  // Window focus → silently re-detect the local install (milliseconds, no
-  // network). If it no longer matches the snapshot on screen (Codex was
-  // updated / downgraded out-of-band while we weren't looking), re-run the
-  // full check so the card corrects itself instead of waiting to fail the
-  // perform-time guard.
-  useEffect(() => {
-    let last = 0;
-    let un: (() => void) | undefined;
-    void (async () => {
-      try {
-        un = await listen("tauri://focus", () => {
-          const now = Date.now();
-          if (busyRef.current || now - last < 3000) return;
-          last = now;
-          void (async () => {
-            try {
-              const st = await managerApi.macStatus();
-              setStatus(st);
-              setStatusLoaded(true);
-              setStatusFailed(false);
-              // Re-check whenever the install identity (build OR path) differs
-              // from the last checked snapshot — in EITHER direction, so a
-              // fresh external install (snapshot had none), a removal, a
-              // version change, and a same-build move to a new path all
-              // re-plan. Gate on `checked` (we have planned at least once), not
-              // on a non-null installed, or the none→installed transition is
-              // missed. The perform expectation pins build+path, so a stale
-              // plan here would only fail the backend guard or mislead the card.
-              const checked = reportRef.current;
-              const snap = checked?.installed ?? null;
-              const fresh = st.installed ?? null;
-              const identityChanged =
-                (snap?.build ?? null) !== (fresh?.build ?? null) ||
-                (snap?.path ?? null) !== (fresh?.path ?? null);
-              if (checked && identityChanged) {
-                // Drop any open confirm sheet first: it was built for the OLD
-                // target, and the install may now be external/gone. Leaving it
-                // up would let a click run perform against a snapshot the user
-                // never saw — bypassing the external→adopt boundary. The user
-                // re-confirms against the freshly-checked card.
-                setConfirmOpen(false);
-                void check();
-              }
-            } catch {
-              // Transient/unsupported — the next explicit check will surface it.
-            }
-          })();
-        });
-      } catch {
-        // Non-Tauri (web preview): no event bus — nothing to clean up.
-      }
-    })();
-    return () => un?.();
-  }, [check]);
+  // Re-check whenever the install identity (build OR path) differs from the
+  // last checked snapshot — in EITHER direction, so a fresh external install
+  // (snapshot had none), a removal, a version change, and a same-build move to
+  // a new path all re-plan. The perform expectation pins build+path, so a stale
+  // plan would only fail the backend guard or mislead the card. Dropping any
+  // open confirm sheet first: it was built for the OLD target.
+  useFocusRecheck<MacInstallStatus>({
+    fetchStatus: () => managerApi.macStatus(),
+    onStatus: (st) => {
+      setStatus(st);
+      setStatusLoaded(true);
+      setStatusFailed(false);
+    },
+    hasChecked: () => reportRef.current != null,
+    checkedIdentity: () => installIdentity(reportRef.current?.installed ?? null),
+    identityOf: (st) => installIdentity(st.installed ?? null),
+    isBusy: () => busyRef.current != null,
+    onIdentityChanged: () => {
+      setConfirmOpen(false);
+      void check();
+    },
+  });
 
   const adopt = useCallback(async () => {
     setBusy("adopt");
@@ -325,12 +242,9 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     } finally {
       un();
       setBusy(null);
-      setDl(null);
-      setDownloadStop(null);
-      setDownloadStopBusy(false);
-      downloadStopRef.current = null;
+      resetStop();
     }
-  }, [check, startDlListen, t]);
+  }, [check, startDlListen, resetStop, t]);
 
   const runPerform = useCallback(async () => {
     // ONE atomic snapshot (the report carries installed + plan detected
@@ -384,12 +298,9 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     } finally {
       un();
       setBusy(null);
-      setDl(null);
-      setDownloadStop(null);
-      setDownloadStopBusy(false);
-      downloadStopRef.current = null;
+      resetStop();
     }
-  }, [report, check, startDlListen, t]);
+  }, [report, check, startDlListen, resetStop, t]);
 
   // 〔继续〕from the paused state — re-run the same operation. The backend finds
   // the cached `.part` and resumes via `curl -C -`, so the bar picks up where it
@@ -594,94 +505,25 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   // ── progress (performing / installing / paused) takes over the whole screen ─
   if (busy === "perform" || busy === "install" || paused) {
-    const installing = paused ? paused.kind === "install" : busy === "install";
-    // Paused reads from its captured snapshot; live runs from the eased `dl`.
-    const snap = paused ? paused.dl : dl;
-    const known = Boolean(snap && snap.total > 0);
-    const snapPct = snap && snap.total > 0 ? Math.min(100, (snap.downloaded / snap.total) * 100) : 0;
-    const pct = known ? Math.round(paused ? snapPct : dlPct) : null;
-    const barPct = paused ? snapPct : dlPct;
-    // Bytes are in → the uninterruptible install phase (gate/quit/atomic swap).
-    // Say so and drop the dead buttons rather than leave them greyed for no
-    // visible reason.
-    const finishing = !paused && Boolean(snap && snap.total > 0 && snap.downloaded >= snap.total);
-    // Pause only makes sense mid-transfer; cancel is the "abandon" out and works
-    // through the preparing phase too (a backend abort checkpoint honors it), but
-    // not once the install has begun.
-    const canPause =
-      !paused && Boolean(dl && dl.total > 0 && dl.downloaded < dl.total) && !downloadStopBusy;
-    const canCancel = !paused && !finishing && !downloadStopBusy;
     return (
-      <div className="pop">
-        <TopBar />
-        <div className="scroll" ref={scopeRef}>
-          <div className="hero" style={{ marginTop: 24 }} key={scene}>
-            <Ring icon={paused ? "pause" : "loader"} spin={!paused} className="glow" />
-            <div className={`headline${paused ? "" : " shimmer"}`}>
-              {paused
-                ? t("progress.paused.title")
-                : installing
-                  ? t("progress.installing")
-                  : t("progress.title")}
-            </div>
-            {!paused ? (
-              <div className="sub">
-                {finishing
-                  ? t("progress.finishing")
-                  : snap
-                    ? t("progress.downloadingFrom", { source: snap.source })
-                    : t("progress.preparing")}
-              </div>
-            ) : null}
-            {pct !== null ? (
-              <div className="pctbig">
-                {pct}
-                <span className="pctsign">%</span>
-              </div>
-            ) : null}
-            <div className="bar">
-              <div
-                className={`bar-fill${pct === null ? " indeterminate" : ""}`}
-                style={pct === null ? undefined : { width: `${barPct}%` }}
-              />
-            </div>
-            {known && snap ? (
-              <div className="dlmeta">
-                {mib(paused ? snap.downloaded : dlBytes)} / {mib(snap.total)}
-                {!paused && dlSpeed > 0 ? ` · ${mib(dlSpeed)}/s` : ""}
-              </div>
-            ) : null}
-            <div className="progress-actions">
-              {paused ? (
-                <button className="btn primary" onClick={resumeDownload}>
-                  <Icon name="play" />
-                  {t("progress.resume")}
-                </button>
-              ) : (
-                <button
-                  className="btn ghost"
-                  onClick={() => void requestDownloadStop("pause")}
-                  disabled={!canPause}
-                >
-                  <Icon name="pause" />
-                  {downloadStop === "pause" ? t("progress.pausePending") : t("progress.pause")}
-                </button>
-              )}
-              <button
-                className="btn danger"
-                onClick={() => {
-                  if (paused) cancelPausedDownload();
-                  else void requestDownloadStop("cancel");
-                }}
-                disabled={!paused && !canCancel}
-              >
-                <Icon name="close" />
-                {downloadStop === "cancel" ? t("progress.cancelPending") : t("progress.cancel")}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
+      <ProgressScreen
+        scene={scene}
+        scopeRef={scopeRef}
+        paused={paused}
+        dl={dl}
+        dlPct={dlPct}
+        dlBytes={dlBytes}
+        dlSpeed={dlSpeed}
+        installing={paused ? paused.kind === "install" : busy === "install"}
+        downloadStop={downloadStop}
+        downloadStopBusy={downloadStopBusy}
+        onResume={resumeDownload}
+        onPause={() => void requestDownloadStop("pause")}
+        onCancel={() => {
+          if (paused) void cancelPausedDownload();
+          else void requestDownloadStop("cancel");
+        }}
+      />
     );
   }
 

@@ -247,6 +247,14 @@ describe("MacHome state machine", () => {
       onProgress?.({ payload: { downloaded: 512, total: 1024, source: "mirror.example" } });
     });
 
+    // The progress bar exposes progressbar semantics to assistive tech. The
+    // exact aria-valuenow eases (useCountUp), so assert the range + presence
+    // rather than a timing-dependent value.
+    const progressbar = await screen.findByRole("progressbar");
+    expect(progressbar).toHaveAttribute("aria-valuemin", "0");
+    expect(progressbar).toHaveAttribute("aria-valuemax", "100");
+    expect(progressbar).toHaveAttribute("aria-valuenow");
+
     const pause = await screen.findByRole("button", { name: /^暂停$/ });
     await waitFor(() => expect(pause).toBeEnabled());
     await user.click(pause);

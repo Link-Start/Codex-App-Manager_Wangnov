@@ -8,6 +8,7 @@ import { useI18n, LANGS, type Lang, type TFn, type TKey } from "../i18n";
 import { useTheme, type ThemeMode } from "../theme";
 import { NavBar, Segmented, Toggle, radioNavTarget } from "../components";
 import { isWindows } from "../platform";
+import { samePath } from "../paths";
 import { Sheet } from "../Sheet";
 import { useSettingsSaver } from "./useSettingsSaver";
 
@@ -78,12 +79,6 @@ function formatInterval(seconds: number, t: TFn) {
     parts.seconds ? `${parts.seconds}${t("settings.general.intervalSecondsSuffix")}` : "",
   ].filter(Boolean);
   return labels.join(" ") || `1${t("settings.general.intervalMinutesSuffix")}`;
-}
-
-function samePath(a: string, b: string): boolean {
-  const norm = (value: string) =>
-    value.trim().replace(/[\\/]+$/, "").replace(/\//g, "\\").toLowerCase();
-  return norm(a) === norm(b);
 }
 
 export function Settings({
