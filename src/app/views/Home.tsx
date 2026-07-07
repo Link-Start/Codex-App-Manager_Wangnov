@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Pause, Play, XCircle } from "lucide-react";
 
 import {
   errorCode,
@@ -655,7 +654,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             <div className="progress-actions">
               {paused ? (
                 <button className="btn primary" onClick={resumeDownload}>
-                  <Play />
+                  <Icon name="play" />
                   {t("progress.resume")}
                 </button>
               ) : (
@@ -664,7 +663,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
                   onClick={() => void requestDownloadStop("pause")}
                   disabled={!canPause}
                 >
-                  <Pause />
+                  <Icon name="pause" />
                   {downloadStop === "pause" ? t("progress.pausePending") : t("progress.pause")}
                 </button>
               )}
@@ -676,7 +675,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
                 }}
                 disabled={!paused && !canCancel}
               >
-                <XCircle />
+                <Icon name="close" />
                 {downloadStop === "cancel" ? t("progress.cancelPending") : t("progress.cancel")}
               </button>
             </div>

@@ -435,10 +435,252 @@ input {
   width: 16px;
   height: 16px;
 }
+.cam-icon {
+  overflow: visible;
+  pointer-events: none;
+}
+.cam-icon :is(g, path, polyline, line, circle, rect) {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+/* Hover / focus-visible micro-animations for the stroke icon set. One shared
+   trigger list — interactive hosts plus the manual `.cam-anim-trigger` opt-in
+   hook for non-interactive containers. The whole block sits behind
+   prefers-reduced-motion: no-preference, mirroring the GSAP matchMedia gate in
+   motion.ts, so reduced-motion users get fully static icons (including the
+   dasharray setup, which would otherwise leave check strokes dashed). */
+@media (prefers-reduced-motion: no-preference) {
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-check-mark {
+    stroke-dasharray: 20;
+    animation: cam-stroke-draw 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-alert-body {
+    animation: cam-alert-pop 0.38s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) :is(.cam-alert-line, .cam-alert-dot) {
+    animation: cam-pulse 0.55s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-arrow-up {
+    animation: cam-lift 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) :is(.cam-download-stem, .cam-download-head) {
+    animation: cam-download-drop 0.9s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-download-tray {
+    animation: cam-tray-bounce 0.9s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-play-triangle {
+    animation: cam-play-squeeze 0.38s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) :is(.cam-pause-left, .cam-pause-right) {
+    animation: cam-pause-squeeze 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-refresh {
+    animation: cam-half-spin 0.5s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-gear-body {
+    animation: cam-full-spin 0.9s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-gear-center {
+    animation: cam-center-pop 0.36s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-shield-body {
+    animation: cam-shield-guard 0.46s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-shield-check {
+    stroke-dasharray: 12;
+    animation: cam-stroke-draw 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) :is(.cam-info-line, .cam-info-dot) {
+    animation: cam-info-nudge 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) :is(.cam-chevron, .cam-back) {
+    animation: cam-side-nudge 0.32s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) :is(.cam-trash-lid, .cam-trash-handle) {
+    animation: cam-trash-open 0.34s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-slider-a {
+    animation: cam-slide-right 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-slider-b {
+    animation: cam-slide-left 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-message {
+    animation: cam-message-pop 0.42s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-folder-lid {
+    animation: cam-folder-open 0.34s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-copy-front {
+    animation: cam-copy-slide 0.36s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-globe {
+    animation: cam-globe-turn 0.64s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-external-arrow {
+    animation: cam-external-lift 0.36s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) .cam-minimize {
+    animation: cam-minimize-settle 0.3s var(--ease) both;
+  }
+  :where(.cam-anim-trigger, button:not(:disabled), a, [role="button"], .row, .install-root-copy, .ring):is(:hover, :focus-visible) :is(.cam-close-a, .cam-close-b) {
+    animation: cam-close-snap 0.28s var(--ease) both;
+  }
+}
 .spinicon {
   animation: spin 0.8s linear infinite;
   transform-box: fill-box;
   transform-origin: center;
+}
+@keyframes cam-stroke-draw {
+  from {
+    stroke-dashoffset: 20;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes cam-alert-pop {
+  0% {
+    transform: translateY(0) scale(1);
+  }
+  55% {
+    transform: translateY(-1.5px) scale(1.06);
+  }
+  100% {
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes cam-pulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+@keyframes cam-lift {
+  45% {
+    transform: translateY(-2px);
+  }
+}
+@keyframes cam-download-drop {
+  0% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  38% {
+    transform: translateY(6px);
+    opacity: 0;
+  }
+  48% {
+    transform: translateY(-6px);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+@keyframes cam-tray-bounce {
+  48% {
+    transform: translateY(0);
+  }
+  65% {
+    transform: translateY(1.5px) scaleX(1.08);
+  }
+}
+@keyframes cam-play-squeeze {
+  50% {
+    transform: scale(0.84);
+  }
+}
+@keyframes cam-pause-squeeze {
+  50% {
+    transform: scaleY(0.78);
+  }
+}
+@keyframes cam-half-spin {
+  to {
+    transform: rotate(180deg);
+  }
+}
+@keyframes cam-full-spin {
+  55% {
+    transform: rotate(360deg) scale(1.03);
+  }
+  100% {
+    transform: rotate(360deg) scale(1);
+  }
+}
+@keyframes cam-center-pop {
+  50% {
+    transform: scale(1.18);
+  }
+}
+@keyframes cam-shield-guard {
+  50% {
+    transform: translateY(-1px) scale(1.04);
+  }
+}
+@keyframes cam-info-nudge {
+  45% {
+    transform: translateY(-1px);
+  }
+}
+@keyframes cam-side-nudge {
+  50% {
+    transform: translateX(1.75px);
+  }
+}
+@keyframes cam-trash-open {
+  to {
+    transform: translate(-1px, -3px) rotate(-24deg);
+  }
+}
+@keyframes cam-slide-right {
+  55% {
+    transform: translateX(4px);
+  }
+}
+@keyframes cam-slide-left {
+  55% {
+    transform: translateX(-4px);
+  }
+}
+@keyframes cam-message-pop {
+  50% {
+    transform: translateY(-1px) scale(1.04);
+  }
+}
+@keyframes cam-folder-open {
+  55% {
+    transform: translateY(-2px) rotate(-5deg);
+  }
+}
+@keyframes cam-copy-slide {
+  50% {
+    transform: translate(2px, 2px);
+  }
+}
+@keyframes cam-globe-turn {
+  50% {
+    transform: rotate(-10deg) scale(1.03);
+  }
+}
+@keyframes cam-external-lift {
+  50% {
+    transform: translate(1.5px, -1.5px);
+  }
+}
+@keyframes cam-minimize-settle {
+  45% {
+    transform: translateY(1px) scaleX(0.82);
+  }
+}
+@keyframes cam-close-snap {
+  50% {
+    transform: rotate(8deg) scale(1.08);
+  }
 }
 
 /* sub-view nav bar */
@@ -940,6 +1182,10 @@ button.row:active {
   color: var(--text-soft);
   flex-shrink: 0;
 }
+.row .ricon svg {
+  width: 100%;
+  height: 100%;
+}
 .row .rtext {
   flex: 1;
   min-width: 0;
@@ -974,6 +1220,10 @@ button.row:active {
   height: 16px;
   flex-shrink: 0;
   transition: transform 0.18s var(--ease), color 0.18s var(--ease);
+}
+.row .chev svg {
+  width: 100%;
+  height: 100%;
 }
 button.row:hover .chev {
   color: var(--text-soft);
@@ -1046,6 +1296,10 @@ button.row.danger:hover {
   color: var(--text-soft);
   flex-shrink: 0;
   margin-top: 1px;
+}
+.install-root-copy .ricon svg {
+  width: 100%;
+  height: 100%;
 }
 .install-root-copy .rtext {
   min-width: 0;
@@ -1399,6 +1653,14 @@ button.row.danger:hover {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-xs);
   animation: risein 0.22s var(--ease-out) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .schedule-panel {
+    transition: none;
+  }
+  .interval-grid {
+    animation: none;
+  }
 }
 .interval-grid label {
   display: grid;
@@ -1997,6 +2259,7 @@ button.row.danger:hover {
   .bar-fill.indeterminate,
   .ring.spin svg,
   .spinicon,
+  .cam-icon *,
   .view > * {
     animation: none !important;
   }
