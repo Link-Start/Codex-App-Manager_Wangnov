@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 
 import {
   errorCode,
@@ -10,7 +9,6 @@ import {
 } from "../../services/managerApi";
 import type {
   AppSettings,
-  DownloadProgress,
   WinInstallStatus,
   WinPerformReport,
   WinUpdateReport,
@@ -20,8 +18,8 @@ import { userErrorMessage } from "../errorCopy";
 import { Icon, CodexGlyph } from "../icons";
 import { useI18n, dirOf, type TKey } from "../i18n";
 import { Ring, TopBar, ResultBanner, ErrorHero } from "../components";
-import { useCountUp } from "../useCountUp";
 import { mib, fmtDateTime } from "../format";
+import { samePath, normalizePath } from "../paths";
 import { useHomeMotion } from "../motion";
 import { Sheet } from "../Sheet";
 import { skippedUpdateMatches, winSkippedUpdateCandidate } from "../skippedUpdate";
@@ -29,15 +27,11 @@ import {
   ManualExistingInstallSheet,
   type ManualExistingCandidate,
 } from "./ManualExistingInstall";
-
-function samePath(a: string, b: string): boolean {
-  const norm = (value: string) =>
-    value.trim().replace(/[\\/]+$/, "").replace(/\//g, "\\").toLowerCase();
-  return norm(a) === norm(b);
-}
+import { ProgressScreen, type PausedDownload } from "./ProgressScreen";
+import { useDownloadProgress } from "./useDownloadProgress";
+import { useFocusRecheck, installIdentity } from "./useFocusRecheck";
 
 type Kind = "loading" | "error" | "none" | "idle" | "update" | "external" | "uptodate";
-type DownloadStopIntent = "pause" | "cancel";
 
 // Windows counterpart of MacHome — same design system + state machine, driven by
 // the win_* backend (codex-win-engine): MSIX sideload or portable fallback.
@@ -65,22 +59,10 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [manualExistingError, setManualExistingError] = useState<string | null>(null);
   const [statusLoaded, setStatusLoaded] = useState(false);
   const [statusFailed, setStatusFailed] = useState(false);
-  const [dl, setDl] = useState<DownloadProgress | null>(null);
-  const [speed, setSpeed] = useState(0);
-  const dlSample = useRef<{ t: number; bytes: number } | null>(null);
-  const [downloadStop, setDownloadStop] = useState<DownloadStopIntent | null>(null);
-  const [downloadStopBusy, setDownloadStopBusy] = useState(false);
-  const downloadStopRef = useRef<DownloadStopIntent | null>(null);
-  // Latest live progress, read at pause time to snapshot the paused figures.
-  const dlRef = useRef<DownloadProgress | null>(null);
   // A paused download: the progress screen stays up (not routed home) offering
   // 〔继续〕/〔取消〕. `installRoot` is preserved so a paused fresh install
   // resumes into the same chosen location.
-  const [paused, setPaused] = useState<{
-    kind: "perform" | "install";
-    dl: DownloadProgress | null;
-    installRoot?: string;
-  } | null>(null);
+  const [paused, setPaused] = useState<(PausedDownload & { installRoot?: string }) | null>(null);
   const scopeRef = useRef<HTMLDivElement>(null);
   const confirmTitleId = useId();
   const confirmBodyId = useId();
@@ -88,64 +70,29 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const installDirBodyId = useId();
   const manualExistingTitleId = useId();
   const manualExistingBodyId = useId();
-  // Smoothly roll the live download figures instead of snapping per event.
-  const dlPctTarget = dl && dl.total > 0 ? Math.min(100, (dl.downloaded / dl.total) * 100) : 0;
-  const dlPct = useCountUp(dlPctTarget);
-  const dlBytes = useCountUp(dl?.downloaded ?? 0);
-  const dlSpeed = useCountUp(speed);
 
-  const onDlProgress = useCallback((event: { payload: DownloadProgress }) => {
-    const p = event.payload;
-    setDl(p);
-    dlRef.current = p;
-    const now = Date.now();
-    const prev = dlSample.current;
-    if (!prev) {
-      dlSample.current = { t: now, bytes: p.downloaded };
-    } else if (now > prev.t + 400) {
-      setSpeed((p.downloaded - prev.bytes) / ((now - prev.t) / 1000));
-      dlSample.current = { t: now, bytes: p.downloaded };
-    }
-  }, []);
-
-  const startDlListen = useCallback(async () => {
-    setDl(null);
-    dlRef.current = null;
-    setSpeed(0);
-    dlSample.current = null;
-    try {
-      return await listen<DownloadProgress>("win://download-progress", onDlProgress);
-    } catch {
-      return () => {};
-    }
-  }, [onDlProgress]);
-
-  const requestDownloadStop = useCallback(
-    async (intent: DownloadStopIntent) => {
-      setActionError(null);
-      setDownloadStop(intent);
-      setDownloadStopBusy(true);
-      downloadStopRef.current = intent;
-      try {
-        const active =
-          intent === "pause"
-            ? await managerApi.winPauseDownload()
-            : await managerApi.winCancelDownload();
-        if (!active) {
-          downloadStopRef.current = null;
-          setDownloadStop(null);
-          setDownloadStopBusy(false);
-          setActionError(t("progress.cannotCancel"));
-        }
-      } catch (cause) {
-        downloadStopRef.current = null;
-        setDownloadStop(null);
-        setDownloadStopBusy(false);
-        setActionError(userErrorMessage(cause, t));
-      }
-    },
-    [t],
-  );
+  // Live download state machine, shared with the mac home; only the channel +
+  // stop commands differ.
+  const {
+    dl,
+    setDl,
+    dlRef,
+    dlPct,
+    dlBytes,
+    dlSpeed,
+    downloadStop,
+    downloadStopBusy,
+    downloadStopRef,
+    startDlListen,
+    requestDownloadStop,
+    resetStop,
+  } = useDownloadProgress({
+    eventName: "win://download-progress",
+    pauseDownload: () => managerApi.winPauseDownload(),
+    cancelDownload: () => managerApi.winCancelDownload(),
+    cannotCancelMessage: t("progress.cannotCancel"),
+    onError: setActionError,
+  });
 
   const check = useCallback(async () => {
     setBusy("plan");
@@ -195,6 +142,12 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     return () => window.removeEventListener(SETTINGS_CHANGED_EVENT, onSettingsChanged);
   }, []);
 
+  // The snapshot/busy values the focus listener (a long-lived subscription)
+  // reads — refs so the subscription doesn't tear down on every state change.
+  const reportRef = useRef<WinUpdateReport | null>(null);
+  useEffect(() => {
+    reportRef.current = report;
+  }, [report]);
   const busyRef = useRef(busy);
   useEffect(() => {
     busyRef.current = busy;
@@ -203,6 +156,37 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   useEffect(() => {
     checkRef.current = check;
   }, [check]);
+
+  // Window focus → silently re-detect the local install and re-check if the
+  // install identity (version OR path) drifted out-of-band. Parity with the mac
+  // home, which has had this since the atomic-snapshot rework; without it the
+  // Windows card can show a stale version / "managed" badge after Codex is
+  // updated or removed externally, until the next periodic check.
+  useFocusRecheck<WinInstallStatus>({
+    fetchStatus: () => managerApi.winStatus(),
+    onStatus: (st) => {
+      setStatus(st);
+      setStatusLoaded(true);
+      setStatusFailed(false);
+    },
+    hasChecked: () => reportRef.current != null,
+    checkedIdentity: () => installIdentity(reportRef.current?.installed ?? null, normalizePath),
+    identityOf: (st) => installIdentity(st.installed ?? null, normalizePath),
+    isBusy: () => busyRef.current != null,
+    onIdentityChanged: () => {
+      // Drop EVERY sheet built for the OLD target before re-checking: the
+      // confirm sheet, the fresh-install location sheet, and the manual
+      // existing-install picker. Any of them could otherwise let a click run
+      // install/perform against a snapshot the user never saw — bypassing the
+      // freshly-refreshed external→adopt boundary. The user re-confirms against
+      // the re-checked card.
+      setConfirmOpen(false);
+      setInstallDirOpen(false);
+      setManualExistingOpen(false);
+      setManualExistingCandidate(null);
+      void check();
+    },
+  });
 
   useEffect(() => {
     if (!settings.periodicCheck) return;
@@ -302,13 +286,10 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       } finally {
         unlisten();
         setBusy(null);
-        setDl(null);
-        setDownloadStop(null);
-        setDownloadStopBusy(false);
-        downloadStopRef.current = null;
+        resetStop();
       }
     },
-    [status, report, refreshStatus, check, startDlListen, t],
+    [status, report, refreshStatus, check, startDlListen, resetStop, t],
   );
 
   // 〔继续〕from the paused state — re-run the same operation (same install
@@ -559,92 +540,25 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   useHomeMotion(scopeRef, scene, { splitHeadline, success });
 
   if (progressing || paused) {
-    const installing = paused ? paused.kind === "install" : busy === "install";
-    const snap = paused ? paused.dl : dl;
-    const known = Boolean(snap && snap.total > 0);
-    const snapPct = snap && snap.total > 0 ? Math.min(100, (snap.downloaded / snap.total) * 100) : 0;
-    const pct = known ? Math.round(paused ? snapPct : dlPct) : null;
-    const barPct = paused ? snapPct : dlPct;
-    // Bytes are in → the uninterruptible install phase (sideload / portable
-    // extract). Say so and drop the dead buttons rather than grey them silently.
-    const finishing = !paused && Boolean(snap && snap.total > 0 && snap.downloaded >= snap.total);
-    // Pause only mid-transfer; cancel is the "abandon" out and works through the
-    // preparing phase too (a backend abort checkpoint honors it), but not once
-    // the install has begun.
-    const canPause =
-      !paused && Boolean(dl && dl.total > 0 && dl.downloaded < dl.total) && !downloadStopBusy;
-    const canCancel = !paused && !finishing && !downloadStopBusy;
     return (
-      <div className="pop">
-        <TopBar />
-        <div className="scroll" ref={scopeRef}>
-          <div className="hero" style={{ marginTop: 24 }} key={scene}>
-            <Ring icon={paused ? "pause" : "loader"} spin={!paused} className="glow" />
-            <div className={`headline${paused ? "" : " shimmer"}`}>
-              {paused
-                ? t("progress.paused.title")
-                : installing
-                  ? t("progress.installing")
-                  : t("progress.title")}
-            </div>
-            {!paused ? (
-              <div className="sub">
-                {finishing
-                  ? t("progress.finishing")
-                  : snap
-                    ? t("progress.downloadingFrom", { source: snap.source })
-                    : t("progress.preparing")}
-              </div>
-            ) : null}
-            {pct !== null ? (
-              <div className="pctbig">
-                {pct}
-                <span className="pctsign">%</span>
-              </div>
-            ) : null}
-            <div className="bar">
-              <div
-                className={`bar-fill${pct === null ? " indeterminate" : ""}`}
-                style={pct === null ? undefined : { width: `${barPct}%` }}
-              />
-            </div>
-            {known && snap ? (
-              <div className="dlmeta">
-                {mib(paused ? snap.downloaded : dlBytes)} / {mib(snap.total)}
-                {!paused && dlSpeed > 0 ? ` · ${mib(dlSpeed)}/s` : ""}
-              </div>
-            ) : null}
-            <div className="progress-actions">
-              {paused ? (
-                <button className="btn primary" onClick={resumeDownload}>
-                  <Icon name="play" />
-                  {t("progress.resume")}
-                </button>
-              ) : (
-                <button
-                  className="btn ghost"
-                  onClick={() => void requestDownloadStop("pause")}
-                  disabled={!canPause}
-                >
-                  <Icon name="pause" />
-                  {downloadStop === "pause" ? t("progress.pausePending") : t("progress.pause")}
-                </button>
-              )}
-              <button
-                className="btn danger"
-                onClick={() => {
-                  if (paused) cancelPausedDownload();
-                  else void requestDownloadStop("cancel");
-                }}
-                disabled={!paused && !canCancel}
-              >
-                <Icon name="close" />
-                {downloadStop === "cancel" ? t("progress.cancelPending") : t("progress.cancel")}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
+      <ProgressScreen
+        scene={scene}
+        scopeRef={scopeRef}
+        paused={paused}
+        dl={dl}
+        dlPct={dlPct}
+        dlBytes={dlBytes}
+        dlSpeed={dlSpeed}
+        installing={paused ? paused.kind === "install" : busy === "install"}
+        downloadStop={downloadStop}
+        downloadStopBusy={downloadStopBusy}
+        onResume={resumeDownload}
+        onPause={() => void requestDownloadStop("pause")}
+        onCancel={() => {
+          if (paused) void cancelPausedDownload();
+          else void requestDownloadStop("cancel");
+        }}
+      />
     );
   }
 

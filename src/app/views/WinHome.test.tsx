@@ -1,6 +1,8 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { listen } from "@tauri-apps/api/event";
 
 import { managerApi } from "../../services/managerApi";
 import type {
@@ -237,5 +239,41 @@ describe("WinHome state machine", () => {
     );
     // Switching re-plans so the route (and the banner) can settle.
     await waitFor(() => expect(api.winPlanUpdate.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("closes the install-dir sheet when a focus re-check finds the install drifted", async () => {
+    const user = userEvent.setup();
+    // Capture the focus-recheck listener so the test can fire it.
+    let onFocus: (() => void) | undefined;
+    vi.mocked(listen).mockImplementation((event: string, cb: unknown) => {
+      if (event === "tauri://focus") onFocus = cb as () => void;
+      return Promise.resolve(() => {});
+    });
+    // Portable fresh-install: no install yet, so clicking install opens the
+    // install-dir sheet instead of running straight away.
+    api.getSettings.mockResolvedValue(settings({ windowsInstallMode: "portable" }));
+    api.winStatus.mockResolvedValue({ installed: null, status: "none" });
+    api.winPlanUpdate.mockResolvedValue(
+      report({ installed: null, plan: { ...PLAN_UPDATE, route: "portable-fallback" } }),
+    );
+    renderWinHome();
+
+    await user.click(await screen.findByRole("button", { name: /安装 Codex/ }));
+    // The location sheet is up (fresh portable install needs a target).
+    expect(await screen.findByText("选择安装位置")).toBeInTheDocument();
+
+    // Codex appears out-of-band; the focus probe now sees a managed install —
+    // an identity change from the null snapshot the sheet was built against.
+    api.winStatus.mockResolvedValue(STATUS_MANAGED);
+    await waitFor(() => expect(onFocus).toBeDefined());
+    await act(async () => {
+      onFocus?.();
+      await Promise.resolve();
+    });
+
+    // The stale install-dir sheet must be gone — otherwise its 使用当前位置 /
+    // 浏览 buttons could still run install against the vanished snapshot,
+    // bypassing the external→adopt boundary.
+    await waitFor(() => expect(screen.queryByText("选择安装位置")).not.toBeInTheDocument());
   });
 });
