@@ -51,6 +51,10 @@ export function useFocusTrap(
     active?: boolean;
   },
 ) {
+  // Destructure so the effect depends on the specific option values (stable
+  // primitives / callbacks) rather than the freshly-spread `opts` object, which
+  // would re-arm the trap every render.
+  const { onEsc, initialFocus } = opts;
   const active = opts.active ?? true;
   useEffect(() => {
     const node = ref.current;
@@ -61,13 +65,13 @@ export function useFocusTrap(
 
     const focusables = getFocusable(node);
     const pick = () => {
-      if (opts.initialFocus === "dismiss") {
+      if (initialFocus === "dismiss") {
         return node.querySelector<HTMLElement>(".btn.ghost") ?? focusables[0];
       }
-      if (opts.initialFocus === "primary") {
+      if (initialFocus === "primary") {
         return node.querySelector<HTMLElement>(".btn.primary, .btn.danger") ?? focusables[0];
       }
-      if (opts.initialFocus === "container") {
+      if (initialFocus === "container") {
         node.tabIndex = -1;
         return node;
       }
@@ -79,7 +83,7 @@ export function useFocusTrap(
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        opts.onEsc?.();
+        onEsc?.();
         return;
       }
       if (event.key !== "Tab") {
@@ -99,5 +103,5 @@ export function useFocusTrap(
         opener.focus();
       }
     };
-  }, [ref, opts.onEsc, opts.initialFocus, active]);
+  }, [ref, onEsc, initialFocus, active]);
 }

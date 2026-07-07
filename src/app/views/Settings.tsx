@@ -1,7 +1,7 @@
 import { useEffect, useId, useState } from "react";
 
 import { errorMessage, managerApi } from "../../services/managerApi";
-import type { AppSettings, ProxyMode, UpdateSourceKind, WindowsInstallMode } from "../../shared/types";
+import type { ProxyMode, UpdateSourceKind, WindowsInstallMode } from "../../shared/types";
 import { DEFAULT_SETTINGS } from "../../shared/types";
 import { Icon } from "../icons";
 import { useI18n, LANGS, type Lang, type TFn, type TKey } from "../i18n";
@@ -209,6 +209,9 @@ export function Settings({
         {/* 更新源 */}
         <div className="group">
           <div className="group-h">{t("settings.source.header")}</div>
+          {/* Roving-tabindex radiogroup — the child radios carry focus + Tab, so
+              the group is correctly non-focusable (WAI-ARIA APG). */}
+          {/* eslint-disable-next-line jsx-a11y/interactive-supports-focus */}
           <div
             className="list"
             role="radiogroup"
@@ -272,6 +275,8 @@ export function Settings({
         {win ? (
           <div className="group">
             <div className="group-h">{t("settings.windows.header")}</div>
+            {/* Roving-tabindex radiogroup — child radios carry focus + Tab. */}
+            {/* eslint-disable-next-line jsx-a11y/interactive-supports-focus */}
             <div
               className="list"
               role="radiogroup"
@@ -642,6 +647,8 @@ export function Settings({
         initialFocus="first"
       >
         <h3 id={langTitleId}>{t("settings.appearance.language")}</h3>
+        {/* Roving-tabindex radiogroup — child radios carry focus + Tab. */}
+        {/* eslint-disable-next-line jsx-a11y/interactive-supports-focus */}
         <div
           className="langgrid"
           style={{ marginTop: 14 }}

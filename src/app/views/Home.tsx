@@ -83,7 +83,6 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // shared with the Windows home; only the channel + stop commands differ.
   const {
     dl,
-    setDl,
     dlRef,
     dlPct,
     dlBytes,
@@ -244,7 +243,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       setBusy(null);
       resetStop();
     }
-  }, [check, startDlListen, resetStop, t]);
+  }, [check, startDlListen, resetStop, dlRef, downloadStopRef, t]);
 
   const runPerform = useCallback(async () => {
     // ONE atomic snapshot (the report carries installed + plan detected
@@ -300,7 +299,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       setBusy(null);
       resetStop();
     }
-  }, [report, check, startDlListen, resetStop, t]);
+  }, [report, check, startDlListen, resetStop, dlRef, downloadStopRef, t]);
 
   // 〔继续〕from the paused state — re-run the same operation. The backend finds
   // the cached `.part` and resumes via `curl -C -`, so the bar picks up where it
