@@ -40,4 +40,49 @@ describe("installGlobalErrorHandlers", () => {
 
     window.removeEventListener("cam:fatal", fatal);
   });
+
+  it("ignores benign ResizeObserver noise entirely", () => {
+    const fatal = vi.fn();
+    window.addEventListener("cam:fatal", fatal);
+    installGlobalErrorHandlers();
+
+    window.dispatchEvent(
+      new ErrorEvent("error", {
+        message: "ResizeObserver loop completed with undelivered notifications.",
+      }),
+    );
+
+    expect(reportFrontendError).not.toHaveBeenCalled();
+    expect(fatal).not.toHaveBeenCalled();
+    window.removeEventListener("cam:fatal", fatal);
+  });
+
+  it("still escalates non-Error throwables to fatal", () => {
+    const fatal = vi.fn();
+    window.addEventListener("cam:fatal", fatal);
+    installGlobalErrorHandlers();
+
+    // `throw "boom"` — event.error is set but is not an Error instance.
+    window.dispatchEvent(new ErrorEvent("error", { message: "boom", error: "boom" }));
+
+    expect(reportFrontendError).toHaveBeenCalledTimes(1);
+    expect(fatal).toHaveBeenCalledTimes(1);
+    window.removeEventListener("cam:fatal", fatal);
+  });
+
+  it("reports error-less window.error events without escalating to fatal", () => {
+    const fatal = vi.fn();
+    window.addEventListener("cam:fatal", fatal);
+    installGlobalErrorHandlers();
+
+    // e.g. a failed resource load: the event carries a message but no Error.
+    window.dispatchEvent(new ErrorEvent("error", { message: "Script load failed" }));
+
+    expect(reportFrontendError).toHaveBeenCalledTimes(1);
+    expect(reportFrontendError).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "window.error", message: "Script load failed" }),
+    );
+    expect(fatal).not.toHaveBeenCalled();
+    window.removeEventListener("cam:fatal", fatal);
+  });
 });

@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 
 import { useFocusTrap } from "./useFocusTrap";
 
-// Keep in sync with the longest `.sheet-frame.is-closing` exit transition in
-// styles.css — once it elapses the sheet is actually unmounted.
-const CLOSE_MS = 240;
+// Upper bound on the exit. Unmount is driven by the frame's animationend
+// (the `.is-closing` exit is a CSS animation); this only needs to be ≥ the
+// longest exit in styles.css, as the safety net for environments where the
+// animation never fires (jsdom, display:none ancestors).
+const CLOSE_FALLBACK_MS = 400;
 
 function prefersReducedMotion(): boolean {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
@@ -30,12 +32,15 @@ export function Sheet({
   children: ReactNode;
 }) {
   const sheetRef = useRef<HTMLDivElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
   // Keep the sheet in the DOM through its exit. `mounted` only *lags* `open` on
   // close: presence is `open || mounted`, so opening shows the node immediately
   // (the focus trap can grab focus the same render) while closing keeps the same
   // node around. The closing flag is derived live as `!open`, so the frame `open`
   // flips false the *existing* node gains `.is-closing` and the exit transition
-  // animates from its current state — then a timer drops `mounted` to unmount.
+  // animates from its current state — unmount happens on the frame's own
+  // animationend (with a timeout safety net), so the CSS duration can change
+  // without touching this file.
   // (Driving `.is-closing` off an effect-set state instead would unmount the node
   // before the class lands, so the exit would never play.)
   const [mounted, setMounted] = useState(open);
@@ -50,8 +55,17 @@ export function Sheet({
       setMounted(false);
       return;
     }
-    const id = window.setTimeout(() => setMounted(false), CLOSE_MS);
-    return () => window.clearTimeout(id);
+    const frame = frameRef.current;
+    const finish = () => setMounted(false);
+    const onAnimationEnd = (event: AnimationEvent) => {
+      if (event.target === frame) finish();
+    };
+    frame?.addEventListener("animationend", onAnimationEnd);
+    const id = window.setTimeout(finish, CLOSE_FALLBACK_MS);
+    return () => {
+      frame?.removeEventListener("animationend", onAnimationEnd);
+      window.clearTimeout(id);
+    };
   }, [open, mounted]);
 
   // Ignore dismissals once the exit is playing (`open` already false). The trap
@@ -73,6 +87,7 @@ export function Sheet({
   return (
     <div className={`${scrimClass}${closing ? " is-closing" : ""}`} onClick={dismiss}>
       <div
+        ref={frameRef}
         className={`sheet-frame${closing ? " is-closing" : ""}`}
         onClick={(event) => event.stopPropagation()}
       >

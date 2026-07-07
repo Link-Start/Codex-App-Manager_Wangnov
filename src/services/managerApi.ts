@@ -391,6 +391,74 @@ const FALLBACK_DIAGNOSTICS: Diagnostics = {
   generatedAtUnix: Math.floor(Date.now() / 1000),
 };
 
+// ── Contract guards ──────────────────────────────────────────────────────────
+// invoke<T>() is a bare type assertion: if the backend contract drifts (field
+// renamed, made nullable), the UI would otherwise crash deep in a render with
+// an unhelpful stack. Guard the load-bearing read paths — the report/status
+// shapes every home-screen decision keys on — and fail them as a readable
+// CommandError instead. Only structural keystones are checked, not every
+// field: enough to catch a desynced engine, cheap enough to never drift far
+// from the real types.
+
+function contractError(what: string): CommandError {
+  return {
+    code: "contract_mismatch",
+    message: `Backend returned an unexpected ${what} shape — the app and its engine may be out of sync. Reinstalling the manager usually fixes this.`,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object";
+}
+
+function guardMacStatus(status: MacInstallStatus): MacInstallStatus {
+  const s = status as unknown;
+  if (
+    !isRecord(s) ||
+    typeof s.status !== "string" ||
+    (s.installed !== null && !(isRecord(s.installed) && typeof s.installed.build === "number"))
+  ) {
+    throw contractError("macOS install status");
+  }
+  return status;
+}
+
+function guardMacReport(report: MacUpdateReport): MacUpdateReport {
+  const r = report as unknown;
+  if (
+    !isRecord(r) ||
+    (r.installed !== null && !(isRecord(r.installed) && typeof r.installed.build === "number")) ||
+    (r.plan !== null && !(isRecord(r.plan) && typeof r.plan.upToDate === "boolean"))
+  ) {
+    throw contractError("macOS update report");
+  }
+  return report;
+}
+
+function guardWinStatus(status: WinInstallStatus): WinInstallStatus {
+  const s = status as unknown;
+  if (
+    !isRecord(s) ||
+    typeof s.status !== "string" ||
+    (s.installed !== null && !(isRecord(s.installed) && typeof s.installed.version === "string"))
+  ) {
+    throw contractError("Windows install status");
+  }
+  return status;
+}
+
+function guardWinReport(report: WinUpdateReport): WinUpdateReport {
+  const r = report as unknown;
+  if (
+    !isRecord(r) ||
+    !(isRecord(r.plan) && typeof r.plan.upToDate === "boolean") ||
+    (r.installed !== null && !(isRecord(r.installed) && typeof r.installed.version === "string"))
+  ) {
+    throw contractError("Windows update report");
+  }
+  return report;
+}
+
 export const managerApi = {
   armDestructive(kind: OperationKind): Promise<OperationToken> {
     if (!hasTauriRuntime()) {
@@ -404,7 +472,7 @@ export const managerApi = {
     }
     return invoke<MacUpdateReport>("mac_plan_update", {
       simulatedBuild: simulatedBuild ?? null,
-    });
+    }).then(guardMacReport);
   },
   // Destructive: reconstruct + codesign-gate + atomic swap + relaunch (or
   // rollback). `confirm` must be true; the backend rejects it otherwise. Guarded
@@ -463,7 +531,7 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return Promise.resolve({ installed: null, status: "none" });
     }
-    return invoke<MacInstallStatus>("mac_status");
+    return invoke<MacInstallStatus>("mac_status").then(guardMacStatus);
   },
   macAdopt(): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {
@@ -679,7 +747,7 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return Promise.resolve(WIN_FALLBACK_PLAN);
     }
-    return invoke<WinUpdateReport>("win_plan_update");
+    return invoke<WinUpdateReport>("win_plan_update").then(guardWinReport);
   },
   winPauseDownload(): Promise<boolean> {
     if (!hasTauriRuntime()) {
@@ -742,7 +810,7 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return Promise.resolve({ installed: WIN_FALLBACK_INSTALLED, status: "managed" });
     }
-    return invoke<WinInstallStatus>("win_status");
+    return invoke<WinInstallStatus>("win_status").then(guardWinStatus);
   },
   winAdopt(): Promise<WinInstallStatus> {
     if (!hasTauriRuntime()) {
