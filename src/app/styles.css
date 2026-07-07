@@ -1986,8 +1986,8 @@ button.row.danger:hover {
    down. Driven by an animation (not a transition) so it fires reliably the
    instant `.is-closing` lands — the resting `.sheet-frame`/`.scrim` carry no
    transition to interpolate from, so a same-frame transition wouldn't tween. The
-   Sheet component holds the node mounted for the duration (CLOSE_MS) before
-   unmounting, so dismiss no longer hard-cuts. */
+   Sheet component holds the node mounted until the frame's animationend (plus
+   a timeout safety net), so dismiss no longer hard-cuts. */
 @keyframes scrim-out {
   to {
     opacity: 0;

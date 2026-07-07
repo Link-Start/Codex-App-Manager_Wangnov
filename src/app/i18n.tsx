@@ -2455,7 +2455,9 @@ export function I18nProvider({ children }: { children: ReactNode }) {
       let s = CATALOG[lang][key] ?? CATALOG.en[key] ?? key;
       if (vars) {
         for (const [k, v] of Object.entries(vars)) {
-          s = s.replace(new RegExp(`\\{${k}\\}`, "g"), String(v));
+          // split/join, not String.replace: an interpolated value containing
+          // "$&"/"$1" (e.g. a path or an error string) must land verbatim.
+          s = s.split(`{${k}}`).join(String(v));
         }
       }
       return s;
