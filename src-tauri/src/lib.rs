@@ -10,10 +10,46 @@ use std::sync::atomic::Ordering;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
+use crate::app::op_phase::QuitPolicy;
+
 /// The "ask before closing" setting, read fresh from disk so a toggle in
 /// Settings takes effect immediately (no restart).
 fn confirm_close_enabled() -> bool {
     crate::app::settings_store::AppSettings::load().confirm_close
+}
+
+/// Unified quit/close policy: phase-aware + confirm_close setting.
+fn quit_policy_for(app: &tauri::AppHandle) -> QuitPolicy {
+    let state = app.state::<state::ManagerState>();
+    let force = state.force_quit.load(Ordering::SeqCst);
+    state
+        .operations
+        .quit_policy(force, confirm_close_enabled())
+}
+
+/// Apply a quit policy decision for window/menu/exit paths.
+/// Returns `true` when the caller should proceed to exit.
+fn apply_quit_policy(app: &tauri::AppHandle, policy: &QuitPolicy) -> bool {
+    match policy {
+        QuitPolicy::Allow => true,
+        QuitPolicy::Confirm => {
+            let _ = app.emit("app://confirm-quit", ());
+            false
+        }
+        QuitPolicy::Block {
+            phase,
+            reason,
+            kind,
+        } => {
+            log::warn!(
+                "quit blocked phase={} kind={:?} reason={reason}",
+                phase.as_str(),
+                kind
+            );
+            let _ = app.emit("app://quit-blocked", policy);
+            false
+        }
+    }
 }
 
 /// macOS routes Cmd+Q through the app-menu Quit item, which terminates *below*
@@ -178,6 +214,22 @@ pub fn run() {
             }
             let operations = app.state::<state::ManagerState>().operations.clone();
             tauri::async_runtime::spawn_blocking(move || {
+                // Crash-safe install recovery MUST run before ordinary staging
+                // cleanup so recovery materials (backup / staged new) are not
+                // deleted out from under an incomplete swap.
+                let recovery = crate::app::install_tx::recover_pending_transactions();
+                if recovery.failed > 0 || recovery.kept_manual > 0 {
+                    log::warn!(
+                        "install transaction recovery finished scanned={} continued={} rolled_back={} completed={} cleared={} kept_manual={} failed={}",
+                        recovery.scanned,
+                        recovery.continued,
+                        recovery.rolled_back,
+                        recovery.completed,
+                        recovery.cleared,
+                        recovery.kept_manual,
+                        recovery.failed
+                    );
+                }
                 let summary = crate::app::staging::cleanup_stale_staging(&operations);
                 if summary.failed > 0 {
                     log::warn!(
@@ -206,18 +258,13 @@ pub fn run() {
             }
             Ok(())
         })
-        // Our custom macOS Quit item lands here (Cmd+Q). Same guard as the
-        // window close: confirm first unless already confirmed / guard off.
+        // Our custom macOS Quit item lands here (Cmd+Q). Same phase-aware policy
+        // as window close / ExitRequested.
         .on_menu_event(|app, event| {
             if event.id().0.as_str() == "cam-quit" {
-                let confirmed = app
-                    .state::<state::ManagerState>()
-                    .force_quit
-                    .load(Ordering::SeqCst);
-                if confirmed || !confirm_close_enabled() {
+                let policy = quit_policy_for(app);
+                if apply_quit_policy(app, &policy) {
                     app.exit(0);
-                } else {
-                    let _ = app.emit("app://confirm-quit", ());
                 }
             }
         })
@@ -227,38 +274,29 @@ pub fn run() {
         // an explicit, off-by-default opt-in (see Settings).
         //
         // The window has no system chrome, so every window-close path — the
-        // in-app ✕, Alt+F4, the macOS window close — arrives here. Unless the
-        // user already confirmed (or turned the guard off) we hold the close and
-        // ask the UI to raise the confirm dialog instead of quitting.
+        // in-app ✕, Alt+F4, the macOS window close — arrives here. Policy is
+        // phase-aware: point-of-no-return install steps block quit; otherwise
+        // the confirm_close setting may raise a dialog.
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
-                let confirmed = app
-                    .state::<state::ManagerState>()
-                    .force_quit
-                    .load(Ordering::SeqCst);
-                if confirmed || !confirm_close_enabled() {
+                let policy = quit_policy_for(app);
+                if apply_quit_policy(app, &policy) {
                     app.exit(0);
                 } else {
                     api.prevent_close();
-                    let _ = window.emit("app://confirm-quit", ());
                 }
             }
         })
         .build(tauri::generate_context!())
         .expect("failed to build Codex App Manager")
         // Cmd+Q (and any other app-level quit) lands as ExitRequested rather than
-        // a window CloseRequested — gate it the same way so the close-confirm
-        // setting is honored there too.
+        // a window CloseRequested — gate it with the same phase-aware policy.
         .run(|app, event| {
             if let RunEvent::ExitRequested { api, .. } = event {
-                let confirmed = app
-                    .state::<state::ManagerState>()
-                    .force_quit
-                    .load(Ordering::SeqCst);
-                if !confirmed && confirm_close_enabled() {
+                let policy = quit_policy_for(app);
+                if !apply_quit_policy(app, &policy) {
                     api.prevent_exit();
-                    let _ = app.emit("app://confirm-quit", ());
                 }
             }
         });
