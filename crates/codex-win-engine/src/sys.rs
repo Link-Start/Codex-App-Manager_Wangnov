@@ -889,21 +889,64 @@ fn detect_msix_install() -> Option<InstalledWindowsCodex> {
 }
 
 pub fn detect_portable_install(portable_root: &Path) -> Option<InstalledWindowsCodex> {
-    let exe = portable_root.join("Codex.exe");
-    if !exe.exists() {
-        return None;
-    }
-    let identity = std::fs::read_to_string(portable_root.join("AppxManifest.xml"))
-        .ok()
-        .and_then(|xml| parse_appx_manifest_xml(&xml).ok());
+    // Entry-exe aware (manifest-declared, ChatGPT.exe/Codex.exe fallback) so
+    // both pre- and post-rebrand portable payloads are recognized.
+    let exe = crate::portable::installed_app_exe(portable_root)?;
+    // Identity gate: an entry executable alone is not product identity — a
+    // ChatGPT Classic payload also ships a root-level ChatGPT.exe.
+    //   - With a manifest present (our installer always writes one), it must
+    //     declare exactly the Codex package identity; a foreign or unparseable
+    //     manifest is never a Codex install.
+    //   - Without a manifest (a user-unpacked `app/` dir or a legacy adopted
+    //     root), fall back to the payload's package-level identity: the
+    //     `name` in app.asar's package.json. MSIX-internal executables carry
+    //     no embedded Authenticode (integrity lives in the package-level
+    //     AppxSignature.p7x, which does not survive unpacking), so signature
+    //     checks cannot recognize these roots — the asar marker can.
+    let identity = match std::fs::read_to_string(portable_root.join("AppxManifest.xml")) {
+        Ok(xml) => match parse_appx_manifest_xml(&xml) {
+            Ok(identity) if identity.name == crate::OPENAI_PACKAGE_IDENTITY => Some(identity),
+            Ok(identity) => {
+                log::debug!(
+                    "portable root at {} declares identity {} (expected {}); not a Codex install",
+                    portable_root.display(),
+                    identity.name,
+                    crate::OPENAI_PACKAGE_IDENTITY
+                );
+                return None;
+            }
+            Err(err) => {
+                log::debug!(
+                    "portable root at {} has an unparseable AppxManifest.xml ({err}); not a Codex install",
+                    portable_root.display()
+                );
+                return None;
+            }
+        },
+        Err(_) => {
+            let asar_name = crate::app_version::read_asar_package_name_from_install_root(portable_root);
+            if asar_name.as_deref() != Some(crate::app_version::CODEX_ASAR_PACKAGE_NAME) {
+                log::debug!(
+                    "portable root at {} has no manifest and its app payload name is {:?} (expected {}); not a Codex install",
+                    portable_root.display(),
+                    asar_name,
+                    crate::app_version::CODEX_ASAR_PACKAGE_NAME
+                );
+                return None;
+            }
+            None
+        }
+    };
 
     let installed = InstalledWindowsCodex {
         path: portable_root.to_string_lossy().into_owned(),
         version: identity
             .as_ref()
-            .map(|i| i.version.clone())
+            .map(|identity| identity.version.clone())
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        arch: identity.as_ref().map(|i| i.processor_architecture.clone()),
+        arch: identity
+            .as_ref()
+            .map(|identity| identity.processor_architecture.clone()),
         source: "portable".to_string(),
         package_family_name: None,
         installed_at: path_mtime_secs(&exe.to_string_lossy()),
@@ -925,7 +968,14 @@ pub fn launch_codex_with_options(
     options: LaunchOptions,
 ) -> Result<(), EngineError> {
     if installed.source == "portable" {
-        let exe = Path::new(&installed.path).join("Codex.exe");
+        let root = Path::new(&installed.path);
+        let exe = crate::portable::installed_app_exe(root)
+            .ok_or_else(|| {
+                EngineError::Io(format!(
+                    "no app entry executable (ChatGPT.exe / Codex.exe) in {}",
+                    root.display()
+                ))
+            })?;
         // CREATE_NO_WINDOW only suppresses a console flash; the GUI still shows.
         let mut command = hidden_command(exe);
         if options.disable_codex_self_updates {
@@ -1301,5 +1351,94 @@ mod tests {
             reason: String::new(),
         };
         assert!(!inconsistent.should_route_portable());
+    }
+}
+
+#[cfg(test)]
+mod portable_identity_tests {
+    use super::detect_portable_install;
+    use std::path::Path;
+
+    fn write_root(name: &str, exe: &str, manifest: Option<&str>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("codex-sys-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(exe), b"fake exe").unwrap();
+        if let Some(identity_name) = manifest {
+            std::fs::write(
+                root.join("AppxManifest.xml"),
+                format!(
+                    r#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="{identity_name}" Publisher="CN=OpenAI OpCo, LLC" Version="26.707.3748.0" ProcessorArchitecture="x64" />
+  <Applications><Application Id="App" Executable="app/{exe}" /></Applications>
+</Package>"#
+                ),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_rebranded_portable_with_codex_identity() {
+        let root = write_root("rebrand", "ChatGPT.exe", Some("OpenAI.Codex"));
+        let installed = detect_portable_install(&root).expect("codex identity accepted");
+        assert_eq!(installed.version, "26.707.3748.0");
+        assert_eq!(installed.source, "portable");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rejects_portable_with_foreign_identity() {
+        // Same file shape as an unpacked ChatGPT Classic: entry exe + manifest,
+        // but the identity is not OpenAI.Codex — never a Codex install.
+        let root = write_root("classic", "ChatGPT.exe", Some("OpenAI.ChatGPT"));
+        assert!(detect_portable_install(&root).is_none());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rejects_portable_without_manifest_identity() {
+        // Without a manifest the gate falls back to the app.asar package-name
+        // marker; this root has no asar at all, so it is not recognized.
+        let root = write_root("no-manifest", "Codex.exe", None);
+        assert!(detect_portable_install(&root).is_none());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn accepts_manifestless_portable_with_codex_asar_marker() {
+        // A user-unpacked official `app/` dir: no package-root manifest, but
+        // the payload's asar carries the Codex package name — the supported
+        // self-extracted layout must stay detectable/adoptable.
+        let root = write_root("selfextracted", "ChatGPT.exe", None);
+        let resources = root.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        crate::app_version::write_test_asar(
+            &resources.join("app.asar"),
+            br#"{"version":"26.707.31428","name":"openai-codex-electron"}"#,
+        );
+        let installed = detect_portable_install(&root).expect("asar marker accepted");
+        assert_eq!(installed.version, "26.707.31428");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rejects_manifestless_portable_with_foreign_asar_name() {
+        // Same shape but a non-Codex Electron payload (e.g. an unpacked
+        // Classic): the asar package name differs, so it is never adopted.
+        let root = write_root("foreign-asar", "ChatGPT.exe", None);
+        let resources = root.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        crate::app_version::write_test_asar(
+            &resources.join("app.asar"),
+            br#"{"version":"1.2026.160","name":"chatgpt-desktop"}"#,
+        );
+        assert!(detect_portable_install(&root).is_none());
+        cleanup(&root);
     }
 }

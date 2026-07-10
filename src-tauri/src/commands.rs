@@ -418,7 +418,10 @@ fn is_protected_install_root(path: &Path) -> bool {
 }
 
 fn is_existing_codex_portable_root(path: &Path) -> bool {
-    path.join("Codex.exe").is_file() && path.join("AppxManifest.xml").is_file()
+    // Identity-gated (entry exe + AppxManifest Identity == OpenAI.Codex): a
+    // directory that merely contains a ChatGPT.exe (e.g. an unpacked ChatGPT
+    // Classic) must not be treated as a replaceable Codex install.
+    codex_win_engine::detect_portable_install(path).is_some()
 }
 
 fn directory_is_empty(path: &Path) -> Result<bool, AppError> {
@@ -642,7 +645,9 @@ pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, Com
     crate::app::mac_update::mac_adopt().map_err(Into::into)
 }
 
-/// macOS-only: let the user pick an existing Codex.app and validate it.
+/// macOS-only: let the user pick an existing Codex install and validate it.
+/// The bundle may be named Codex.app or (post-rebrand) ChatGPT.app — validation
+/// is by CFBundleIdentifier, so ChatGPT Classic is rejected with a clear error.
 #[tauri::command]
 pub async fn mac_pick_existing_install(
     app: tauri::AppHandle,
@@ -655,7 +660,7 @@ pub async fn mac_pick_existing_install(
     let selected = tauri::async_runtime::spawn_blocking(move || {
         app.dialog()
             .file()
-            .set_title("选择 Codex.app")
+            .set_title("选择 Codex 应用（Codex.app 或 ChatGPT.app）")
             .set_directory(start_dir)
             .blocking_pick_file()
             .map(|path| {
@@ -1622,16 +1627,47 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn write_portable_manifest(root: &std::path::Path, identity_name: &str) {
+        fs::write(
+            root.join("AppxManifest.xml"),
+            format!(
+                r#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="{identity_name}" Publisher="CN=OpenAI OpCo, LLC" Version="26.707.3748.0" ProcessorArchitecture="x64" />
+</Package>"#
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn accepts_existing_codex_portable_install_root() {
         let root = temp_path("codex-manager-existing-portable-root");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("Codex.exe"), b"codex").unwrap();
-        fs::write(root.join("AppxManifest.xml"), b"<Package />").unwrap();
+        write_portable_manifest(&root, "OpenAI.Codex");
 
         let validated = validate_install_root_path(&root.to_string_lossy()).unwrap();
         assert_eq!(validated, root.to_string_lossy());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_portable_root_with_foreign_identity() {
+        // An unpacked non-Codex payload (e.g. ChatGPT Classic) also carries a
+        // root-level ChatGPT.exe + AppxManifest.xml. Its identity fails the
+        // gate, so the non-empty directory must NOT be treated as replaceable.
+        let root = temp_path("codex-manager-foreign-portable-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ChatGPT.exe"), b"classic").unwrap();
+        write_portable_manifest(&root, "OpenAI.ChatGPT");
+
+        let err = validate_install_root_path(&root.to_string_lossy()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("安装位置必须是空文件夹，或已有的 Codex 免安装版目录"));
 
         let _ = fs::remove_dir_all(root);
     }

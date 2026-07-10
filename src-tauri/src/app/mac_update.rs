@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use codex_mac_engine::{
-    apply_delta, download, gate_reconstructed, parse_appcast, plan_update, quit_codex, relaunch,
-    rollback, swap::codex_running, swap_in_place, sys, verify_sparkle, Appcast, NetworkConfig,
+    apply_delta, download, gate_reconstructed, parse_appcast, plan_update, quit_codex_at, relaunch,
+    rollback, swap::codex_running_at, swap_in_place, sys, verify_sparkle, Appcast, NetworkConfig,
     UpdatePlan, UpdateStrategy,
 };
 
@@ -244,21 +244,77 @@ fn detect_installed() -> Option<InstalledCodex> {
 pub fn detect_existing_install_at_path(path: &Path) -> Result<InstalledCodex, AppError> {
     if !path.exists() {
         return Err(AppError::Internal(
-            "所选位置不存在，请选择已安装的 Codex.app".to_string(),
+            "所选位置不存在，请选择已安装的 Codex 应用".to_string(),
         ));
     }
     if !path.is_dir() {
-        return Err(AppError::Internal("所选位置必须是 Codex.app".to_string()));
-    }
-    if path.file_name().and_then(|name| name.to_str()) != Some("Codex.app") {
         return Err(AppError::Internal(
-            "请选择 Codex.app，而不是它的上级文件夹".to_string(),
+            "所选位置必须是应用包（.app）".to_string(),
+        ));
+    }
+    // Identity, not name: after the upstream ChatGPT-brand merge the Codex
+    // bundle may be named ChatGPT.app, while /Applications/ChatGPT.app can just
+    // as well be ChatGPT Classic. Only CFBundleIdentifier can tell them apart.
+    if path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        return Err(AppError::Internal(
+            "请选择 Codex 应用本体（.app），而不是它的上级文件夹".to_string(),
         ));
     }
     let raw = path.to_string_lossy();
+    match sys::read_bundle_identifier(&raw).as_deref() {
+        Some(sys::CODEX_BUNDLE_ID) => {}
+        Some("com.openai.chat") => {
+            return Err(AppError::Internal(
+                "所选应用是 ChatGPT Classic（com.openai.chat），不是 Codex；本工具只管理 Codex"
+                    .to_string(),
+            ));
+        }
+        Some(other) => {
+            return Err(AppError::Internal(format!(
+                "所选应用不是 Codex（CFBundleIdentifier 为 {other}，期望 {}）",
+                sys::CODEX_BUNDLE_ID
+            )));
+        }
+        None => {
+            return Err(AppError::Internal(
+                "无法读取所选应用的 CFBundleIdentifier，请选择已安装的 Codex 应用".to_string(),
+            ));
+        }
+    }
+    require_not_translocation_risk(&raw)?;
     let (detected_path, build) = sys::installed_codex_build_at_path(&raw)
-        .ok_or_else(|| AppError::Internal("无法读取所选 Codex.app 的版本信息".to_string()))?;
+        .ok_or_else(|| AppError::Internal("无法读取所选 Codex 应用的版本信息".to_string()))?;
     Ok(installed_from_path_build(detected_path, build))
+}
+
+/// Refuse paths macOS would run through App Translocation: the live process
+/// then sits on a randomized mount, every path-scoped run/quit protection is
+/// blind to it, and a swap/uninstall could act while the app is running.
+/// Checked at adoption AND re-checked right before each destructive tail
+/// (the attribute can appear later, e.g. after a re-download over the path).
+fn require_not_translocation_risk(app: &str) -> Result<(), AppError> {
+    if sys::is_translocation_risk(app) {
+        return Err(AppError::Internal(
+            "该应用带有会触发 App Translocation 的 macOS 隔离属性：系统会在随机路径运行它，\
+             无法安全地检测或退出运行中的实例。请先退出该应用，再用 Finder 将它「移动」到\
+             其他位置再移回（移动会写入豁免标记），或运行 xattr -d com.apple.quarantine \
+             移除隔离属性后重试"
+                .to_string(),
+        ));
+    }
+    // De-quarantining does not migrate an ALREADY-RUNNING translocated
+    // instance back — it stays on its randomized mount, invisible to the
+    // path-scoped quit check. Refuse until it exits. (Bundle-name matching may
+    // also catch a translocated ChatGPT Classic; quitting it too is a harmless
+    // ask compared to swapping under a live process.)
+    if codex_mac_engine::swap::translocated_instance_running(Path::new(app)) {
+        return Err(AppError::Internal(
+            "检测到该应用（或同名应用）仍有一个经 App Translocation 启动的实例在运行：\
+             它不会随隔离属性的清除而迁回原路径，无法被安全退出。请先退出该应用后重试"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn detect_managed_installed() -> Option<InstalledCodex> {
@@ -409,8 +465,8 @@ fn no_progress(_p: DownloadProgress) {}
 /// automations are enabled); the engine brings that dialog frontmost after a
 /// grace period, and if the user still hasn't confirmed by the timeout we say
 /// exactly what to click instead of a bare timeout. Never force-kills.
-fn quit_codex_gracefully() -> Result<(), AppError> {
-    quit_codex(30).map_err(|_| {
+fn quit_codex_gracefully(install_app: &Path) -> Result<(), AppError> {
+    quit_codex_at(install_app, 30).map_err(|_| {
         AppError::Engine(
             "Codex 未在限时内退出——它可能正在等待退出确认（如「Quit Codex?」对话框，已尝试将其带到前台）。\
              请在 Codex 中确认退出后重试；为保护进行中的会话，不会强制结束 Codex"
@@ -642,6 +698,9 @@ fn unpack_app_zip(zip: &Path, work: &Path, out_app: &Path) -> Result<(), AppErro
         )));
     }
 
+    // The upstream archive may ship the bundle under either name (Codex.app
+    // pre-merge, ChatGPT.app post-merge); identity is checked, and the rename
+    // below normalizes whatever we accepted to the caller's canonical out_app.
     let found = require_single_codex_app(&extract)?;
     if out_app.exists() {
         let _ = std::fs::remove_dir_all(out_app);
@@ -663,7 +722,7 @@ fn require_single_codex_app(dir: &Path) -> Result<PathBuf, AppError> {
     }
     if apps.is_empty() {
         return Err(AppError::Engine(
-            "full-update zip did not contain Codex.app".to_string(),
+            "full-update zip did not contain an .app bundle".to_string(),
         ));
     }
     if apps.len() > 1 {
@@ -672,16 +731,17 @@ fn require_single_codex_app(dir: &Path) -> Result<PathBuf, AppError> {
         ));
     }
     let app = apps.remove(0);
-    if app
-        .file_name()
-        .map(|name| name == "Codex.app")
-        .unwrap_or(false)
-    {
-        Ok(app)
-    } else {
-        Err(AppError::Engine(
-            "full-update zip contained a non-Codex .app bundle".to_string(),
-        ))
+    // Accept any top-level bundle name but require the Codex product identity —
+    // the codesign gate re-asserts this against the sealed plist right after.
+    match sys::read_bundle_identifier(&app.to_string_lossy()).as_deref() {
+        Some(sys::CODEX_BUNDLE_ID) => Ok(app),
+        Some(other) => Err(AppError::Engine(format!(
+            "full-update zip contained a non-Codex .app bundle (CFBundleIdentifier {other}, expected {})",
+            sys::CODEX_BUNDLE_ID
+        ))),
+        None => Err(AppError::Engine(
+            "full-update zip's .app bundle had no readable CFBundleIdentifier".to_string(),
+        )),
     }
 }
 
@@ -912,12 +972,37 @@ pub fn perform_macos_update_with_network(
         // (so its cancel flag never arms) yet reconstruct/gate still ran.
         check_update_abort()?;
 
+        // Re-verify the TARGET right before the destructive tail: the early
+        // consent check ran before download, and the bundle at this path may
+        // have been swapped in the meantime — e.g. replaced with a ChatGPT
+        // Classic, which the identity gate inside installed_codex_build_at_path
+        // rejects. Quitting/swapping whatever sits here now would destroy
+        // something the user never confirmed.
+        match sys::installed_codex_build_at_path(&installed.path) {
+            Some((_, build)) if build == expected.from_build => {}
+            Some((_, build)) => {
+                return Err(AppError::StaleExpectation(format!(
+                    "安装目标在确认后发生了变化（当前 build {build}，确认时为 {}）：请重新检查后再试",
+                    expected.from_build
+                )));
+            }
+            None => {
+                return Err(AppError::StaleExpectation(
+                    "安装目标在确认后被移除或替换为非 Codex 应用：请重新检查后再试".to_string(),
+                ));
+            }
+        }
+        // The attribute can appear after adoption (e.g. the path was replaced
+        // by a fresh download) — a translocated live instance would be
+        // invisible to the quit check below.
+        require_not_translocation_risk(&installed.path)?;
+
         // 4b) graceful quit (never force-kill), then 5) atomic same-volume swap. If
         //     the swap fails after the quit, swap_in_place has restored the old
         //     bundle in place — bring the user's app back before surfacing the error.
-        let was_running = codex_running();
+        let was_running = codex_running_at(&install_path);
         log::info!("macOS perform step=quit");
-        quit_codex_gracefully()?;
+        quit_codex_gracefully(&install_path)?;
         log::info!("macOS perform step=swap");
         if let Err(err) = swap_in_place(&install_path, &out_app, &backup) {
             if was_running {
@@ -1050,6 +1135,12 @@ pub struct MacInstallStatus {
     pub installed: Option<InstalledCodex>,
     /// "managed" | "external" | "none"
     pub status: String,
+    /// All Codex-lineage installs when more than one exists (e.g. an old
+    /// `Codex.app` plus a hand-dragged post-rebrand `ChatGPT.app`). The UI
+    /// should surface this and have the user adopt one explicitly; destructive
+    /// operations stay safe regardless (they re-verify path + build + identity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguous_paths: Option<Vec<String>>,
 }
 
 /// Classify the installed Codex against our provenance store.
@@ -1064,13 +1155,46 @@ pub fn mac_install_status() -> MacInstallStatus {
         Some(_) => "external",
     }
     .to_string();
-    MacInstallStatus { installed, status }
+    // Report ambient ambiguity (multiple lineage installs) unless provenance
+    // already pins which install the user manages.
+    let ambiguous_paths = match &installed {
+        Some(codex) if !store.is_managed_build(&codex.path, codex.build) => {
+            let candidates = sys::installed_codex_candidates();
+            (candidates.len() > 1).then(|| candidates.into_iter().map(|(path, _)| path).collect())
+        }
+        _ => None,
+    };
+    MacInstallStatus {
+        installed,
+        status,
+        ambiguous_paths,
+    }
 }
 
 /// Adopt the detected install — record provenance after explicit user consent.
 pub fn mac_adopt() -> Result<MacInstallStatus, AppError> {
-    let installed = detect_installed()
+    // Ambient adoption picks the canonical-order first install; with several
+    // lineage installs coexisting that silently chooses for the user and every
+    // later update/uninstall would act on a target they never confirmed.
+    // Force the explicit path-picking flow instead.
+    let mut candidates = sys::installed_codex_candidates();
+    if candidates.len() > 1 {
+        let paths: Vec<String> = candidates.into_iter().map(|(path, _)| path).collect();
+        return Err(AppError::Internal(format!(
+            "检测到多个 Codex 安装（{}）。请使用「选择已安装的 Codex」手动指定要管理的那一个",
+            paths.join("、")
+        )));
+    }
+    // Adopt exactly the install the ambiguity check saw — a second scan could
+    // pick a DIFFERENT path if another install appeared in between, recording
+    // provenance for something the user never looked at.
+    let (path, build) = candidates
+        .pop()
         .ok_or_else(|| AppError::Internal("no Codex detected to adopt".to_string()))?;
+    let installed = installed_from_path_build(path, build);
+    // Same gate as the manual picker — ambient adoption must not manage a
+    // bundle whose running instance cannot be located.
+    require_not_translocation_risk(&installed.path)?;
     let path = &installed.path;
     log::info!("macOS adopt external install path={path}");
     let mut store = ProvenanceStore::load();
@@ -1357,7 +1481,10 @@ pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppE
         ));
     }
 
-    quit_codex_gracefully()?;
+    // A translocated live instance would be invisible to the quit check —
+    // re-verify before the destructive delete, same as perform.
+    require_not_translocation_risk(&installed.path)?;
+    quit_codex_gracefully(&install_path)?;
 
     // Delete first: if we lack permission to remove the bundle (e.g. a root-owned
     // install), the managed record stays intact so the user can retry without
@@ -1490,17 +1617,38 @@ mod tests {
         assert!(status.success(), "ditto {args:?} failed");
     }
 
+    fn write_bundle_plist(app: &Path, bundle_id: &str) {
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>{bundle_id}</string>
+</dict>
+</plist>
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn unpack_app_zip_surfaces_bundle() {
         let root = std::env::temp_dir().join(format!("codex-unpack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        // A synthetic Codex.app, zipped the way Sparkle ships a macOS full update
-        // (`ditto -c -k --keepParent` → the `.app` is the top-level entry).
-        let src_app = root.join("Codex.app");
-        std::fs::create_dir_all(src_app.join("Contents")).unwrap();
-        std::fs::write(src_app.join("Contents/marker"), "3575").unwrap();
+        // A synthetic post-rebrand bundle (named ChatGPT.app, Codex identity),
+        // zipped the way Sparkle ships a macOS full update (`ditto -c -k
+        // --keepParent` → the `.app` is the top-level entry). unpack must accept
+        // it by identity and normalize it to the caller's out_app name.
+        let src_app = root.join("ChatGPT.app");
+        write_bundle_plist(&src_app, sys::CODEX_BUNDLE_ID);
+        std::fs::write(src_app.join("Contents/marker"), "5059").unwrap();
         let zip = root.join("Codex.zip");
         ditto(&[
             "-c",
@@ -1518,7 +1666,7 @@ mod tests {
         assert!(out_app.join("Contents/marker").exists(), "bundle surfaced");
         assert_eq!(
             std::fs::read_to_string(out_app.join("Contents/marker")).unwrap(),
-            "3575"
+            "5059"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1532,6 +1680,26 @@ mod tests {
 
         let err = require_single_codex_app(&root).unwrap_err();
         assert!(err.to_string().contains("multiple .app"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_single_codex_app_gates_on_bundle_identity() {
+        let root = std::env::temp_dir().join(format!("codex-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // ChatGPT Classic in the archive: right name shape, wrong product.
+        let classic = root.join("classic");
+        write_bundle_plist(&classic.join("ChatGPT.app"), "com.openai.chat");
+        let err = require_single_codex_app(&classic).unwrap_err();
+        assert!(err.to_string().contains("com.openai.chat"));
+
+        // Rebranded Codex: accepted regardless of the bundle's file name.
+        let rebranded = root.join("rebranded");
+        write_bundle_plist(&rebranded.join("ChatGPT.app"), sys::CODEX_BUNDLE_ID);
+        let found = require_single_codex_app(&rebranded).unwrap();
+        assert!(found.ends_with("ChatGPT.app"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
