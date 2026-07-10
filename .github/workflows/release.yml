@@ -15,6 +15,23 @@ name: Release
 #   AC_API_KEY_BASE64            base64 of the AuthKey_XXXX.p8
 #   TAURI_SIGNING_PRIVATE_KEY            updater private key (string)
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   its password (empty if none)
+#   IMMUTABLE_RELEASES_READ_TOKEN         fine-grained token with repository
+#                                           Administration: read-only
+#   MANAGER_R2_S3_ENDPOINT / MANAGER_R2_PROMOTION_ACCESS_KEY_ID /
+#     MANAGER_R2_PROMOTION_SECRET_ACCESS_KEY
+#                                           R2 S3-compatible read/write access
+#   MANAGER_IHEP_S3_ENDPOINT / MANAGER_IHEP_S3_BUCKET /
+#     MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID /
+#     MANAGER_IHEP_S3_PROMOTION_SECRET_ACCESS_KEY
+#                                           IHEP S3-compatible read/write access
+# Both mirror backends are required for stable publication. They must already
+# contain a valid latest.json baseline and support conditional PutObject
+# (If-Match / If-None-Match) plus HeadObject user-metadata round trips.
+# GitHub Immutable Releases must be enabled before any release starts; the
+# workflow verifies the repository setting with IMMUTABLE_RELEASES_READ_TOKEN.
+# Every reused asset is also pinned to the API-provided sha256 digest.
+# The old MANAGER_*_ACCESS_KEY_ID / SECRET_ACCESS_KEY names must stay deleted;
+# otherwise a historical workflow revision could still perform unconditional writes.
 #
 # Optional Windows Authenticode (non-blocking until configured; see docs/windows-signing.md):
 #   WINDOWS_CERTIFICATE          base64 of OV/EV code-signing .pfx
@@ -26,13 +43,99 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "Existing vX.Y.Z release to republish through the current protected workflow"
+        required: false
+        default: ""
+        type: string
+      allow_mirror_downgrade:
+        description: "Emergency only: allow this tag to replace a newer mirror latest.json"
+        required: false
+        default: false
+        type: boolean
+      mirror_downgrade_reason:
+        description: "Required audit reason when emergency mirror downgrade is enabled"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
+env:
+  RELEASE_TAG: ${{ inputs.target_tag || github.ref_name }}
+
+# Serialize every tag in the repository through one release lane. The mirror
+# promotion also uses per-object ETag conditions, so an external/manual writer
+# cannot bypass monotonicity merely by racing this workflow.
+concurrency:
+  group: release-latest-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
+  prepare:
+    if: ${{ startsWith(inputs.target_tag || github.ref_name, 'v') }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      release_reusable: ${{ steps.lookup.outputs.release_reusable }}
+      release_asset_digests: ${{ steps.lookup.outputs.release_asset_digests }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 20
+
+      - name: Require GitHub Immutable Releases
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: node scripts/check-immutable-releases.mjs
+
+      - name: Check for an existing immutable release
+        id: lookup
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DISPATCH_REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TARGET_TAG: ${{ inputs.target_tag || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TARGET_TAG" && "$DISPATCH_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::target_tag must be dispatched from the default branch ($DEFAULT_BRANCH), not $DISPATCH_REF_NAME"
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag must be a semantic vX.Y.Z tag: $RELEASE_TAG"
+            exit 1
+          fi
+          lookup_error="$RUNNER_TEMP/release-lookup-error.txt"
+          release_json="$RUNNER_TEMP/release.json"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$release_json" 2>"$lookup_error"; then
+            REQUESTED_TARGET_TAG="$REQUESTED_TARGET_TAG" \
+              node scripts/check-release-reuse.mjs "$RELEASE_TAG" "$release_json"
+          elif grep -q 'HTTP 404' "$lookup_error"; then
+            if [[ -n "$REQUESTED_TARGET_TAG" ]]; then
+              echo "::error::target_tag $REQUESTED_TARGET_TAG must already exist as a GitHub Release"
+              exit 1
+            fi
+            echo "release_reusable=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$lookup_error" >&2
+            echo "::error::could not determine whether release $RELEASE_TAG already exists"
+            exit 1
+          fi
+
   build:
-    if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+    needs: prepare
+    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.release_reusable != 'true' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && !(github.event_name == 'workflow_dispatch' && inputs.target_tag != '') }}
     # Repo admins should configure the release environment and copy signing
     # secrets there before moving them off repo-level Actions secrets.
     environment: release
@@ -281,13 +384,75 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
-          name: bundle-${{ matrix.target }}
+          name: bundle-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist-artifacts/*
           if-no-files-found: error
 
+  # Signing and notarization are intentionally non-deterministic. Keep every
+  # successful matrix artifact under an attempt-qualified name, then select the
+  # earliest successful artifact for each target. A release/stage rerun therefore
+  # reuses the exact first bytes instead of creating a second immutable payload.
+  select_artifacts:
+    needs: [prepare, build]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_names: ${{ steps.select.outputs.artifact_names }}
+    steps:
+      - name: Select canonical build artifacts
+        id: select
+        if: ${{ needs.prepare.outputs.release_reusable != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-pc-windows-msvc
+            aarch64-pc-windows-msvc
+          )
+          names_file="$RUNNER_TEMP/canonical-artifact-names.txt"
+          : > "$names_file"
+          for poll in 1 2 3 4 5; do
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+              --jq '.artifacts[].name' > "$RUNNER_TEMP/run-artifacts.txt"
+            : > "$names_file"
+            complete=true
+            for target in "${targets[@]}"; do
+              selected=""
+              for attempt in $(seq 1 "$GITHUB_RUN_ATTEMPT"); do
+                candidate="bundle-${target}-${GITHUB_RUN_ID}-${attempt}"
+                if grep -Fxq "$candidate" "$RUNNER_TEMP/run-artifacts.txt"; then
+                  selected="$candidate"
+                  break
+                fi
+              done
+              if [[ -z "$selected" ]]; then
+                complete=false
+                break
+              fi
+              echo "$selected" >> "$names_file"
+            done
+            [[ "$complete" == "true" ]] && break
+            sleep 5
+          done
+          [[ "$complete" == "true" ]] || {
+            echo "::error::no complete canonical release artifact set exists for this run"
+            exit 1
+          }
+          artifact_names="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$names_file")"
+          echo "artifact_names=$artifact_names" >> "$GITHUB_OUTPUT"
+          echo "Canonical artifacts: $artifact_names"
+
   release:
-    if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
-    needs: build
+    if: ${{ always() && needs.prepare.result == 'success' && needs.select_artifacts.result == 'success' && startsWith(inputs.target_tag || github.ref_name, 'v') }}
+    needs: [prepare, build, select_artifacts]
     # Repo admins should configure the release environment and copy mirror
     # secrets there before moving them off repo-level Actions secrets.
     environment: release
@@ -302,14 +467,167 @@ jobs:
         with:
           persist-credentials: false
 
+      # Historical workflow revisions used the legacy credential names and wrote
+      # latest.json unconditionally. Keeping those secrets deleted is the storage
+      # authorization boundary that makes an old run's "Re-run all jobs" fail
+      # before it can mutate either mirror.
+      - name: Enforce legacy mirror credential revocation
+        shell: bash
+        env:
+          LEGACY_R2_ACCESS_KEY_ID: ${{ secrets.MANAGER_R2_ACCESS_KEY_ID }}
+          LEGACY_R2_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_R2_SECRET_ACCESS_KEY }}
+          LEGACY_IHEP_ACCESS_KEY_ID: ${{ secrets.MANAGER_IHEP_S3_ACCESS_KEY_ID }}
+          LEGACY_IHEP_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_IHEP_S3_SECRET_ACCESS_KEY }}
+        run: |
+          if [[ -n "$LEGACY_R2_ACCESS_KEY_ID$LEGACY_R2_SECRET_ACCESS_KEY$LEGACY_IHEP_ACCESS_KEY_ID$LEGACY_IHEP_SECRET_ACCESS_KEY" ]]; then
+            echo "::error::legacy mirror write secrets are still configured; move credentials to the *_PROMOTION_* names and delete all four legacy access-key secrets"
+            exit 1
+          fi
+
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
           node-version: 20
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
-        with:
-          path: dist
-          merge-multiple: true
+      # Re-check on every release-job attempt. `prepare` is not rerun by
+      # "Re-run failed jobs", and publishing a resumed draft while the setting is
+      # disabled would create a mutable canonical source.
+      - name: Re-check GitHub Immutable Releases
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: node scripts/check-immutable-releases.mjs
+
+      # `prepare` may belong to an earlier run attempt when the operator chooses
+      # "Re-run failed jobs". Refresh the release state inside this job so a
+      # GitHub Release published by the failed attempt becomes the canonical,
+      # immutable byte source instead of being uploaded a second time.
+      - name: Refresh immutable release state
+        id: live_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TARGET_TAG: ${{ inputs.target_tag || '' }}
+        run: |
+          set -euo pipefail
+          lookup_error="$RUNNER_TEMP/live-release-lookup-error.txt"
+          release_json="$RUNNER_TEMP/live-release.json"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$release_json" 2>"$lookup_error"; then
+            REQUESTED_TARGET_TAG="$REQUESTED_TARGET_TAG" \
+              node scripts/check-release-reuse.mjs "$RELEASE_TAG" "$release_json"
+          elif grep -q 'HTTP 404' "$lookup_error"; then
+            if [[ -n "$REQUESTED_TARGET_TAG" ]]; then
+              echo "::error::target_tag $REQUESTED_TARGET_TAG must already exist as a GitHub Release"
+              exit 1
+            fi
+            echo "release_reusable=false" >> "$GITHUB_OUTPUT"
+            echo "release_asset_digests={}" >> "$GITHUB_OUTPUT"
+          else
+            cat "$lookup_error" >&2
+            echo "::error::could not refresh release state for $RELEASE_TAG"
+            exit 1
+          fi
+
+      # A target_tag dispatch intentionally checks out the protected default
+      # branch so historical workflow code cannot run. The updater trust root is
+      # release data, however, and must come from the target tag: a later key
+      # rotation must not make valid immutable historical artifacts unverifiable.
+      - name: Resolve updater trust root for release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_config="$RUNNER_TEMP/release-tauri.conf.json"
+          gh api --method GET \
+            -H "Accept: application/vnd.github.raw+json" \
+            "repos/$GITHUB_REPOSITORY/contents/src-tauri/tauri.conf.json" \
+            -f ref="$RELEASE_TAG" >"$release_config"
+          if ! updater_public_key="$(
+            jq -er '
+              .plugins.updater.pubkey
+              | select(type == "string" and length > 0)
+              | select((contains("\n") or contains("\r")) | not)
+              | select(test("^[A-Za-z0-9+/]+={0,2}$"))
+            ' "$release_config"
+          )"; then
+            echo "::error::release tag $RELEASE_TAG has no valid single-line updater public key"
+            exit 1
+          fi
+          printf 'RELEASE_TAURI_CONFIG=%s\n' "$release_config" >> "$GITHUB_ENV"
+          printf 'MIRROR_UPDATER_PUBLIC_KEY=%s\n' "$updater_public_key" >> "$GITHUB_ENV"
+
+      - name: Download canonical build artifacts
+        if: ${{ steps.live_release.outputs.release_reusable != 'true' }}
+        shell: bash
+        env:
+          ARTIFACT_NAMES_JSON: ${{ needs.select_artifacts.outputs.artifact_names }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          jq -er '.[]' <<<"$ARTIFACT_NAMES_JSON" | while IFS= read -r artifact; do
+            gh run download "$GITHUB_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name "$artifact" \
+              --dir dist
+          done
+
+      # A same-tag rerun or emergency downgrade must use the bytes already
+      # published for that tag. Rebuilding signed/notarized artifacts is
+      # intentionally non-reproducible and would conflict with immutable keys.
+      - name: Resolve immutable release artifact source
+        id: release_source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSET_DIGESTS: ${{ steps.live_release.outputs.release_asset_digests }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.live_release.outputs.release_reusable }}" == "true" ]]; then
+            published="$RUNNER_TEMP/published-release-artifacts"
+            rm -rf "$published"
+            mkdir -p "$published"
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$published" \
+              --pattern 'CodexAppManager*' \
+              --pattern 'latest.json'
+            test -f "$published/latest.json" || {
+              echo "::error::published $RELEASE_TAG has no latest.json"
+              exit 1
+            }
+            jq -e 'type == "object" and length > 0' <<<"$RELEASE_ASSET_DIGESTS" >/dev/null || {
+              echo "::error::immutable release digest evidence is missing"
+              exit 1
+            }
+            while IFS=$'\t' read -r name expected_digest; do
+              file="$published/$name"
+              test -f "$file" || {
+                echo "::error::immutable release asset is missing after download: $name"
+                exit 1
+              }
+              actual_digest="sha256:$(sha256sum "$file" | cut -d' ' -f1)"
+              if [[ "$actual_digest" != "$expected_digest" ]]; then
+                echo "::error::immutable release digest mismatch for $name"
+                exit 1
+              fi
+              echo "Verified immutable release digest: $name"
+            done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<<"$RELEASE_ASSET_DIGESTS")
+            cp "$published/latest.json" "$RUNNER_TEMP/published-latest.json"
+            rm "$published/latest.json"
+            rm -rf dist
+            mv "$published" dist
+            echo "existing=true" >> "$GITHUB_OUTPUT"
+            echo "source=github-release" >> "$GITHUB_OUTPUT"
+            echo "Reusing immutable artifacts from existing release $RELEASE_TAG"
+          else
+            test -d dist || {
+              echo "::error::no build artifacts are available for new release $RELEASE_TAG"
+              exit 1
+            }
+            echo "existing=false" >> "$GITHUB_OUTPUT"
+            echo "source=canonical-actions-artifacts" >> "$GITHUB_OUTPUT"
+          fi
 
       # Validate the merged *publishable* tree (renamed final names), not the
       # per-target intermediate build directories from the matrix jobs.
@@ -322,12 +640,20 @@ jobs:
           missing=0
           require() {
             local pattern="$1"
+            local matches
             # shellcheck disable=SC2086
-            if ! compgen -G "dist/$pattern" > /dev/null; then
+            matches="$(compgen -G "dist/$pattern" || true)"
+            if [[ -z "$matches" ]]; then
               echo "::error::[build] missing final artifact matching: $pattern"
               missing=1
             else
-              echo "OK $pattern → $(compgen -G "dist/$pattern" | tr '\n' ' ')"
+              while IFS= read -r file; do
+                if [[ ! -s "$file" ]]; then
+                  echo "::error::[build] empty final artifact: $file"
+                  missing=1
+                fi
+              done <<<"$matches"
+              echo "OK $pattern → $(tr '\n' ' ' <<<"$matches")"
             fi
           }
           require "CodexAppManager_aarch64.dmg"
@@ -350,29 +676,91 @@ jobs:
       - name: Generate updater manifest (latest.json)
         env:
           ALLOW_PARTIAL_RELEASE: ${{ vars.ALLOW_PARTIAL_RELEASE }}
-        run: node scripts/gen-updater-manifest.mjs "${{ github.ref_name }}" dist
+        run: |
+          node scripts/gen-updater-manifest.mjs "$RELEASE_TAG" dist
+          cp latest.json "$RUNNER_TEMP/artifact-derived-latest.json"
+          if [[ "${{ steps.release_source.outputs.existing }}" == "true" ]]; then
+            cp "$RUNNER_TEMP/published-latest.json" latest.json
+          fi
+          if [[ "$RELEASE_TAG" != *-* ]]; then
+            node scripts/validate-release-manifest.mjs \
+              "$RELEASE_TAG" \
+              latest.json \
+              "$RUNNER_TEMP/artifact-derived-latest.json"
+          fi
 
-      # Stable releases mirror in two phases: stage immutable versioned assets
-      # before GitHub Release publication, then promote latest.json only after
+      # A wrong private/public updater-key pairing cannot be repaired after an
+      # immutable GitHub Release is published. Verify the exact local payloads
+      # (including manifest/sidecar equality) before either mirror staging or
+      # draft publication. This also protects prereleases, which skip mirrors.
+      - name: Verify local updater signatures before immutable publication
+        run: |
+          node scripts/verify-release-artifacts.mjs \
+            latest.json \
+            dist \
+            "$RELEASE_TAURI_CONFIG"
+
+      # Stable releases stage immutable versioned assets before GitHub Release
+      # publication, verify them separately, then promote latest.json only after
       # the GitHub Release succeeds. Pre-releases still skip the mirror entirely.
       - name: Stage CDN mirror candidate (R2 + IHEP S3)
         id: mirror_stage
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ !contains(env.RELEASE_TAG, '-') }}
         env:
           MIRROR_PHASE: stage
+          MIRROR_REQUIRED_BACKENDS: r2,ihep
+          MIRROR_CANDIDATE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          MIRROR_ALLOW_DOWNGRADE: ${{ inputs.allow_mirror_downgrade && '1' || '0' }}
+          MIRROR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MIRROR_DOWNGRADE_REASON: ${{ inputs.mirror_downgrade_reason || '' }}
+          MIRROR_WORKFLOW_REF_NAME: ${{ github.ref_name }}
           MANAGER_R2_S3_ENDPOINT: ${{ secrets.MANAGER_R2_S3_ENDPOINT }}
-          MANAGER_R2_ACCESS_KEY_ID: ${{ secrets.MANAGER_R2_ACCESS_KEY_ID }}
-          MANAGER_R2_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_R2_SECRET_ACCESS_KEY }}
+          MANAGER_R2_BUCKET: ${{ vars.MANAGER_R2_BUCKET }}
+          MANAGER_R2_ACCESS_KEY_ID: ${{ secrets.MANAGER_R2_PROMOTION_ACCESS_KEY_ID }}
+          MANAGER_R2_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_R2_PROMOTION_SECRET_ACCESS_KEY }}
           MANAGER_IHEP_S3_ENDPOINT: ${{ secrets.MANAGER_IHEP_S3_ENDPOINT }}
           MANAGER_IHEP_S3_BUCKET: ${{ secrets.MANAGER_IHEP_S3_BUCKET }}
           MANAGER_IHEP_S3_REGION: ${{ secrets.MANAGER_IHEP_S3_REGION }}
           MANAGER_IHEP_S3_PREFIX: ${{ secrets.MANAGER_IHEP_S3_PREFIX }}
-          MANAGER_IHEP_S3_ACCESS_KEY_ID: ${{ secrets.MANAGER_IHEP_S3_ACCESS_KEY_ID }}
-          MANAGER_IHEP_S3_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_IHEP_S3_SECRET_ACCESS_KEY }}
+          MANAGER_IHEP_S3_ACCESS_KEY_ID: ${{ secrets.MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID }}
+          MANAGER_IHEP_S3_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_IHEP_S3_PROMOTION_SECRET_ACCESS_KEY }}
         run: |
           [ -f dist/latest.json ] || cp latest.json dist/latest.json
           bash scripts/sync-mirror.sh dist
-          rm -f dist/latest.mirror.json
+          # The GitHub Release uploads the root latest.json exactly once. Recreate
+          # dist/latest.json later for promotion instead of giving the upload
+          # action two paths with the same asset basename.
+          rm -f dist/latest.mirror.json dist/latest.json
+
+      # Complete a direct readback from both object stores and force separate
+      # readbacks through the Worker's R2 and mainland-China IHEP branches. This
+      # is a verify-only phase: latest.json cannot be changed here. Both public
+      # branches must pass before GitHub publication becomes immutable.
+      - name: Verify staged CDN mirror before immutable publication
+        id: mirror_verify
+        if: ${{ !contains(env.RELEASE_TAG, '-') }}
+        env:
+          MIRROR_PHASE: verify
+          MIRROR_REQUIRED_BACKENDS: r2,ihep
+          MIRROR_CANDIDATE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          MIRROR_ALLOW_DOWNGRADE: ${{ inputs.allow_mirror_downgrade && '1' || '0' }}
+          MIRROR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MIRROR_DOWNGRADE_REASON: ${{ inputs.mirror_downgrade_reason || '' }}
+          MIRROR_WORKFLOW_REF_NAME: ${{ github.ref_name }}
+          MANAGER_R2_S3_ENDPOINT: ${{ secrets.MANAGER_R2_S3_ENDPOINT }}
+          MANAGER_R2_BUCKET: ${{ vars.MANAGER_R2_BUCKET }}
+          MANAGER_R2_ACCESS_KEY_ID: ${{ secrets.MANAGER_R2_PROMOTION_ACCESS_KEY_ID }}
+          MANAGER_R2_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_R2_PROMOTION_SECRET_ACCESS_KEY }}
+          MANAGER_IHEP_S3_ENDPOINT: ${{ secrets.MANAGER_IHEP_S3_ENDPOINT }}
+          MANAGER_IHEP_S3_BUCKET: ${{ secrets.MANAGER_IHEP_S3_BUCKET }}
+          MANAGER_IHEP_S3_REGION: ${{ secrets.MANAGER_IHEP_S3_REGION }}
+          MANAGER_IHEP_S3_PREFIX: ${{ secrets.MANAGER_IHEP_S3_PREFIX }}
+          MANAGER_IHEP_S3_ACCESS_KEY_ID: ${{ secrets.MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID }}
+          MANAGER_IHEP_S3_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_IHEP_S3_PROMOTION_SECRET_ACCESS_KEY }}
+        run: |
+          [ -f dist/latest.json ] || cp latest.json dist/latest.json
+          bash scripts/sync-mirror.sh dist
+          rm -f dist/latest.mirror.json dist/latest.json
 
       # ── release notes: the hand-written file from the version-bump PR
       #    (docs/releases/<tag>.md, see docs/releases/TEMPLATE.md) wins;
@@ -380,7 +768,7 @@ jobs:
       #    empty. GitHub's auto "What's Changed" section is appended either way.
       - name: Prepare release notes
         run: |
-          NOTES="docs/releases/${{ github.ref_name }}.md"
+          NOTES="docs/releases/$RELEASE_TAG.md"
           if [ -f "$NOTES" ]; then
             cp "$NOTES" "$RUNNER_TEMP/release-notes.md"
           else
@@ -432,17 +820,21 @@ jobs:
 
           exit "$status"
 
-      - name: Publish GitHub Release
-        id: publish_release
+      # Explicit draft-first publication keeps asset upload ahead of publication
+      # for both stable and prerelease tags. This is required when GitHub immutable
+      # releases are enabled: a published release can no longer accept assets.
+      - name: Upload GitHub Release draft
+        id: upload_release_draft
+        if: ${{ steps.release_source.outputs.existing != 'true' }}
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3
         with:
-          tag_name: ${{ github.ref_name }}
-          draft: false
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
           # Tags carrying a pre-release identifier (e.g. v0.1.2-rc1) publish as a
           # prerelease, so GitHub's `releases/latest` — and the updater endpoint
           # pointing at it — keep resolving to the last stable build instead of
           # serving a release-candidate to real users.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           files: |
@@ -451,35 +843,85 @@ jobs:
             SHA256SUMS
             release-assets/*
 
-      - name: Promote CDN mirror latest (R2 + IHEP S3)
-        id: mirror_promote
-        if: ${{ !contains(github.ref_name, '-') }}
-        env:
-          MIRROR_PHASE: promote
-          MANAGER_R2_S3_ENDPOINT: ${{ secrets.MANAGER_R2_S3_ENDPOINT }}
-          MANAGER_R2_ACCESS_KEY_ID: ${{ secrets.MANAGER_R2_ACCESS_KEY_ID }}
-          MANAGER_R2_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_R2_SECRET_ACCESS_KEY }}
-          MANAGER_IHEP_S3_ENDPOINT: ${{ secrets.MANAGER_IHEP_S3_ENDPOINT }}
-          MANAGER_IHEP_S3_BUCKET: ${{ secrets.MANAGER_IHEP_S3_BUCKET }}
-          MANAGER_IHEP_S3_REGION: ${{ secrets.MANAGER_IHEP_S3_REGION }}
-          MANAGER_IHEP_S3_PREFIX: ${{ secrets.MANAGER_IHEP_S3_PREFIX }}
-          MANAGER_IHEP_S3_ACCESS_KEY_ID: ${{ secrets.MANAGER_IHEP_S3_ACCESS_KEY_ID }}
-          MANAGER_IHEP_S3_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_IHEP_S3_SECRET_ACCESS_KEY }}
-        run: |
-          [ -f dist/latest.json ] || cp latest.json dist/latest.json
-          bash scripts/sync-mirror.sh dist
+      # Omitting `draft` tells action-gh-release v3 to publish the existing draft
+      # after all uploads succeeded while retaining its stable/prerelease metadata.
+      - name: Publish GitHub Release
+        id: publish_release
+        if: ${{ steps.release_source.outputs.existing != 'true' }}
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
 
+      - name: Verify published immutable Release and asset digests
+        if: ${{ steps.release_source.outputs.existing != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/published-release.json"
+          verification_log="$RUNNER_TEMP/published-release-verification.log"
+          verification_output="$RUNNER_TEMP/published-release-verification-output.txt"
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            : > "$verification_log"
+            : > "$verification_output"
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$release_json" 2>"$verification_log" \
+              && REQUESTED_TARGET_TAG="$RELEASE_TAG" GITHUB_OUTPUT="$verification_output" \
+                node scripts/check-release-reuse.mjs "$RELEASE_TAG" "$release_json" >>"$verification_log" 2>&1; then
+              verified=true
+              break
+            fi
+            sleep 3
+          done
+          if [[ "$verified" != "true" ]]; then
+            cat "$verification_log" >&2
+            echo "::error::published $RELEASE_TAG did not become immutable with canonical asset digests"
+            exit 1
+          fi
+          cat "$verification_log"
+
+      # Attest immediately after GitHub confirms the canonical immutable bytes,
+      # before mirror promotion can fail the job. Keep the subjects limited to
+      # updater payloads and latest.json: on a failed-job rerun those are fetched
+      # from the immutable Release and checked against GitHub's canonical SHA-256
+      # digests. SHA256SUMS and SBOMs are intentionally excluded because they are
+      # regenerated locally and are not necessarily the bytes already published.
+      # A failed attestation must fail the job so the release stays retryable and
+      # neither mirror promotion nor winget dispatch can proceed without proof.
       - name: Attest build provenance
         id: attest
-        if: ${{ steps.publish_release.outcome == 'success' }}
-        continue-on-error: true
+        if: ${{ steps.publish_release.outcome == 'success' || steps.release_source.outputs.existing == 'true' }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-path: |
             dist/*
             latest.json
-            SHA256SUMS
-            release-assets/*
+
+      - name: Promote CDN mirror latest (R2 + IHEP S3)
+        id: mirror_promote
+        if: ${{ success() && steps.attest.outcome == 'success' && !contains(env.RELEASE_TAG, '-') }}
+        env:
+          MIRROR_PHASE: promote
+          MIRROR_REQUIRED_BACKENDS: r2,ihep
+          MIRROR_CANDIDATE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          MIRROR_ALLOW_DOWNGRADE: ${{ inputs.allow_mirror_downgrade && '1' || '0' }}
+          MIRROR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MIRROR_DOWNGRADE_REASON: ${{ inputs.mirror_downgrade_reason || '' }}
+          MIRROR_WORKFLOW_REF_NAME: ${{ github.ref_name }}
+          MANAGER_R2_S3_ENDPOINT: ${{ secrets.MANAGER_R2_S3_ENDPOINT }}
+          MANAGER_R2_BUCKET: ${{ vars.MANAGER_R2_BUCKET }}
+          MANAGER_R2_ACCESS_KEY_ID: ${{ secrets.MANAGER_R2_PROMOTION_ACCESS_KEY_ID }}
+          MANAGER_R2_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_R2_PROMOTION_SECRET_ACCESS_KEY }}
+          MANAGER_IHEP_S3_ENDPOINT: ${{ secrets.MANAGER_IHEP_S3_ENDPOINT }}
+          MANAGER_IHEP_S3_BUCKET: ${{ secrets.MANAGER_IHEP_S3_BUCKET }}
+          MANAGER_IHEP_S3_REGION: ${{ secrets.MANAGER_IHEP_S3_REGION }}
+          MANAGER_IHEP_S3_PREFIX: ${{ secrets.MANAGER_IHEP_S3_PREFIX }}
+          MANAGER_IHEP_S3_ACCESS_KEY_ID: ${{ secrets.MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID }}
+          MANAGER_IHEP_S3_SECRET_ACCESS_KEY: ${{ secrets.MANAGER_IHEP_S3_PROMOTION_SECRET_ACCESS_KEY }}
+        run: |
+          [ -f dist/latest.json ] || cp latest.json dist/latest.json
+          bash scripts/sync-mirror.sh dist
 
       # The release above is created with GITHUB_TOKEN, which by design does not
       # trigger other workflows — so winget.yml's `on: release` never fires.
@@ -488,11 +930,11 @@ jobs:
       # so a re-run is harmless.
       - name: Trigger winget submission
         id: winget
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ success() && steps.attest.outcome == 'success' && !contains(env.RELEASE_TAG, '-') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh workflow run winget.yml -f release-tag="${{ github.ref_name }}" --repo "${{ github.repository }}"; then
+          if gh workflow run winget.yml -f release-tag="$RELEASE_TAG" --repo "${{ github.repository }}"; then
             echo "status=dispatched" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::winget dispatch failed"
@@ -502,10 +944,26 @@ jobs:
       - name: Write release summary
         if: always()
         env:
-          PUBLISH_OUTCOME: ${{ steps.publish_release.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.release_source.outputs.existing == 'true' && 'reused' || steps.publish_release.outcome }}
           MIRROR_STAGE_OUTCOME: ${{ steps.mirror_stage.outcome }}
+          MIRROR_VERIFY_OUTCOME: ${{ steps.mirror_verify.outcome }}
           MIRROR_PROMOTE_OUTCOME: ${{ steps.mirror_promote.outcome }}
           WINGET_OUTCOME: ${{ steps.winget.outputs.status || steps.winget.outcome }}
           SBOM_OUTCOME: ${{ steps.sbom.outcome }}
           ATTESTATION_OUTCOME: ${{ steps.attest.outcome }}
         run: node scripts/write-release-summary.mjs
+
+      - name: Upload release audit records
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: release-audit-${{ env.RELEASE_TAG }}-${{ github.run_attempt }}
+          path: |
+            manifest-summary.json
+            updater-signature-verification.json
+            mirror-stage-summary.json
+            mirror-verification-summary.json
+            mirror-promotion-summary.json
+            SHA256SUMS
+          if-no-files-found: warn
+          retention-days: 90
