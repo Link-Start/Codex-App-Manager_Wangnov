@@ -126,6 +126,15 @@ impl OperationOutcome {
         }
     }
 
+    /// Preserve the retry action for every failed provenance branch. Keeping
+    /// this check after a multi-branch attempt prevents a newly-added error
+    /// path (including "nothing detected") from stranding the UI without a CTA.
+    pub fn retain_failed_provenance_recovery(&mut self, action: &str) {
+        if self.provenance.is_failed() {
+            self.push_recovery(action);
+        }
+    }
+
     /// True when the primary op succeeded but at least one ancillary step failed.
     pub fn is_partial(&self) -> bool {
         self.primary_ok && (self.provenance.is_failed() || self.cleanup.is_failed())
@@ -181,5 +190,20 @@ mod tests {
         outcome.push_recovery(recovery::CLEANUP_METADATA);
         outcome.push_recovery(recovery::CLEANUP_METADATA);
         assert_eq!(outcome.recovery_actions.len(), 1);
+    }
+
+    #[test]
+    fn failed_provenance_always_retains_its_retry_action() {
+        let mut failed = OperationOutcome::full_success("present", Some("external"));
+        failed.provenance = StepOutcome::failed("record target missing");
+        failed.retain_failed_provenance_recovery(recovery::RECORD_PROVENANCE);
+        assert_eq!(
+            failed.recovery_actions,
+            vec![recovery::RECORD_PROVENANCE.to_string()]
+        );
+
+        let mut succeeded = OperationOutcome::full_success("present", Some("managed"));
+        succeeded.retain_failed_provenance_recovery(recovery::RECORD_PROVENANCE);
+        assert!(succeeded.recovery_actions.is_empty());
     }
 }

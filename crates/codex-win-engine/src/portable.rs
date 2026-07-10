@@ -552,11 +552,20 @@ fn restore_previous_install(
     backup: &Path,
     had_previous: bool,
 ) -> Result<(), EngineError> {
+    // Never delete the failed/new tree and then discover that the old tree we
+    // promised to restore is gone. Missing rollback material is ambiguous and
+    // must not emit positive rollback evidence.
+    if had_previous && !backup.exists() {
+        return Err(EngineError::Install(format!(
+            "portable rollback backup is missing: {}",
+            backup.display()
+        )));
+    }
     if install_root.exists() {
         fs::remove_dir_all(install_root)
             .map_err(|e| io_err("remove failed portable install", e))?;
     }
-    if had_previous && backup.exists() {
+    if had_previous {
         fs::rename(backup, install_root)
             .map_err(|e| io_err("restore portable rollback backup", e))?;
     }
@@ -567,10 +576,27 @@ fn rollback_install_error(
     install_root: &Path,
     backup: &Path,
     had_previous: bool,
+    observer: &mut PortableObserver<'_>,
     err: EngineError,
 ) -> EngineError {
     match restore_previous_install(install_root, backup, had_previous) {
-        Ok(()) => EngineError::Install(format!("{err}; previous install was restored")),
+        Ok(()) => {
+            let restored = if had_previous {
+                "previous install was restored"
+            } else {
+                "new install was removed and the absent state was restored"
+            };
+            match observer(PortableBoundary::RollbackCompleted {
+                install_root: install_root.to_path_buf(),
+                backup: backup.to_path_buf(),
+                had_previous,
+            }) {
+                Ok(()) => EngineError::Install(format!("{err}; {restored}")),
+                Err(evidence_err) => EngineError::Install(format!(
+                    "{err}; {restored}, but recording rollback evidence failed: {evidence_err}"
+                )),
+            }
+        }
         Err(rollback_err) => {
             EngineError::Install(format!("{err}; rollback failed: {rollback_err}"))
         }
@@ -664,6 +690,13 @@ pub enum PortableBoundary {
         backup: PathBuf,
         had_previous: bool,
     },
+    /// A later failure was fully rolled back. The install root now matches its
+    /// pre-operation state (the old tree was restored, or a fresh tree removed).
+    RollbackCompleted {
+        install_root: PathBuf,
+        backup: PathBuf,
+        had_previous: bool,
+    },
 }
 
 pub type PortableObserver<'a> = dyn FnMut(PortableBoundary) -> Result<(), EngineError> + 'a;
@@ -673,6 +706,7 @@ pub enum PortableFault {
     BeforeMoveOld,
     AfterMoveOld,
     OnMoveNew,
+    AfterMoveNew,
 }
 
 thread_local! {
@@ -764,15 +798,13 @@ pub fn install_portable_from_msix_with_observer(
         backup: backup.clone(),
         had_previous,
     }) {
-        if had_previous {
-            if let Err(rb) = restore_previous_install(install_root, &backup, had_previous) {
-                log::error!(
-                    "portable observer failed after move-old and rollback also failed: obs={obs_err} rollback={rb}"
-                );
-                // Crash window left for startup recovery.
-            }
-        }
-        return Err(obs_err);
+        return Err(rollback_install_error(
+            install_root,
+            &backup,
+            had_previous,
+            observer,
+            obs_err,
+        ));
     }
     if fault == Some(PortableFault::AfterMoveOld) {
         // Leave the crash window intact for recovery tests (no auto-rollback).
@@ -786,9 +818,14 @@ pub fn install_portable_from_msix_with_observer(
         had_previous,
     })?;
     if fault == Some(PortableFault::OnMoveNew) {
-        let _ = restore_previous_install(install_root, &backup, had_previous);
         let _ = fs::remove_dir_all(&work_dir);
-        return Err(portable_fault_err("on-move-new"));
+        return Err(rollback_install_error(
+            install_root,
+            &backup,
+            had_previous,
+            observer,
+            portable_fault_err("on-move-new"),
+        ));
     }
 
     match fs::rename(&payload, install_root) {
@@ -804,9 +841,25 @@ pub fn install_portable_from_msix_with_observer(
             }
         }
         Err(err) => {
-            let _ = restore_previous_install(install_root, &backup, had_previous);
-            return Err(io_err("install portable payload (rolled back)", err));
+            return Err(rollback_install_error(
+                install_root,
+                &backup,
+                had_previous,
+                observer,
+                io_err("install portable payload", err),
+            ));
         }
+    }
+
+    if fault == Some(PortableFault::AfterMoveNew) {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(rollback_install_error(
+            install_root,
+            &backup,
+            had_previous,
+            observer,
+            portable_fault_err("after-move-new"),
+        ));
     }
 
     let relaunched = match health_check_portable_install(install_root, manage_process && relaunch) {
@@ -817,6 +870,7 @@ pub fn install_portable_from_msix_with_observer(
                 install_root,
                 &backup,
                 had_previous,
+                observer,
                 err,
             ));
         }
@@ -1381,6 +1435,7 @@ mod tests {
                     PortableBoundary::AfterMoveOld { .. } => "after-old",
                     PortableBoundary::BeforeMoveNew { .. } => "before-new",
                     PortableBoundary::AfterMoveNew { .. } => "after-new",
+                    PortableBoundary::RollbackCompleted { .. } => "rollback-completed",
                 });
                 Ok(())
             },
@@ -1390,6 +1445,142 @@ mod tests {
             kinds,
             ["before-old", "after-old", "before-new", "after-new"]
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn successful_fresh_install_rollback_emits_absent_state_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-fresh-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let msix = root.join("codex.msix");
+        let install_root = root.join("Codex");
+        write_fake_msix(&msix);
+        let mut kinds = Vec::new();
+
+        inject_portable_fault(Some(PortableFault::AfterMoveNew));
+        let err = install_portable_from_msix_with_observer(
+            &msix,
+            &install_root,
+            false,
+            false,
+            &mut |boundary| {
+                kinds.push(match boundary {
+                    PortableBoundary::BeforeMoveOld { .. } => "before-old",
+                    PortableBoundary::AfterMoveOld { .. } => "after-old",
+                    PortableBoundary::BeforeMoveNew { .. } => "before-new",
+                    PortableBoundary::AfterMoveNew { .. } => "after-new",
+                    PortableBoundary::RollbackCompleted { .. } => "rollback-completed",
+                });
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("absent state was restored"));
+        assert_eq!(
+            kinds,
+            [
+                "before-old",
+                "after-old",
+                "before-new",
+                "after-new",
+                "rollback-completed"
+            ]
+        );
+        assert!(
+            !install_root.exists(),
+            "a fully rolled-back fresh install must be absent and safe to retry"
+        );
+        assert!(
+            !fs::read_dir(&root).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("Codex.rollback-")),
+            "a fresh rollback must not leave rollback material"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_upgrade_backup_never_reports_rollback_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-missing-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let install_root = root.join("Codex");
+        let backup = root.join("Codex.rollback-missing");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("new-marker.txt"), b"new").unwrap();
+        let mut boundaries = Vec::new();
+
+        let err = rollback_install_error(
+            &install_root,
+            &backup,
+            true,
+            &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(())
+            },
+            portable_fault_err("after-move-new"),
+        );
+
+        assert!(err.to_string().contains("rollback backup is missing"));
+        assert!(boundaries.is_empty(), "failed rollback must emit no evidence");
+        assert!(
+            install_root.join("new-marker.txt").exists(),
+            "failed rollback must preserve the current tree for recovery"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn successful_upgrade_rollback_restores_old_tree_before_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-upgrade-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let install_root = root.join("Codex");
+        let backup = root.join("Codex.rollback-old");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("new-marker.txt"), b"new").unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("old-marker.txt"), b"old").unwrap();
+        let mut saw_restored_tree = false;
+
+        let err = rollback_install_error(
+            &install_root,
+            &backup,
+            true,
+            &mut |boundary| {
+                assert!(matches!(
+                    boundary,
+                    PortableBoundary::RollbackCompleted {
+                        had_previous: true,
+                        ..
+                    }
+                ));
+                saw_restored_tree = install_root.join("old-marker.txt").exists()
+                    && !install_root.join("new-marker.txt").exists();
+                Ok(())
+            },
+            portable_fault_err("after-move-new"),
+        );
+
+        assert!(err.to_string().contains("previous install was restored"));
+        assert!(saw_restored_tree, "evidence must follow the completed restore");
+        assert!(!backup.exists());
+
         let _ = fs::remove_dir_all(&root);
     }
 }

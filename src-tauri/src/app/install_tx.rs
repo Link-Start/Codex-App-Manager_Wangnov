@@ -291,6 +291,20 @@ impl InstallTransaction {
         }
     }
 
+    fn remove_file_checked(&self) -> Result<(), AppError> {
+        let path = tx_path_for(&self.id).ok_or_else(|| {
+            AppError::Internal("无法定位 install-transactions 数据目录".to_string())
+        })?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(AppError::Internal(format!(
+                "删除事务日志失败（{}）: {err}",
+                path.display()
+            ))),
+        }
+    }
+
     pub fn load_from_path(path: &Path) -> Result<Self, AppError> {
         let bytes = fs::read(path)
             .map_err(|e| AppError::Internal(format!("读取事务日志失败: {e}")))?;
@@ -590,10 +604,11 @@ impl ActiveInstallTx {
     /// Record a successful rollback and clear the log.
     pub fn mark_rolled_back(mut self) -> Result<(), AppError> {
         if let Some(mut tx) = self.inner.take() {
-            tx.step = InstallTxStep::RolledBack;
-            tx.updated_unix = now_unix();
-            let _ = tx.persist();
-            tx.remove_file();
+            // Persist the terminal state before clearing the journal. If this
+            // write fails, propagate it so the operation remains outcome-unknown
+            // instead of claiming a fully recorded rollback.
+            tx.advance(InstallTxStep::RolledBack)?;
+            tx.remove_file_checked()?;
         }
         Ok(())
     }
