@@ -135,6 +135,11 @@ impl Drop for OperationGuard {
             .is_some_and(|active| active.token == self.token.0)
         {
             let _ = OperationManager::unlock_lock_file(&mut inner);
+            // Linearize latch cleanup with removal of the owning lease. A cancel
+            // command takes the same mutex for both snapshots, so it either sees
+            // this owner and is followed by this cleanup, or sees no owner and
+            // immediately rolls its speculative latch back.
+            clear_cancel_latches();
             inner.active.take();
             log::info!(
                 "released operation lock kind={} token_prefix={}",
@@ -198,6 +203,7 @@ impl OperationManager {
                     return Ok(());
                 }
                 Self::unlock_lock_file(&mut inner)?;
+                clear_cancel_latches();
                 log::info!(
                     "ended operation lock kind={} token_prefix={}",
                     active_kind.as_str(),
@@ -213,6 +219,24 @@ impl OperationManager {
     }
 
     pub fn validate(&self, token: &OperationToken) -> Result<(), OperationError> {
+        self.validate_inner(token, None)
+    }
+
+    /// Claim a detached token and publish its first phase in one critical section.
+    /// Destructive operations use this to eliminate the validate→commit window.
+    pub fn validate_with_phase(
+        &self,
+        token: &OperationToken,
+        phase: OperationPhase,
+    ) -> Result<(), OperationError> {
+        self.validate_inner(token, Some(phase))
+    }
+
+    fn validate_inner(
+        &self,
+        token: &OperationToken,
+        phase: Option<OperationPhase>,
+    ) -> Result<(), OperationError> {
         let mut inner = self
             .inner
             .lock()
@@ -233,6 +257,15 @@ impl OperationManager {
                     );
                 }
                 active.holders = active.holders.saturating_add(1);
+                if let Some(phase) = phase {
+                    log::info!(
+                        "claimed operation at phase kind={} phase={} token_prefix={}",
+                        active.kind.as_str(),
+                        phase.as_str(),
+                        token_prefix(&token.0)
+                    );
+                    active.phase = phase;
+                }
                 return Ok(());
             }
         }
@@ -359,6 +392,71 @@ impl OperationManager {
         QuitPolicy::evaluate(force_quit, confirm_close, busy, phase, kind)
     }
 
+    /// Linearize an allowed or user-confirmed quit with the active phase.
+    ///
+    /// `prepare_exit` runs while the operation mutex is held when policy is
+    /// already `Allow`, or after an explicit confirmation. Callers use it to arm
+    /// platform cancellation latches and the force-exit flag before a worker can
+    /// advance to `Committing`. A worker that won the mutex first is observed as
+    /// blocked; a worker that advances afterward observes the final checkpoint.
+    pub fn prepare_quit(
+        &self,
+        confirm_close: bool,
+        confirmed: bool,
+        prepare_exit: impl FnOnce(),
+    ) -> QuitPolicy {
+        let Ok(mut inner) = self.inner.lock() else {
+            return QuitPolicy::evaluate(
+                false,
+                confirm_close,
+                true,
+                OperationPhase::Finishing,
+                None,
+            );
+        };
+        let _ = self.reclaim_stale_detached(&mut inner);
+
+        let (busy, phase, kind) = if let Some(active) = inner.active.as_ref() {
+            (true, active.phase, Some(active.kind))
+        } else {
+            let other_busy = match Self::lock_file_mut(&mut inner) {
+                Ok(lock_file) => match Fs4FileExt::try_lock(lock_file) {
+                    Ok(()) => {
+                        let _ = Fs4FileExt::unlock(lock_file);
+                        false
+                    }
+                    Err(TryLockError::WouldBlock) => true,
+                    Err(TryLockError::Error(_)) => false,
+                },
+                Err(_) => false,
+            };
+            if other_busy {
+                (true, OperationPhase::Finishing, None)
+            } else {
+                (false, OperationPhase::Idle, None)
+            }
+        };
+        let policy = QuitPolicy::evaluate(false, confirm_close, busy, phase, kind);
+        let should_prepare = matches!(policy, QuitPolicy::Allow)
+            || (confirmed && matches!(policy, QuitPolicy::Confirm));
+        if should_prepare {
+            // An armed detached token has not entered its command yet. Remove it
+            // under this same mutex so a delayed validate cannot start destructive
+            // work after force-exit preparation. Claimed workers keep their lease
+            // and must honor the phase-linearized abort checkpoint instead.
+            let abandon_unclaimed = inner
+                .active
+                .as_ref()
+                .is_some_and(|active| active.detached && !active.claimed);
+            if abandon_unclaimed {
+                let _ = Self::unlock_lock_file(&mut inner);
+                inner.active.take();
+            }
+            prepare_exit();
+        }
+        policy
+    }
+
     /// Snapshot of the local active operation, for frontend reattach after
     /// renderer reload / remount. `None` when free (or only a cross-process lock).
     pub fn snapshot(&self) -> Option<OperationSnapshot> {
@@ -380,6 +478,48 @@ impl OperationManager {
                 interruptible,
             }
         })
+    }
+
+    /// Run a platform cancel signal while the active lease is locked and still
+    /// known to be interruptible. This is the linearization point between an
+    /// operation ending and a new one beginning: a process-global engine latch
+    /// can never be armed for operation A after operation B has taken its lease.
+    pub fn request_cancellation(
+        &self,
+        token: &OperationToken,
+        request: impl FnOnce() -> bool,
+    ) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        if !inner
+            .active
+            .as_ref()
+            .is_some_and(|active| active.token == token.0 && active.phase.interruptible())
+        {
+            return false;
+        }
+        request()
+    }
+
+    /// Signal pause and mark the same active lease while holding the operation
+    /// mutex. Without this critical section a late pause for operation A could
+    /// observe the process-global downloader of newly-started operation B.
+    pub fn request_pause(&self, token: &OperationToken, request: impl FnOnce() -> bool) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let Some(active) = inner.active.as_mut() else {
+            return false;
+        };
+        if active.token != token.0 || !active.phase.interruptible() {
+            return false;
+        }
+        let requested = request();
+        if requested {
+            active.paused = true;
+        }
+        requested
     }
 
     /// Record the latest download progress for a validated token.
@@ -522,6 +662,7 @@ impl OperationManager {
                 active.kind.as_str()
             );
             Self::unlock_lock_file(inner)?;
+            clear_cancel_latches();
             inner.active.take();
         }
         Ok(())
@@ -536,6 +677,22 @@ impl OperationManager {
                 && now_unix().saturating_sub(active.started_unix) >= self.stale_after_secs
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) static CANCEL_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn clear_cancel_latches() {
+    // The abort latches are process-global. Production OperationManager access is
+    // serialized by `inner`, while Rust's test harness may run unrelated managers
+    // and direct latch tests concurrently in one process. Share a test-only lock
+    // with those direct tests so a guard drop cannot clear their asserted value.
+    #[cfg(test)]
+    let _test_guard = CANCEL_LATCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::app::mac_update::clear_update_abort();
+    crate::app::win_update::clear_win_update_abort();
 }
 
 fn token_prefix(token: &str) -> &str {
@@ -894,6 +1051,229 @@ mod tests {
 
         manager.end(token).unwrap();
         assert!(manager.snapshot().is_none());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn cancellation_signal_runs_only_inside_a_live_interruptible_lease() {
+        use crate::app::op_phase::OperationPhase;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let path = lock_path("cancel-linearization");
+        let manager = OperationManager::new(path.clone());
+        let calls = AtomicUsize::new(0);
+        let missing = OperationToken("missing".to_string());
+        assert!(!manager.request_cancellation(&missing, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+
+        let guard = manager.begin(OperationKind::Update).unwrap();
+        let owner = guard.token().clone();
+        assert!(manager.request_cancellation(&owner, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        manager
+            .set_phase(guard.token(), OperationPhase::Committing)
+            .unwrap();
+        assert!(!manager.request_cancellation(&owner, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(guard);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn pause_signal_and_paused_marker_share_the_same_live_lease() {
+        use crate::app::op_phase::OperationPhase;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let path = lock_path("pause-linearization");
+        let manager = OperationManager::new(path.clone());
+        let calls = AtomicUsize::new(0);
+        let missing = OperationToken("missing".to_string());
+        assert!(!manager.request_pause(&missing, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+
+        let guard = manager.begin(OperationKind::Update).unwrap();
+        let owner = guard.token().clone();
+        assert!(!manager.request_pause(&owner, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+        assert!(!manager.snapshot().unwrap().paused);
+        assert!(manager.request_pause(&owner, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        assert!(manager.snapshot().unwrap().paused);
+
+        manager
+            .set_phase(guard.token(), OperationPhase::Committing)
+            .unwrap();
+        assert!(!manager.request_pause(&owner, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        drop(guard);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stale_stop_token_cannot_target_the_next_operation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let path = lock_path("stale-stop-token");
+        let manager = OperationManager::new(path.clone());
+        let first = manager.begin(OperationKind::Update).unwrap();
+        let stale = first.token().clone();
+        drop(first);
+
+        let second = manager.begin(OperationKind::Install).unwrap();
+        let calls = AtomicUsize::new(0);
+        assert!(!manager.request_cancellation(&stale, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        assert!(!manager.request_pause(&stale, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!manager.snapshot().unwrap().paused);
+
+        assert!(manager.request_pause(second.token(), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(manager.snapshot().unwrap().paused);
+
+        drop(second);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn confirmed_quit_preparation_linearizes_before_commit_transition() {
+        use crate::app::op_phase::{OperationPhase, QuitPolicy};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let path = lock_path("confirmed-quit-linearization");
+        let manager = OperationManager::new(path.clone());
+        let guard = manager.begin(OperationKind::Install).unwrap();
+        manager
+            .set_phase(guard.token(), OperationPhase::Verifying)
+            .unwrap();
+
+        let attempted = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(2));
+        let worker_manager = manager.clone();
+        let worker_token = guard.token().clone();
+        let worker_attempted = Arc::clone(&attempted);
+        let worker_completed = Arc::clone(&completed);
+        let worker_start = Arc::clone(&start);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            worker_attempted.store(true, Ordering::SeqCst);
+            worker_manager
+                .set_phase(&worker_token, OperationPhase::Committing)
+                .unwrap();
+            worker_completed.store(true, Ordering::SeqCst);
+        });
+
+        let prepared_for_quit = Arc::clone(&prepared);
+        let policy = manager.prepare_quit(true, true, || {
+            start.wait();
+            while !attempted.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "phase transition must stay behind confirmed-quit preparation"
+            );
+            prepared_for_quit.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(policy, QuitPolicy::Confirm);
+        assert!(prepared.load(Ordering::SeqCst));
+        worker.join().unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+
+        let blocked_preparation = AtomicBool::new(false);
+        let blocked = manager.prepare_quit(true, true, || {
+            blocked_preparation.store(true, Ordering::SeqCst);
+        });
+        assert!(matches!(blocked, QuitPolicy::Block { .. }));
+        assert!(!blocked_preparation.load(Ordering::SeqCst));
+
+        let needs_confirmation = AtomicBool::new(false);
+        manager
+            .set_phase(guard.token(), OperationPhase::Verifying)
+            .unwrap();
+        let confirm = manager.prepare_quit(true, false, || {
+            needs_confirmation.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(confirm, QuitPolicy::Confirm);
+        assert!(!needs_confirmation.load(Ordering::SeqCst));
+
+        let automatic_preparation = AtomicBool::new(false);
+        let allow = manager.prepare_quit(false, false, || {
+            automatic_preparation.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(allow, QuitPolicy::Allow);
+        assert!(automatic_preparation.load(Ordering::SeqCst));
+
+        drop(guard);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn quit_abandons_unclaimed_destructive_token_or_commit_claim_blocks_quit() {
+        use crate::app::op_phase::{OperationPhase, QuitPolicy};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let path = lock_path("quit-vs-destructive-claim");
+        let manager = OperationManager::new(path.clone());
+
+        // Quit wins: the still-unclaimed token is removed, so its delayed command
+        // cannot validate and begin destructive work after force-exit preparation.
+        let abandoned = manager.begin_detached(OperationKind::Uninstall).unwrap();
+        let prepared = AtomicBool::new(false);
+        assert_eq!(
+            manager.prepare_quit(false, false, || prepared.store(true, Ordering::SeqCst)),
+            QuitPolicy::Allow
+        );
+        assert!(prepared.load(Ordering::SeqCst));
+        assert!(matches!(
+            manager.validate_with_phase(&abandoned, OperationPhase::Committing),
+            Err(OperationError::InvalidToken)
+        ));
+        assert!(!manager.is_busy());
+
+        // Destructive claim wins: validation and Committing are atomic, so quit
+        // observes the point of no return and does not run its preparation closure.
+        let committed = manager.begin_detached(OperationKind::Uninstall).unwrap();
+        manager
+            .validate_with_phase(&committed, OperationPhase::Committing)
+            .unwrap();
+        let should_not_prepare = AtomicBool::new(false);
+        let blocked = manager.prepare_quit(false, false, || {
+            should_not_prepare.store(true, Ordering::SeqCst);
+        });
+        assert!(matches!(blocked, QuitPolicy::Block { .. }));
+        assert!(!should_not_prepare.load(Ordering::SeqCst));
+        manager.end(committed).unwrap();
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

@@ -620,17 +620,17 @@ export const managerApi = {
     }
     return invoke<MacInstallStatus>("mac_install");
   },
-  macPauseDownload(): Promise<boolean> {
+  macPauseDownload(operationId: string): Promise<boolean> {
     if (!hasTauriRuntime()) {
       return Promise.resolve(true);
     }
-    return invoke<boolean>("mac_pause_download");
+    return invoke<boolean>("mac_pause_download", { operationId });
   },
-  macCancelDownload(): Promise<boolean> {
+  macCancelDownload(operationId: string): Promise<boolean> {
     if (!hasTauriRuntime()) {
       return Promise.resolve(true);
     }
-    return invoke<boolean>("mac_cancel_download");
+    return invoke<boolean>("mac_cancel_download", { operationId });
   },
   // Discard a PAUSED download's cached partial (paused-state cancel).
   macDiscardDownload(): Promise<void> {
@@ -846,17 +846,17 @@ export const managerApi = {
     }
     return invoke<WinUpdateReport>("win_plan_update").then(guardWinReport);
   },
-  winPauseDownload(): Promise<boolean> {
+  winPauseDownload(operationId: string): Promise<boolean> {
     if (!hasTauriRuntime()) {
       return Promise.resolve(true);
     }
-    return invoke<boolean>("win_pause_download");
+    return invoke<boolean>("win_pause_download", { operationId });
   },
-  winCancelDownload(): Promise<boolean> {
+  winCancelDownload(operationId: string): Promise<boolean> {
     if (!hasTauriRuntime()) {
       return Promise.resolve(true);
     }
-    return invoke<boolean>("win_cancel_download");
+    return invoke<boolean>("win_cancel_download", { operationId });
   },
   // Discard a PAUSED download's cached partial (paused-state cancel).
   winDiscardDownload(): Promise<void> {

@@ -12,7 +12,7 @@
 //! already on the latest build (the user's case during development).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::Serialize;
 
@@ -577,7 +577,7 @@ pub fn stage_macos_update_with_network(
     // A standalone stage can also be cancelled (its download sets the abort
     // latch). Own a guard so a cancelled stage can't leave the latch set and
     // make the NEXT perform/install abort itself at its first checkpoint.
-    let _abort_guard = AbortGuard;
+    let _abort_guard = AbortGuard::new();
     let installed = detect_managed_installed();
     let (_, xml) = fetch_appcast_for_arch(arch_of(&installed), network)?;
     let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
@@ -838,7 +838,7 @@ pub fn perform_macos_update_with_network_and_phase(
     };
     // Reset the latch when THIS op ends (not at entry) so a cancel racing the
     // op's startup isn't wiped. See AbortGuard.
-    let _abort_guard = AbortGuard;
+    let _abort_guard = AbortGuard::new();
     set_phase(OperationPhase::Preparing);
     // A vanished install is itself a stale snapshot: the user confirmed an
     // update against a Codex that is no longer there (deleted / moved between
@@ -999,10 +999,9 @@ pub fn perform_macos_update_with_network_and_phase(
             ));
         }
 
-        // Point of no return. Honor a cancel one last time BEFORE we touch the
-        // user's running Codex — this also closes the gap after the preparing-
-        // phase checkpoint where a fully-cached artifact skips the download loop
-        // (so its cancel flag never arms) yet reconstruct/gate still ran.
+        // Honor a cancel before touching the user's running Codex. A second,
+        // phase-linearized checkpoint immediately before the swap closes the
+        // later quit/cancel window.
         check_update_abort()?;
 
         // Re-verify the TARGET right before the destructive tail: the early
@@ -1038,6 +1037,15 @@ pub fn perform_macos_update_with_network_and_phase(
         quit_codex_gracefully(&install_path)?;
         log::info!("macOS perform step=swap");
         set_phase(OperationPhase::Committing);
+        // The phase transition and the app quit preparation share the operation
+        // mutex. If quit won first its latch is now visible; if commit won first,
+        // quit was blocked. No destructive rename occurs between those outcomes.
+        if let Err(err) = check_update_abort() {
+            if was_running {
+                let _ = relaunch(&install_path);
+            }
+            return Err(err);
+        }
         let had_previous = install_path.exists();
         let mut tx = ActiveInstallTx::begin(
             InstallTxKind::MacosSwap,
@@ -1332,9 +1340,17 @@ pub fn install_macos_with_network(
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
 ) -> Result<MacInstallStatus, AppError> {
+    install_macos_with_network_and_phase(progress, network, None)
+}
+
+pub fn install_macos_with_network_and_phase(
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase_hook: Option<&PhaseHook<'_>>,
+) -> Result<MacInstallStatus, AppError> {
     log::info!("macOS install start");
     // Reset on op end, not entry — race-free cancel (see AbortGuard).
-    let _abort_guard = AbortGuard;
+    let _abort_guard = AbortGuard::new();
     if detect_installed().is_some() {
         return Err(AppError::Engine(
             "已检测到 Codex,请使用更新而非安装".to_string(),
@@ -1369,6 +1385,7 @@ pub fn install_macos_with_network(
         &staging,
         progress,
         network,
+        phase_hook,
     );
     match install_result {
         Ok(status) => {
@@ -1396,6 +1413,7 @@ fn install_macos_in_staging(
     staging: &StagingDir,
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
+    phase_hook: Option<&PhaseHook<'_>>,
 ) -> Result<MacInstallStatus, AppError> {
     let work = staging.path();
     let out_app = staging.join("Codex.app");
@@ -1403,6 +1421,9 @@ fn install_macos_in_staging(
 
     // Full package only — no basis bundle to delta against.
     reconstruct_full(appcast, work, &out_app, progress, network)?;
+    if let Some(hook) = phase_hook {
+        hook(OperationPhase::Verifying);
+    }
     gate_reconstructed(&out_app)
         .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝安装）: {e}")))?;
 
@@ -1412,11 +1433,19 @@ fn install_macos_in_staging(
             install_dir.display()
         )));
     }
-    // Point of no return. Last cancel check before writing into the install
-    // location — covers a cached-artifact path that skipped the download loop.
+    // Publish the point-of-no-return while the same operation token is still
+    // held, then perform one final cancel checkpoint. A cancel that won the
+    // operation mutex first leaves its latch for this checkpoint; a later cancel
+    // sees Committing and is rejected instead of racing the rename.
+    if let Some(hook) = phase_hook {
+        hook(OperationPhase::Committing);
+    }
     check_update_abort()?;
     std::fs::rename(&out_app, install_path)
         .map_err(|e| AppError::Engine(format!("写入 {} 失败: {e}", install_dir.display())))?;
+    if let Some(hook) = phase_hook {
+        hook(OperationPhase::Finishing);
+    }
 
     let mut outcome = OperationOutcome::full_success("present", Some("managed"));
     outcome.cleanup = StepOutcome::not_applicable();
@@ -1487,7 +1516,7 @@ pub fn launch_codex() -> Result<(), AppError> {
 /// a cancel pressed during "正在准备" be honored at the next checkpoint.
 static UPDATE_ABORT: AtomicBool = AtomicBool::new(false);
 
-fn clear_update_abort() {
+pub(crate) fn clear_update_abort() {
     UPDATE_ABORT.store(false, Ordering::SeqCst);
 }
 
@@ -1497,13 +1526,27 @@ fn clear_update_abort() {
 /// showing its cancel button and this operation reaching its first checkpoint is
 /// NOT wiped by an entry-clear, so the checkpoint still observes it; the latch is
 /// reset only once this operation is done, leaving the next one clean. The cancel
-/// command does not hold the op lock, so this startup window is real — hence the
-/// guard instead of an entry reset.
+/// command now binds the latch to the owning operation under the op lock, but the
+/// worker may still be between entry and its first checkpoint — hence the guard
+/// instead of an entry reset.
 struct AbortGuard;
+
+static UPDATE_ABORT_GUARD_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+impl AbortGuard {
+    fn new() -> Self {
+        UPDATE_ABORT_GUARD_DEPTH.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
 
 impl Drop for AbortGuard {
     fn drop(&mut self) {
-        clear_update_abort();
+        let previous = UPDATE_ABORT_GUARD_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "AbortGuard depth underflow");
+        if previous == 1 {
+            clear_update_abort();
+        }
     }
 }
 
@@ -1815,20 +1858,29 @@ mod tests {
 
     #[test]
     fn abort_guard_preserves_a_startup_race_cancel_and_resets_on_drop() {
+        let _serial = crate::app::oplock::CANCEL_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The race a reviewer flagged: a cancel can land BEFORE perform reaches
-        // its first checkpoint — the cancel command holds no op lock, and the UI
-        // shows the cancel button the moment it enters the progress state, before
-        // the backend call returns. Clearing the latch at op ENTRY would wipe that
+        // its first checkpoint even though the command now validates the owning
+        // token under the op lock. Clearing the latch at op ENTRY would wipe that
         // cancel; AbortGuard clears on DROP instead, so a pending cancel survives
         // the guard's creation and is still observed, while the next op starts
-        // clean. (Only this test touches UPDATE_ABORT, so it can't race others.)
+        // clean. OperationManager cleanup shares the same test-only serial lock.
         UPDATE_ABORT.store(true, Ordering::SeqCst); // a cancel that beat the op
         {
-            let _guard = AbortGuard;
+            let outer = AbortGuard::new();
+            let inner = AbortGuard::new();
             assert!(
                 check_update_abort().is_err(),
                 "guard creation must not wipe a pending cancel"
             );
+            drop(inner);
+            assert!(
+                check_update_abort().is_err(),
+                "a nested guard must not clear the owning operation's cancel"
+            );
+            drop(outer);
         }
         assert!(
             check_update_abort().is_ok(),

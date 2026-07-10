@@ -1,9 +1,10 @@
 import type { RefObject } from "react";
 
 import type { DownloadProgress } from "../../shared/types";
+import type { FailureSurface } from "../errorCopy";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
-import { Ring, TopBar } from "../components";
+import { FailureBanner, Ring, TopBar } from "../components";
 import { mib } from "../format";
 
 export type DownloadStopIntent = "pause" | "cancel";
@@ -29,6 +30,7 @@ export function ProgressScreen({
   installing,
   downloadStop,
   downloadStopBusy,
+  failure,
   onResume,
   onPause,
   onCancel,
@@ -46,6 +48,7 @@ export function ProgressScreen({
   installing: boolean;
   downloadStop: DownloadStopIntent | null;
   downloadStopBusy: boolean;
+  failure: FailureSurface | null;
   onResume: () => void;
   onPause: () => void;
   onCancel: () => void;
@@ -62,12 +65,16 @@ export function ProgressScreen({
   // mac, sideload/extract on Windows). Say so and drop the dead buttons rather
   // than leave them greyed for no visible reason.
   const finishing = !paused && Boolean(snap && snap.total > 0 && snap.downloaded >= snap.total);
+  const uninterruptible = failure?.code === "download_stop_uninterruptible";
   // Pause only makes sense mid-transfer; cancel is the "abandon" out and works
   // through the preparing phase too (a backend abort checkpoint honors it), but
   // not once the install has begun.
   const canPause =
-    !paused && Boolean(dl && dl.total > 0 && dl.downloaded < dl.total) && !downloadStopBusy;
-  const canCancel = !paused && !finishing && !downloadStopBusy;
+    !paused &&
+    !uninterruptible &&
+    Boolean(dl && dl.total > 0 && dl.downloaded < dl.total) &&
+    !downloadStopBusy;
+  const canCancel = !paused && !finishing && !uninterruptible && !downloadStopBusy;
 
   const phase = paused
     ? t("progress.paused.title")
@@ -81,6 +88,7 @@ export function ProgressScreen({
     <div className="pop">
       <TopBar />
       <div className="scroll" ref={scopeRef}>
+        {failure ? <FailureBanner failure={failure} /> : null}
         <div className="hero" style={{ marginTop: 24 }} key={scene}>
           <Ring icon={paused ? "pause" : "loader"} spin={!paused} className="glow" />
           <div className={`headline${paused ? "" : " shimmer"}`}>
@@ -123,7 +131,7 @@ export function ProgressScreen({
           ) : null}
           <div className="progress-actions">
             {paused ? (
-              <button className="btn primary" onClick={onResume}>
+              <button className="btn primary" onClick={onResume} disabled={downloadStopBusy}>
                 <Icon name="play" />
                 {t("progress.resume")}
               </button>
@@ -136,7 +144,7 @@ export function ProgressScreen({
             <button
               className="btn danger"
               onClick={onCancel}
-              disabled={!paused && !canCancel}
+              disabled={downloadStopBusy || (!paused && !canCancel)}
             >
               <Icon name="close" />
               {downloadStop === "cancel" ? t("progress.cancelPending") : t("progress.cancel")}

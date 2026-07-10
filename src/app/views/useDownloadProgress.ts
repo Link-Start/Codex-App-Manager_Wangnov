@@ -1,8 +1,13 @@
 import { useCallback, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 
-import type { DownloadProgress } from "../../shared/types";
-import { messageFailure, resolveFailure, type FailureSurface } from "../errorCopy";
+import { errorCode } from "../../services/managerApi";
+import type { DownloadProgress, OperationSnapshot } from "../../shared/types";
+import {
+  contextualFailure,
+  messageFailure,
+  type FailureSurface,
+} from "../errorCopy";
 import { useI18n } from "../i18n";
 import { useCountUp } from "../useCountUp";
 import type { DownloadStopIntent } from "./ProgressScreen";
@@ -21,12 +26,12 @@ export type StartDlListenOptions = {
  *  can drive its own banner (with optional raw detail disclosure). */
 export function useDownloadProgress(opts: {
   eventName: string;
-  pauseDownload: () => Promise<boolean>;
-  cancelDownload: () => Promise<boolean>;
-  cannotCancelMessage: string;
+  pauseDownload: (operationId: string) => Promise<boolean>;
+  cancelDownload: (operationId: string) => Promise<boolean>;
+  getOperationSnapshot: () => Promise<OperationSnapshot | null>;
   onError: (failure: FailureSurface | null) => void;
 }) {
-  const { eventName, pauseDownload, cancelDownload, cannotCancelMessage, onError } = opts;
+  const { eventName, pauseDownload, cancelDownload, getOperationSnapshot, onError } = opts;
   const { t } = useI18n();
 
   const [dl, setDl] = useState<DownloadProgress | null>(null);
@@ -35,6 +40,9 @@ export function useDownloadProgress(opts: {
   const [downloadStop, setDownloadStop] = useState<DownloadStopIntent | null>(null);
   const [downloadStopBusy, setDownloadStopBusy] = useState(false);
   const downloadStopRef = useRef<DownloadStopIntent | null>(null);
+  // Monotonic generation for stop IPC. resetStop invalidates a response from an
+  // operation that settled while the command or its snapshot probe was pending.
+  const downloadStopRequestIdRef = useRef(0);
   // Latest live progress, read at pause time to snapshot the paused figures
   // (the `dl` state is cleared when the perform/install call unwinds).
   const dlRef = useRef<DownloadProgress | null>(null);
@@ -114,31 +122,133 @@ export function useDownloadProgress(opts: {
 
   const requestDownloadStop = useCallback(
     async (intent: DownloadStopIntent) => {
+      // React state does not disable the button until the next render. The ref
+      // closes that gap so a fast double-click cannot enqueue two stop commands.
+      if (downloadStopRef.current) return;
+      const requestId = ++downloadStopRequestIdRef.current;
+      // Capture the owner synchronously. A late IPC response must never infer a
+      // newly-started operation as its target.
+      const requestedOperationId = activeOperationIdRef.current;
       onError(null);
       setDownloadStop(intent);
       setDownloadStopBusy(true);
       downloadStopRef.current = intent;
-      try {
-        const active = intent === "pause" ? await pauseDownload() : await cancelDownload();
-        if (!active) {
-          downloadStopRef.current = null;
-          setDownloadStop(null);
-          setDownloadStopBusy(false);
-          onError(messageFailure(cannotCancelMessage, "cancelled"));
-        }
-      } catch (cause) {
+
+      const isCurrent = () =>
+        downloadStopRequestIdRef.current === requestId && downloadStopRef.current === intent;
+      const clearCurrent = () => {
+        if (!isCurrent()) return false;
         downloadStopRef.current = null;
         setDownloadStop(null);
         setDownloadStopBusy(false);
-        onError(resolveFailure(cause, t));
+        return true;
+      };
+      const probeSnapshot = async () => {
+        try {
+          return { available: true as const, snapshot: await getOperationSnapshot() };
+        } catch {
+          return { available: false as const, snapshot: null };
+        }
+      };
+      const uninterruptibleFailure = () =>
+        messageFailure(
+          t("progress.stopUninterruptible"),
+          "download_stop_uninterruptible",
+          false,
+        );
+
+      // Snapshot is authoritative when available. This closes the UI-event lag
+      // window where the final progress packet has not arrived but the backend
+      // has already entered committing/finishing.
+      const before = await probeSnapshot();
+      if (!isCurrent()) return;
+      const operationId = requestedOperationId ?? before.snapshot?.id ?? null;
+      if (!operationId) {
+        clearCurrent();
+        onError(
+          messageFailure(
+            t("progress.stopDeliveryFailed", { action: t(`progress.${intent}`) }),
+            "download_stop_not_delivered",
+          ),
+        );
+        return;
+      }
+      // If this renderer was already bound to A but the backend now reports B,
+      // the request is stale. Let A's completion/reset drive the UI; do not arm B.
+      if (before.snapshot && before.snapshot.id !== operationId) {
+        clearCurrent();
+        return;
+      }
+      if (!activeOperationIdRef.current) {
+        activeOperationIdRef.current = operationId;
+      }
+      if (before.snapshot && !before.snapshot.cancellable) {
+        clearCurrent();
+        onError(uninterruptibleFailure());
+        return;
+      }
+
+      try {
+        const active =
+          intent === "pause"
+            ? await pauseDownload(operationId)
+            : await cancelDownload(operationId);
+        if (!active) {
+          const after = await probeSnapshot();
+          if (!isCurrent()) return;
+          // A successful empty snapshot means the operation settled before the
+          // stop response. Do not paint a stale failure over its result screen.
+          if (before.snapshot && after.available && !after.snapshot) {
+            clearCurrent();
+            return;
+          }
+          const uninterruptible = Boolean(after.snapshot && !after.snapshot.cancellable);
+          clearCurrent();
+          onError(
+            uninterruptible
+              ? uninterruptibleFailure()
+              : messageFailure(
+                  t("progress.stopRejected", { action: t(`progress.${intent}`) }),
+                  "download_stop_rejected",
+                ),
+          );
+        }
+      } catch (cause) {
+        const after = await probeSnapshot();
+        if (!isCurrent()) return;
+        if (before.snapshot && after.available && !after.snapshot) {
+          clearCurrent();
+          return;
+        }
+        if (after.snapshot && !after.snapshot.cancellable) {
+          clearCurrent();
+          onError(uninterruptibleFailure());
+          return;
+        }
+        const delivered = errorCode(cause) !== null;
+        clearCurrent();
+        onError(
+          contextualFailure(
+            cause,
+            t,
+            t(delivered ? "progress.stopRejected" : "progress.stopDeliveryFailed", {
+              action: t(`progress.${intent}`),
+            }),
+            delivered ? "download_stop_rejected" : "download_stop_not_delivered",
+          ),
+        );
       }
     },
-    [pauseDownload, cancelDownload, cannotCancelMessage, onError, t],
+    [pauseDownload, cancelDownload, getOperationSnapshot, onError, t],
   );
 
   // Clear the transfer + stop state when a perform/install call unwinds.
   const resetStop = useCallback(() => {
+    downloadStopRequestIdRef.current += 1;
     setDl(null);
+    dlRef.current = null;
+    setSpeed(0);
+    dlSample.current = null;
     setDownloadStop(null);
     setDownloadStopBusy(false);
     downloadStopRef.current = null;

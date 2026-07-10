@@ -7,7 +7,7 @@
 //!     verification into staging. Non-destructive; it does not install yet.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -568,7 +568,7 @@ pub fn stage_windows_update_with_install_mode_and_network(
     // (Nesting under perform's guard can't lose a reachable cancel: once the
     // download completes the UI is in the "finishing" state with cancel disabled,
     // so no cancel lands during stage's post-download verify.)
-    let _abort_guard = WinAbortGuard;
+    let _abort_guard = WinAbortGuard::new();
     let report = plan_windows_update_with_install_mode_and_network(
         endpoints,
         settings,
@@ -896,7 +896,7 @@ pub fn auto_stage_windows_update_with_install_mode_and_network(
 /// cancel flag can't reach. Reset on op end via `WinAbortGuard`, not at entry.
 static WIN_UPDATE_ABORT: AtomicBool = AtomicBool::new(false);
 
-fn clear_win_update_abort() {
+pub(crate) fn clear_win_update_abort() {
     WIN_UPDATE_ABORT.store(false, Ordering::SeqCst);
 }
 
@@ -904,16 +904,30 @@ fn clear_win_update_abort() {
 /// DROP (not at entry) keeps the cancel race-free: a cancel landing between the
 /// UI showing its button and the op reaching its first checkpoint isn't wiped, so
 /// the checkpoint observes it; the next op still starts clean. The cancel command
-/// doesn't hold the op lock, so this startup window is real. Owned by both
+/// now validates the owning token under the op lock, but the worker can still be
+/// between entry and its first checkpoint. Owned by both
 /// `perform` and `stage` (so background `auto_stage` and the standalone
-/// `win_stage_update` can't leak a set latch into the next op). The perform→stage
-/// nesting is harmless: clears are idempotent, and the only window the inner clear
-/// could touch (stage's post-download verify) has the UI cancel already disabled.
+/// `win_stage_update` can't leak a set latch into the next op). Nested guards are
+/// reference-counted: an inner stage return cannot clear a quit/cancel owned by
+/// the still-running outer perform operation.
 struct WinAbortGuard;
+
+static WIN_ABORT_GUARD_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+impl WinAbortGuard {
+    fn new() -> Self {
+        WIN_ABORT_GUARD_DEPTH.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
 
 impl Drop for WinAbortGuard {
     fn drop(&mut self) {
-        clear_win_update_abort();
+        let previous = WIN_ABORT_GUARD_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "WinAbortGuard depth underflow");
+        if previous == 1 {
+            clear_win_update_abort();
+        }
     }
 }
 
@@ -1033,7 +1047,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
     // Reset the latch when THIS perform ends (not at stage entry) so a cancel
     // racing the op's startup isn't wiped, and `auto_stage` never clears it. See
     // WinAbortGuard.
-    let _abort_guard = WinAbortGuard;
+    let _abort_guard = WinAbortGuard::new();
     set_phase(OperationPhase::Preparing);
     if !confirm {
         return Err(AppError::Internal(
@@ -1086,8 +1100,9 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
     // Point of no return. Honor a cancel one last time BEFORE closing Codex or
     // sideloading — closes the gap after staging where a fully-cached MSIX skips
     // the download loop (so its cancel flag never arms) yet still reaches here.
-    check_win_update_abort()?;
     set_phase(OperationPhase::Committing);
+    // Linearized with every native/window quit path by OperationManager.
+    check_win_update_abort()?;
 
     if stage.route == "portable-fallback" {
         log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
@@ -1858,17 +1873,27 @@ mod tests {
 
     #[test]
     fn win_abort_guard_preserves_a_startup_race_cancel_and_resets_on_drop() {
+        let _serial = crate::app::oplock::CANCEL_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Mirrors the macOS guard test: a cancel landing before `perform` reaches
         // its first checkpoint must survive the guard's creation (no entry-clear)
         // and still be observed; the guard resets the latch on drop so the next
         // op — and background auto_stage — start clean.
         WIN_UPDATE_ABORT.store(true, Ordering::SeqCst);
         {
-            let _guard = WinAbortGuard;
+            let outer = WinAbortGuard::new();
+            let inner = WinAbortGuard::new();
             assert!(
                 check_win_update_abort().is_err(),
                 "guard creation must not wipe a pending cancel"
             );
+            drop(inner);
+            assert!(
+                check_win_update_abort().is_err(),
+                "a nested guard must not clear the owning operation's cancel"
+            );
+            drop(outer);
         }
         assert!(
             check_win_update_abort().is_ok(),
