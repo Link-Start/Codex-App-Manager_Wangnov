@@ -283,16 +283,47 @@ impl OperationManager {
     }
 
     /// Unified quit/close policy for window close, menu quit, and quit command.
+    ///
+    /// Reads busy/phase/kind under a **single** mutex hold so a concurrent
+    /// `end`/`set_phase` cannot TOCTOU the snapshot between separate queries.
     pub fn quit_policy(&self, force_quit: bool, confirm_close: bool) -> QuitPolicy {
-        let busy = self.is_busy();
-        let phase = self.phase();
-        let kind = self.active_kind();
-        // Cross-process lock without a local ActiveOp: treat as non-interruptible
-        // finishing so we never kill another instance mid-swap.
-        let phase = if busy && kind.is_none() && phase == OperationPhase::Idle {
-            OperationPhase::Finishing
+        if force_quit {
+            return QuitPolicy::Allow;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            // Poisoned mutex: refuse exit rather than risk killing mid-swap.
+            return QuitPolicy::evaluate(
+                false,
+                confirm_close,
+                true,
+                OperationPhase::Finishing,
+                None,
+            );
+        };
+        // Reclaim abandoned unclaimed tokens before deciding.
+        let _ = self.reclaim_stale_detached(&mut inner);
+
+        let (busy, phase, kind) = if let Some(active) = inner.active.as_ref() {
+            (true, active.phase, Some(active.kind))
         } else {
-            phase
+            // Cross-process lock without a local ActiveOp: treat as
+            // non-interruptible finishing so we never kill another instance mid-swap.
+            let other_busy = match Self::lock_file_mut(&mut inner) {
+                Ok(lock_file) => match Fs4FileExt::try_lock(lock_file) {
+                    Ok(()) => {
+                        let _ = Fs4FileExt::unlock(lock_file);
+                        false
+                    }
+                    Err(TryLockError::WouldBlock) => true,
+                    Err(TryLockError::Error(_)) => false,
+                },
+                Err(_) => false,
+            };
+            if other_busy {
+                (true, OperationPhase::Finishing, None)
+            } else {
+                (false, OperationPhase::Idle, None)
+            }
         };
         QuitPolicy::evaluate(force_quit, confirm_close, busy, phase, kind)
     }

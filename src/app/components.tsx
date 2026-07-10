@@ -77,7 +77,8 @@ function MinimizeButton() {
 export function QuitConfirm() {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
-  const [blockedReason, setBlockedReason] = useState<string | null>(null);
+  const [blockedCode, setBlockedCode] = useState<string | null>(null);
+  const [blockedFallback, setBlockedFallback] = useState<string | null>(null);
   const titleId = useId();
   const bodyId = useId();
 
@@ -85,23 +86,30 @@ export function QuitConfirm() {
     let unConfirm = () => {};
     let unBlocked = () => {};
     void listen("app://confirm-quit", () => {
-      setBlockedReason(null);
+      setBlockedCode(null);
+      setBlockedFallback(null);
       setOpen(true);
     })
       .then((f) => (unConfirm = f))
       .catch(() => undefined);
-    void listen<{ reason?: string }>("app://quit-blocked", (event) => {
-      const reason =
+    void listen<{ reasonCode?: string; reason?: string }>("app://quit-blocked", (event) => {
+      const code =
+        typeof event.payload?.reasonCode === "string" && event.payload.reasonCode.trim()
+          ? event.payload.reasonCode
+          : "busy";
+      const fallback =
         typeof event.payload?.reason === "string" && event.payload.reason.trim()
           ? event.payload.reason
           : null;
-      setBlockedReason(reason);
+      setBlockedCode(code);
+      setBlockedFallback(fallback);
       setOpen(true);
     })
       .then((f) => (unBlocked = f))
       .catch(() => undefined);
     const onWeb = () => {
-      setBlockedReason(null);
+      setBlockedCode(null);
+      setBlockedFallback(null);
       setOpen(true);
     };
     window.addEventListener("cam:confirm-quit", onWeb);
@@ -112,14 +120,24 @@ export function QuitConfirm() {
     };
   }, []);
 
-  const blocked = blockedReason !== null;
+  const blocked = blockedCode !== null;
+  const blockedBody = !blocked
+    ? t("close.confirm.body")
+    : blockedCode === "committing"
+      ? t("close.blocked.reason.committing")
+      : blockedCode === "finishing"
+        ? t("close.blocked.reason.finishing")
+        : blockedCode === "other-process"
+          ? t("close.blocked.reason.otherProcess")
+          : blockedFallback || t("close.blocked.body");
 
   return (
     <Sheet
       open={open}
       onDismiss={() => {
         setOpen(false);
-        setBlockedReason(null);
+        setBlockedCode(null);
+        setBlockedFallback(null);
       }}
       scrimClass="quit-scrim"
       labelledBy={titleId}
@@ -130,18 +148,15 @@ export function QuitConfirm() {
       <h3 id={titleId}>
         {blocked ? t("close.blocked.title") : t("close.confirm.title")}
       </h3>
-      <p id={bodyId}>
-        {blocked
-          ? blockedReason || t("close.blocked.body")
-          : t("close.confirm.body")}
-      </p>
+      <p id={bodyId}>{blocked ? blockedBody : t("close.confirm.body")}</p>
       <div className="row2">
         {blocked ? (
           <button
             className="btn primary"
             onClick={() => {
               setOpen(false);
-              setBlockedReason(null);
+              setBlockedCode(null);
+              setBlockedFallback(null);
             }}
           >
             {t("close.blocked.ok")}

@@ -38,11 +38,12 @@ fn apply_quit_policy(app: &tauri::AppHandle, policy: &QuitPolicy) -> bool {
         }
         QuitPolicy::Block {
             phase,
+            reason_code,
             reason,
             kind,
         } => {
             log::warn!(
-                "quit blocked phase={} kind={:?} reason={reason}",
+                "quit blocked phase={} reason_code={reason_code} kind={:?} reason={reason}",
                 phase.as_str(),
                 kind
             );
@@ -217,7 +218,8 @@ pub fn run() {
                 // Crash-safe install recovery MUST run before ordinary staging
                 // cleanup so recovery materials (backup / staged new) are not
                 // deleted out from under an incomplete swap.
-                let recovery = crate::app::install_tx::recover_pending_transactions();
+                let recovery =
+                    crate::app::install_tx::recover_pending_transactions(Some(&operations));
                 if recovery.failed > 0 || recovery.kept_manual > 0 {
                     log::warn!(
                         "install transaction recovery finished scanned={} continued={} rolled_back={} completed={} cleared={} kept_manual={} failed={}",

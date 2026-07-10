@@ -116,16 +116,24 @@ pub enum RecoveryAction {
 
 /// Decide recovery from the durable step + which paths still exist.
 ///
-/// Matrix (macOS swap and Windows portable share the same two-rename shape):
+/// Matrix (macOS swap and Windows portable share the same two-rename shape).
+///
+/// **Prepared is reality-based**: a process kill can land between
+/// `rename(old→backup)` and the durable `OldMoved` mark. Inspecting the disk
+/// (not the step alone) is required so we never ClearLog away a half-swap.
 ///
 /// | step          | install | backup | new | action            |
 /// |---------------|---------|--------|-----|-------------------|
-/// | prepared      | *       | *      | *   | clear log         |
+/// | prepared      | yes     | *      | *   | clear log (intact)|
+/// | prepared      | no      | yes    | yes | **continue**      |
+/// | prepared      | no      | yes    | no  | **rollback**      |
+/// | prepared      | no      | no     | yes | keep              |
+/// | prepared      | no      | no     | no  | keep              |
 /// | old-moved     | no      | yes    | yes | continue          |
 /// | old-moved     | no      | yes    | no  | rollback          |
 /// | old-moved     | no      | no     | yes | keep (no backup)  |
 /// | old-moved     | no      | no     | no  | keep (all missing)|
-/// | old-moved     | yes     | *      | *   | complete if prior |
+/// | old-moved     | yes     | *      | *   | complete          |
 /// | new-installed | yes     | *      | *   | complete          |
 /// | new-installed | no      | yes    | *   | rollback          |
 /// | new-installed | no      | no     | *   | keep              |
@@ -137,10 +145,22 @@ pub fn decide_recovery(
     new_exists: bool,
 ) -> RecoveryAction {
     match step {
-        InstallTxStep::Prepared => RecoveryAction::ClearLog,
         InstallTxStep::Completed | InstallTxStep::RolledBack => RecoveryAction::ClearLog,
         InstallTxStep::NeedsManual => RecoveryAction::KeepManual {
             reason: "previous recovery already marked needs-manual",
+        },
+        // Reality-based: Prepared may still mean "old already moved" if we died
+        // between rename and mark_old_moved.
+        InstallTxStep::Prepared => match (install_exists, backup_exists, new_exists) {
+            (true, _, _) => RecoveryAction::ClearLog,
+            (false, true, true) => RecoveryAction::ContinueInstall,
+            (false, true, false) => RecoveryAction::Rollback,
+            (false, false, true) => RecoveryAction::KeepManual {
+                reason: "prepared log but install missing, backup missing; staged new retained",
+            },
+            (false, false, false) => RecoveryAction::KeepManual {
+                reason: "prepared log but install/backup/new all missing",
+            },
         },
         InstallTxStep::OldMoved => match (install_exists, backup_exists, new_exists) {
             (false, true, true) => RecoveryAction::ContinueInstall,
@@ -161,6 +181,16 @@ pub fn decide_recovery(
             },
         },
     }
+}
+
+/// True when on-disk layout suggests a destructive rename already happened
+/// even if the durable step is still `Prepared`.
+pub fn prepared_looks_half_swapped(
+    install_exists: bool,
+    backup_exists: bool,
+    new_exists: bool,
+) -> bool {
+    !install_exists && (backup_exists || new_exists)
 }
 
 fn now_unix() -> u64 {
@@ -280,10 +310,90 @@ pub struct RecoverySummary {
     pub failed: usize,
 }
 
+/// Paths referenced by any pending (non-cleared) transaction, including
+/// `NeedsManual`. Staging cleanup must not delete these.
+///
+/// We protect install/new/backup **themselves** and staging-ish parents of
+/// `new_path` / `backup_path` (update-* dirs, `.codex-app-manager-staging`),
+/// but never the install's parent (e.g. `/Applications`) — that would block
+/// unrelated cleanup.
+pub fn protected_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(dir) = transactions_dir() else {
+        return out;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(tx) = InstallTransaction::load_from_path(&path) else {
+            continue;
+        };
+        if matches!(tx.step, InstallTxStep::Completed | InstallTxStep::RolledBack) {
+            continue;
+        }
+        for raw in [&tx.install_path, &tx.new_path, &tx.backup_path] {
+            out.push(PathBuf::from(raw));
+        }
+        // Staging parents for new + backup only.
+        for raw in [&tx.new_path, &tx.backup_path] {
+            let p = PathBuf::from(raw);
+            let mut cur = p.parent();
+            while let Some(parent) = cur {
+                let name = parent
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                let staging_ish = name.starts_with("update-")
+                    || name.starts_with("portable-")
+                    || name == ".codex-app-manager-staging"
+                    || name.starts_with("Codex.rollback")
+                    || name.starts_with("backup-");
+                if staging_ish {
+                    out.push(parent.to_path_buf());
+                    cur = parent.parent();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `path` is covered by a pending install transaction and must not be
+/// reclaimed by staging cleanup.
+pub fn path_is_protected(path: &Path, protected: &[PathBuf]) -> bool {
+    protected.iter().any(|p| path == p || path.starts_with(p) || p.starts_with(path))
+}
+
 /// Scan pending transaction logs and apply the recovery matrix. Must run
 /// **before** ordinary staging cleanup so recovery materials are not deleted.
-pub fn recover_pending_transactions() -> RecoverySummary {
+///
+/// When `ops` is provided, recovery holds an operation lease so concurrent
+/// install/update cannot race staging cleanup against recovery renames.
+pub fn recover_pending_transactions(
+    ops: Option<&crate::app::oplock::OperationManager>,
+) -> RecoverySummary {
     let mut summary = RecoverySummary::default();
+    let _lease = if let Some(ops) = ops {
+        match ops.begin(crate::app::oplock::OperationKind::Install) {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                log::warn!(
+                    "install transaction recovery deferred (operation busy) error={err}"
+                );
+                return summary;
+            }
+        }
+    } else {
+        None
+    };
+
     let Some(dir) = transactions_dir() else {
         return summary;
     };
@@ -465,6 +575,11 @@ impl ActiveInstallTx {
         Ok(())
     }
 
+    pub fn step(&self) -> Option<InstallTxStep> {
+        self.inner.as_ref().map(|tx| tx.step)
+    }
+
+    /// Mark success only after post-swap health / rollback has settled.
     pub fn succeed(mut self) -> Result<(), AppError> {
         if let Some(tx) = self.inner.take() {
             tx.complete()?;
@@ -472,13 +587,42 @@ impl ActiveInstallTx {
         Ok(())
     }
 
-    /// Explicit abort before any destructive rename — safe to delete the log.
+    /// Record a successful rollback and clear the log.
+    pub fn mark_rolled_back(mut self) -> Result<(), AppError> {
+        if let Some(mut tx) = self.inner.take() {
+            tx.step = InstallTxStep::RolledBack;
+            tx.updated_unix = now_unix();
+            let _ = tx.persist();
+            tx.remove_file();
+        }
+        Ok(())
+    }
+
+    /// Leave the log for startup recovery (e.g. keep backup after relaunch fail).
+    pub fn leave_pending(mut self) {
+        if let Some(tx) = self.inner.take() {
+            log::warn!(
+                "install transaction left pending id={} step={}",
+                tx.id,
+                tx.step.as_str()
+            );
+        }
+    }
+
+    /// Explicit abort before any destructive rename — safe to delete the log
+    /// only when disk still looks untouched.
     pub fn abort_clean(mut self) {
         if let Some(tx) = self.inner.take() {
-            if matches!(tx.step, InstallTxStep::Prepared) {
+            if matches!(tx.step, InstallTxStep::Prepared)
+                && !prepared_looks_half_swapped(
+                    path_exists(&tx.install_path),
+                    path_exists(&tx.backup_path),
+                    path_exists(&tx.new_path),
+                )
+            {
                 tx.remove_file();
             }
-            // If we already moved files, leave the log for startup recovery.
+            // Half-swapped Prepared / later steps: leave for startup recovery.
         }
     }
 }
@@ -486,14 +630,19 @@ impl ActiveInstallTx {
 impl Drop for ActiveInstallTx {
     fn drop(&mut self) {
         // Non-terminal logs intentionally survive process death / panic so the
-        // next launch can recover. Prepared-only logs without renames are
-        // cleared to avoid false-positive recovery.
+        // next launch can recover. Prepared-only logs are cleared ONLY when the
+        // install path still looks intact — never clear a half-swap.
         if let Some(tx) = self.inner.take() {
-            if matches!(tx.step, InstallTxStep::Prepared) {
+            let half = prepared_looks_half_swapped(
+                path_exists(&tx.install_path),
+                path_exists(&tx.backup_path),
+                path_exists(&tx.new_path),
+            );
+            if matches!(tx.step, InstallTxStep::Prepared) && !half {
                 tx.remove_file();
             } else {
                 log::warn!(
-                    "install transaction left pending for recovery id={} step={}",
+                    "install transaction left pending for recovery id={} step={} half_swapped={half}",
                     tx.id,
                     tx.step.as_str()
                 );
@@ -547,6 +696,7 @@ mod tests {
             decide_recovery(InstallTxStep::NewInstalled, false, false, false),
             RecoveryAction::KeepManual { .. }
         ));
+        // Intact prepared → clear.
         assert_eq!(
             decide_recovery(InstallTxStep::Prepared, true, false, true),
             RecoveryAction::ClearLog
@@ -555,6 +705,25 @@ mod tests {
             decide_recovery(InstallTxStep::Completed, true, false, false),
             RecoveryAction::ClearLog
         );
+    }
+
+    #[test]
+    fn prepared_step_reality_based_after_kill_between_rename_and_mark() {
+        // Crash window: rename(old→backup) done, mark_old_moved never wrote.
+        assert_eq!(
+            decide_recovery(InstallTxStep::Prepared, false, true, true),
+            RecoveryAction::ContinueInstall
+        );
+        assert_eq!(
+            decide_recovery(InstallTxStep::Prepared, false, true, false),
+            RecoveryAction::Rollback
+        );
+        assert!(matches!(
+            decide_recovery(InstallTxStep::Prepared, false, false, true),
+            RecoveryAction::KeepManual { .. }
+        ));
+        assert!(prepared_looks_half_swapped(false, true, true));
+        assert!(!prepared_looks_half_swapped(true, false, true));
     }
 
     fn test_root(name: &str) -> PathBuf {
@@ -616,5 +785,52 @@ mod tests {
         fs::rename(&backup, &install).unwrap();
         assert_eq!(fs::read_to_string(install.join("marker")).unwrap(), "old");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kill_between_rename_and_mark_still_recovers_from_prepared() {
+        // Full regression: log says Prepared, disk is post-rename(old→backup).
+        let root = test_root("kill-between-rename-mark");
+        let install = root.join("Codex.app");
+        let backup = root.join("backup-Codex.app");
+        let new_app = root.join("new-Codex.app");
+        fs::create_dir_all(backup.join("Contents")).unwrap();
+        fs::write(backup.join("Contents/ver"), "old").unwrap();
+        fs::create_dir_all(new_app.join("Contents")).unwrap();
+        fs::write(new_app.join("Contents/ver"), "new").unwrap();
+        // install intentionally missing (rename already happened).
+
+        let action = decide_recovery(
+            InstallTxStep::Prepared, // mark_old_moved never ran
+            install.exists(),
+            backup.exists(),
+            new_app.exists(),
+        );
+        assert_eq!(
+            action,
+            RecoveryAction::ContinueInstall,
+            "must not ClearLog a half-swap still marked Prepared"
+        );
+        // Apply continue action.
+        fs::rename(&new_app, &install).unwrap();
+        assert_eq!(
+            fs::read_to_string(install.join("Contents/ver")).unwrap(),
+            "new"
+        );
+        // Drop of Prepared ActiveInstallTx must NOT clear when half-swapped.
+        assert!(prepared_looks_half_swapped(false, true, true));
+        assert!(!prepared_looks_half_swapped(true, true, false));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_is_protected_covers_tx_staging_tree() {
+        let staging = PathBuf::from("/tmp/update-abc");
+        let nested = staging.join("Codex.app");
+        let protected = vec![staging.clone(), nested.clone()];
+        assert!(path_is_protected(&nested, &protected));
+        assert!(path_is_protected(&staging, &protected));
+        assert!(path_is_protected(&staging.join("backup"), &protected));
+        assert!(!path_is_protected(Path::new("/tmp/other"), &protected));
     }
 }

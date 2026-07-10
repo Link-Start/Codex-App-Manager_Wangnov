@@ -1015,12 +1015,13 @@ pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Re
     let policy = state.operations.quit_policy(false, confirm_close);
     if let QuitPolicy::Block {
         phase,
+        reason_code,
         reason,
         kind,
     } = &policy
     {
         log::warn!(
-            "confirm_quit blocked phase={} kind={:?} reason={reason}",
+            "confirm_quit blocked phase={} reason_code={reason_code} kind={:?} reason={reason}",
             phase.as_str(),
             kind
         );

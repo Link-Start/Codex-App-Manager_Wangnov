@@ -703,12 +703,24 @@ pub fn install_portable_from_msix_with_observer(
             .map_err(|e| io_err("move current install to rollback", e))?;
     }
 
-    observer(PortableBoundary::AfterMoveOld {
+    // Observer must persist OldMoved. On failure: restore previous install when
+    // possible so we never leave an empty root without a recovery path.
+    if let Err(obs_err) = observer(PortableBoundary::AfterMoveOld {
         install_root: install_root.to_path_buf(),
         payload: payload.clone(),
         backup: backup.clone(),
         had_previous,
-    })?;
+    }) {
+        if had_previous {
+            if let Err(rb) = restore_previous_install(install_root, &backup, had_previous) {
+                log::error!(
+                    "portable observer failed after move-old and rollback also failed: obs={obs_err} rollback={rb}"
+                );
+                // Crash window left for startup recovery.
+            }
+        }
+        return Err(obs_err);
+    }
     if fault == Some(PortableFault::AfterMoveOld) {
         // Leave the crash window intact for recovery tests (no auto-rollback).
         return Err(portable_fault_err("after-move-old"));
@@ -728,11 +740,15 @@ pub fn install_portable_from_msix_with_observer(
 
     match fs::rename(&payload, install_root) {
         Ok(()) => {
-            observer(PortableBoundary::AfterMoveNew {
+            if let Err(obs_err) = observer(PortableBoundary::AfterMoveNew {
                 install_root: install_root.to_path_buf(),
                 backup: backup.clone(),
                 had_previous,
-            })?;
+            }) {
+                // Payload is already at install_root; leave for recovery.
+                log::error!("portable observer failed after move-new: {obs_err}");
+                return Err(obs_err);
+            }
         }
         Err(err) => {
             let _ = restore_previous_install(install_root, &backup, had_previous);

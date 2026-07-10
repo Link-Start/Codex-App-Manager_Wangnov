@@ -1069,7 +1069,8 @@ pub fn perform_macos_update_with_network_and_phase(
             log::error!("macOS perform swap failed error={err}");
             return Err(AppError::Engine(err.to_string()));
         }
-        tx.succeed()?;
+        // Keep the transaction log through post-swap health / rollback — never
+        // complete() until that tail settles.
         set_phase(OperationPhase::Finishing);
 
         // 6) filesystem health check on the installed root.
@@ -1103,6 +1104,8 @@ pub fn perform_macos_update_with_network_and_phase(
                 log::info!("macOS perform step=relaunch");
                 if let Err(err) = relaunch(&install_path) {
                     keep_staging = true;
+                    // Leave NewInstalled log + backup for recovery / manual use.
+                    tx.leave_pending();
                     return Ok(MacPerformReport {
                         up_to_date: false,
                         from_build: installed.build,
@@ -1127,6 +1130,7 @@ pub fn perform_macos_update_with_network_and_phase(
 
             // Not running, or relaunched cleanly → the backup is no longer needed.
             let _ = std::fs::remove_dir_all(&backup);
+            tx.succeed()?;
             let report = MacPerformReport {
                 up_to_date: false,
                 from_build: installed.build,
@@ -1148,8 +1152,16 @@ pub fn perform_macos_update_with_network_and_phase(
             Ok(report)
         } else {
             log::warn!("macOS perform step=rollback");
-            rollback(&install_path, &backup)
-                .map_err(|e| AppError::Engine(format!("回滚失败（需人工介入）: {e}")))?;
+            match rollback(&install_path, &backup) {
+                Ok(()) => {
+                    tx.mark_rolled_back()?;
+                }
+                Err(e) => {
+                    // Leave NewInstalled log + materials for manual recovery.
+                    tx.leave_pending();
+                    return Err(AppError::Engine(format!("回滚失败（需人工介入）: {e}")));
+                }
+            }
             let relaunched = was_running && relaunch(&install_path).is_ok();
             Ok(MacPerformReport {
                 up_to_date: false,

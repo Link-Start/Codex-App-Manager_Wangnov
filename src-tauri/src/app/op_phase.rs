@@ -55,12 +55,25 @@ impl OperationPhase {
         matches!(self, Self::Committing | Self::Finishing)
     }
 
+    /// Stable machine code for frontend i18n (`close.blocked.reason.*`).
+    pub fn reason_code(self, kind: Option<OperationKind>) -> &'static str {
+        match (self, kind.is_none()) {
+            (Self::Committing, _) => "committing",
+            (Self::Finishing, true) => "other-process",
+            (Self::Finishing, false) => "finishing",
+            _ => "busy",
+        }
+    }
+
     pub fn user_reason(self, kind: Option<OperationKind>) -> String {
         let kind_label = kind.map(|k| k.as_str()).unwrap_or("operation");
         match self {
             Self::Committing => format!(
                 "正在执行关键文件替换（{kind_label}），强行退出可能导致安装不完整。请稍候完成。"
             ),
+            Self::Finishing if kind.is_none() => {
+                "另一个管理器实例正在执行操作，请稍候完成后再关闭。".to_string()
+            }
             Self::Finishing => format!(
                 "正在完成安装收尾（{kind_label}），请稍候完成后再关闭。"
             ),
@@ -84,6 +97,9 @@ pub enum QuitPolicy {
     /// Refuse exit and tell the user why (point of no return).
     Block {
         phase: OperationPhase,
+        /// Stable code for i18n (`committing` / `finishing` / `other-process`).
+        reason_code: String,
+        /// Human-readable fallback (Chinese log / older clients).
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
@@ -104,6 +120,7 @@ impl QuitPolicy {
         if busy && phase.is_point_of_no_return() {
             return Self::Block {
                 phase,
+                reason_code: phase.reason_code(kind).to_string(),
                 reason: phase.user_reason(kind),
                 kind: kind.map(|k| k.as_str().to_string()),
             };

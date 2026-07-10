@@ -153,6 +153,9 @@ pub fn cleanup_stale_staging(ops: &OperationManager) -> CleanupSummary {
         return summary;
     }
 
+    // Never delete paths still referenced by pending / NeedsManual install txs.
+    let protected = crate::app::install_tx::protected_paths();
+
     let root = staging_root();
     let now = SystemTime::now();
     if let Ok(entries) = std::fs::read_dir(&root) {
@@ -166,6 +169,13 @@ pub fn cleanup_stale_staging(ops: &OperationManager) -> CleanupSummary {
                 continue;
             }
             summary.scanned += 1;
+            if crate::app::install_tx::path_is_protected(&path, &protected) {
+                log::info!(
+                    "staging cleanup skipped protected path={}",
+                    path.display()
+                );
+                continue;
+            }
             if !is_stale(&path, now) {
                 continue;
             }
@@ -195,6 +205,9 @@ pub fn cleanup_stale_staging(ops: &OperationManager) -> CleanupSummary {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() || !is_stale(&path, now) {
+                continue;
+            }
+            if crate::app::install_tx::path_is_protected(&path, &protected) {
                 continue;
             }
             summary.scanned += 1;

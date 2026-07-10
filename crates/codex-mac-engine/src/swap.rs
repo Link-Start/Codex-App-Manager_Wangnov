@@ -271,7 +271,20 @@ pub fn swap_in_place_with_observer(
     }
 
     // Point of no return for "install missing": old is at backup (if any).
-    observer(SwapBoundary::AfterMoveOld)?;
+    // Observer must persist OldMoved here. On failure: roll old back when
+    // possible so we never leave an empty install without a recovery path.
+    if let Err(obs_err) = observer(SwapBoundary::AfterMoveOld) {
+        if had_old {
+            if let Err(rb) = std::fs::rename(backup_app, install_app) {
+                log::error!(
+                    "observer failed after move-old and rollback also failed: obs={obs_err} rollback={rb}"
+                );
+                // Leave crash window (backup + new present, install empty) for
+                // startup recovery; do not swallow the original error.
+            }
+        }
+        return Err(obs_err);
+    }
     if fault == Some(SwapFault::AfterMoveOld) {
         // Leave paths as-is for recovery tests (do NOT auto-rollback).
         return Err(fault_err("after-move-old"));
@@ -287,7 +300,12 @@ pub fn swap_in_place_with_observer(
 
     match std::fs::rename(new_app, install_app) {
         Ok(()) => {
-            observer(SwapBoundary::AfterMoveNew)?;
+            if let Err(obs_err) = observer(SwapBoundary::AfterMoveNew) {
+                // New is already at install; leave NewInstalled-pending for
+                // recovery rather than attempting a partial undo here.
+                log::error!("observer failed after move-new: {obs_err}");
+                return Err(obs_err);
+            }
             let install_path = install_app.display();
             log::info!("atomic swap completed install_path={install_path}");
             Ok(())
