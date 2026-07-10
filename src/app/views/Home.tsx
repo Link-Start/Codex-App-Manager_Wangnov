@@ -16,7 +16,7 @@ import { DEFAULT_SETTINGS } from "../../shared/types";
 import { resolveFailure, userErrorMessage, type FailureSurface } from "../errorCopy";
 import { Icon, CodexGlyph } from "../icons";
 import { useI18n, dirOf, type TKey } from "../i18n";
-import { Ring, TopBar, ResultBanner, ErrorHero, FailureBanner } from "../components";
+import { Ring, TopBar, ResultBanner, ErrorHero, FailureBanner, StatusBanner } from "../components";
 import { currentPlatform } from "../platform";
 import { WinHome } from "./WinHome";
 import { mib, fmtDateTime } from "../format";
@@ -226,8 +226,17 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     setPaused(null);
     const un = await startDlListen();
     try {
-      setStatus(await managerApi.macInstall());
-      setJustInstalled(true);
+      const status = await managerApi.macInstall();
+      setStatus(status);
+      // Primary install can succeed while provenance fails — still a completed
+      // install on disk; never treat it as a hard failure (would invite reinstall).
+      const outcome = status.outcome;
+      if (outcome?.primaryOk && outcome.recoveryActions.includes("record_provenance")) {
+        setNotice(t("install.partial.note"));
+        setJustInstalled(true);
+      } else {
+        setJustInstalled(true);
+      }
       await check();
     } catch (cause) {
       const stop = downloadStopRef.current;
@@ -530,11 +539,17 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   // Fresh-install completion — opening Codex is the user's explicit choice.
   if (justInstalled) {
+    const needsRecord =
+      status?.outcome?.recoveryActions.includes("record_provenance") ||
+      status?.status === "external";
     return (
       <div className="pop">
         <TopBar />
         <div className="scroll" ref={scopeRef}>
           {actionError ? <FailureBanner failure={actionError} /> : null}
+          {notice || needsRecord ? (
+            <StatusBanner tone="warn">{notice ?? t("install.partial.note")}</StatusBanner>
+          ) : null}
           <section className="hero" style={{ marginTop: 16 }} key={scene}>
             <Ring icon="check" variant="success" />
             <div className="headline">{t("install.done.title")}</div>
@@ -543,6 +558,18 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             </div>
           </section>
           <div className="actions">
+            {needsRecord ? (
+              <button
+                className="btn primary big"
+                onClick={() => {
+                  setJustInstalled(false);
+                  void adopt();
+                }}
+                disabled={busy === "adopt"}
+              >
+                {t("install.partial.record")}
+              </button>
+            ) : null}
             <button className="btn primary big" onClick={onLaunch}>
               <CodexGlyph />
               {t("install.done.open")}
