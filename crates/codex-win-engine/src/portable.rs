@@ -632,11 +632,90 @@ pub fn install_portable_from_msix(
     }
 }
 
+/// Rename boundary markers for crash-recovery callbacks and fault injection.
+/// Path-carrying variants let the app layer persist a durable transaction log
+/// with the real staging/backup locations chosen by this install.
+#[derive(Debug, Clone)]
+pub enum PortableBoundary {
+    /// About to move the current install aside. `payload` is the staged new tree;
+    /// `backup` is where the old install will go (if any).
+    BeforeMoveOld {
+        install_root: PathBuf,
+        payload: PathBuf,
+        backup: PathBuf,
+        had_previous: bool,
+    },
+    /// Old install is at `backup`; install path is empty.
+    AfterMoveOld {
+        install_root: PathBuf,
+        payload: PathBuf,
+        backup: PathBuf,
+        had_previous: bool,
+    },
+    BeforeMoveNew {
+        install_root: PathBuf,
+        payload: PathBuf,
+        backup: PathBuf,
+        had_previous: bool,
+    },
+    /// New payload is at install root.
+    AfterMoveNew {
+        install_root: PathBuf,
+        backup: PathBuf,
+        had_previous: bool,
+    },
+}
+
+pub type PortableObserver<'a> = dyn FnMut(PortableBoundary) -> Result<(), EngineError> + 'a;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableFault {
+    BeforeMoveOld,
+    AfterMoveOld,
+    OnMoveNew,
+}
+
+thread_local! {
+    static PORTABLE_FAULT: std::cell::Cell<Option<PortableFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install a one-shot fault for the next portable install rename sequence.
+pub fn inject_portable_fault(fault: Option<PortableFault>) {
+    PORTABLE_FAULT.with(|cell| cell.set(fault));
+}
+
+fn take_portable_fault() -> Option<PortableFault> {
+    PORTABLE_FAULT.with(|cell| cell.take())
+}
+
+fn portable_fault_err(boundary: &str) -> EngineError {
+    EngineError::Io(format!("injected portable fault at {boundary}"))
+}
+
 fn install_portable_from_msix_inner(
     msix_path: &Path,
     install_root: &Path,
     manage_process: bool,
     relaunch: bool,
+) -> Result<PortableInstallReport, EngineError> {
+    install_portable_from_msix_with_observer(
+        msix_path,
+        install_root,
+        manage_process,
+        relaunch,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Like the normal portable install path, but notifies `observer` at each
+/// rename boundary so callers can persist a crash-recovery transaction log.
+pub fn install_portable_from_msix_with_observer(
+    msix_path: &Path,
+    install_root: &Path,
+    manage_process: bool,
+    relaunch: bool,
+    observer: &mut PortableObserver<'_>,
 ) -> Result<PortableInstallReport, EngineError> {
     let install_parent = install_root.parent().unwrap_or(install_root);
     fs::create_dir_all(install_parent).map_err(|e| io_err("create install parent", e))?;
@@ -658,14 +737,72 @@ fn install_portable_from_msix_inner(
         request_codex_close_for_root(30, install_root)?;
     }
 
+    let fault = take_portable_fault();
     let had_previous = install_root.exists();
+
+    observer(PortableBoundary::BeforeMoveOld {
+        install_root: install_root.to_path_buf(),
+        payload: payload.clone(),
+        backup: backup.clone(),
+        had_previous,
+    })?;
+    if fault == Some(PortableFault::BeforeMoveOld) {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(portable_fault_err("before-move-old"));
+    }
+
     if had_previous {
         fs::rename(install_root, &backup)
             .map_err(|e| io_err("move current install to rollback", e))?;
     }
 
+    // Observer must persist OldMoved. On failure: restore previous install when
+    // possible so we never leave an empty root without a recovery path.
+    if let Err(obs_err) = observer(PortableBoundary::AfterMoveOld {
+        install_root: install_root.to_path_buf(),
+        payload: payload.clone(),
+        backup: backup.clone(),
+        had_previous,
+    }) {
+        if had_previous {
+            if let Err(rb) = restore_previous_install(install_root, &backup, had_previous) {
+                log::error!(
+                    "portable observer failed after move-old and rollback also failed: obs={obs_err} rollback={rb}"
+                );
+                // Crash window left for startup recovery.
+            }
+        }
+        return Err(obs_err);
+    }
+    if fault == Some(PortableFault::AfterMoveOld) {
+        // Leave the crash window intact for recovery tests (no auto-rollback).
+        return Err(portable_fault_err("after-move-old"));
+    }
+
+    observer(PortableBoundary::BeforeMoveNew {
+        install_root: install_root.to_path_buf(),
+        payload: payload.clone(),
+        backup: backup.clone(),
+        had_previous,
+    })?;
+    if fault == Some(PortableFault::OnMoveNew) {
+        let _ = restore_previous_install(install_root, &backup, had_previous);
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(portable_fault_err("on-move-new"));
+    }
+
     match fs::rename(&payload, install_root) {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Err(obs_err) = observer(PortableBoundary::AfterMoveNew {
+                install_root: install_root.to_path_buf(),
+                backup: backup.clone(),
+                had_previous,
+            }) {
+                // Payload is already at install_root; leave for recovery.
+                log::error!("portable observer failed after move-new: {obs_err}");
+                return Err(obs_err);
+            }
+        }
         Err(err) => {
             let _ = restore_previous_install(install_root, &backup, had_previous);
             return Err(io_err("install portable payload (rolled back)", err));
@@ -1160,6 +1297,99 @@ mod tests {
         assert!(!install_root.join("new-marker.txt").exists());
         assert!(!backup.exists());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fault_after_move_old_leaves_crash_window_for_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-fault-after-old-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let msix = root.join("codex.msix");
+        let install_root = root.join("Codex");
+        write_fake_msix(&msix);
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("old-marker.txt"), b"old").unwrap();
+
+        inject_portable_fault(Some(PortableFault::AfterMoveOld));
+        let err =
+            install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap_err();
+        assert!(err.to_string().contains("after-move-old"));
+        // Crash window: install missing, rollback backup present, staging payload present.
+        assert!(!install_root.exists());
+        let backup = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("Codex.rollback-"))
+            });
+        assert!(backup.is_some(), "rollback backup must remain");
+        assert!(backup.unwrap().join("old-marker.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fault_before_move_old_leaves_install_intact() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-fault-before-old-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let msix = root.join("codex.msix");
+        let install_root = root.join("Codex");
+        write_fake_msix(&msix);
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("old-marker.txt"), b"old").unwrap();
+
+        inject_portable_fault(Some(PortableFault::BeforeMoveOld));
+        let err =
+            install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap_err();
+        assert!(err.to_string().contains("before-move-old"));
+        assert!(install_root.join("old-marker.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn observer_sees_rename_boundaries() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-portable-observer-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let msix = root.join("codex.msix");
+        let install_root = root.join("Codex");
+        write_fake_msix(&msix);
+        let mut kinds = Vec::new();
+        install_portable_from_msix_with_observer(
+            &msix,
+            &install_root,
+            false,
+            false,
+            &mut |b| {
+                kinds.push(match b {
+                    PortableBoundary::BeforeMoveOld { .. } => "before-old",
+                    PortableBoundary::AfterMoveOld { .. } => "after-old",
+                    PortableBoundary::BeforeMoveNew { .. } => "before-new",
+                    PortableBoundary::AfterMoveNew { .. } => "after-new",
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            kinds,
+            ["before-old", "after-old", "before-new", "after-new"]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

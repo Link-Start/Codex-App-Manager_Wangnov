@@ -27,12 +27,16 @@ pub use appcast::{parse_appcast, Appcast, AppcastItem, Delta, Enclosure};
 pub use apply::apply_delta;
 pub use codesign::{gate_reconstructed, OPENAI_TEAM_ID};
 pub use download::{
-    download_to_with_network, download_to_with_progress_bounded_with_network,
-    download_to_with_progress_with_network,
+    cancel_active_download, download_to_with_network,
+    download_to_with_progress_bounded_with_network, download_to_with_progress_with_network,
+    pause_active_download,
 };
 pub use network::NetworkConfig;
 pub use plan::{plan_update, UpdatePlan, UpdateStrategy};
-pub use swap::{install_gated_bundle, quit_codex_at, relaunch, rollback, swap_in_place};
+pub use swap::{
+    inject_swap_fault, install_gated_bundle, quit_codex_at, relaunch, rollback, swap_in_place,
+    swap_in_place_with_observer, SwapBoundary, SwapFault,
+};
 pub use sys::CODEX_BUNDLE_ID;
 pub use verify::{verify_sparkle, SPARKLE_ED_PUBKEY_B64};
 

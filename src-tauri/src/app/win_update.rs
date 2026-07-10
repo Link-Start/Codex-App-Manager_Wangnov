@@ -14,17 +14,19 @@ use serde::{Deserialize, Serialize};
 use codex_win_engine::{
     cancel_active_download, cleanup_portable_metadata, close_codex_gracefully_for_root,
     close_msix_codex_processes, detect_installed_codex, detect_portable_install,
-    download_to_with_progress_bounded_with_network,
-    fetch_text_with_network, find_msix_sha256, install_msix_sideload, install_portable_from_msix,
-    limits::MAX_PACKAGE_BYTES, parse_manifest, pause_active_download, plan_update,
-    precheck_msix_dependencies, probe_capabilities, purge_codex_user_data, read_msix_identity,
-    remove_msix_package, sha256_file, uninstall_portable, validate_codex_identity,
-    verify_msix_health, verify_openai_authenticode, version_key, AuthenticodeReport,
-    CapabilityState, InstalledWindowsCodex, MsixHealthReport, MsixIdentity, MsixRemoveReport,
-    MsixSideloadReport, NetworkConfig, PortableInstallReport, PortableUninstallReport,
+    download_to_with_progress_bounded_with_network, fetch_text_with_network, find_msix_sha256,
+    install_msix_sideload, install_portable_from_msix_with_observer, limits::MAX_PACKAGE_BYTES,
+    parse_manifest, pause_active_download, plan_update, precheck_msix_dependencies,
+    probe_capabilities, purge_codex_user_data, read_msix_identity, remove_msix_package,
+    sha256_file, uninstall_portable, validate_codex_identity, verify_msix_health,
+    verify_openai_authenticode, version_key, AuthenticodeReport, CapabilityState,
+    InstalledWindowsCodex, MsixHealthReport, MsixIdentity, MsixRemoveReport, MsixSideloadReport,
+    NetworkConfig, PortableBoundary, PortableInstallReport, PortableUninstallReport,
     WinCapabilityReport, WinInstallRoute, WindowsRelease, WindowsUpdatePlan,
 };
 
+use crate::app::install_tx::{ActiveInstallTx, InstallTxKind};
+use crate::app::op_phase::OperationPhase;
 use crate::app::operation_outcome::{
     recovery, AncillaryRetryReport, OperationOutcome, StepOutcome,
 };
@@ -33,6 +35,9 @@ use crate::app::staging;
 use crate::domain::manifest::MirrorEndpoints;
 use crate::domain::settings::AppSettings;
 use crate::errors::AppError;
+
+/// Optional hook for the command layer to publish operation phases (quit policy).
+pub type PhaseHook<'a> = dyn Fn(OperationPhase) + Send + Sync + 'a;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -996,17 +1001,47 @@ pub fn perform_windows_update_with_install_mode_and_network(
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
 ) -> Result<WinPerformReport, AppError> {
+    perform_windows_update_with_install_mode_network_and_phase(
+        endpoints,
+        settings,
+        confirm,
+        install_mode,
+        expected,
+        progress,
+        network,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn perform_windows_update_with_install_mode_network_and_phase(
+    endpoints: &MirrorEndpoints,
+    settings: &AppSettings,
+    confirm: bool,
+    install_mode: &str,
+    expected: Option<WinPerformExpectation>,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase: Option<&PhaseHook<'_>>,
+) -> Result<WinPerformReport, AppError> {
+    let set_phase = |p: OperationPhase| {
+        if let Some(hook) = phase {
+            hook(p);
+        }
+    };
     log::info!("Windows perform start install_mode={install_mode}");
     // Reset the latch when THIS perform ends (not at stage entry) so a cancel
     // racing the op's startup isn't wiped, and `auto_stage` never clears it. See
     // WinAbortGuard.
     let _abort_guard = WinAbortGuard;
+    set_phase(OperationPhase::Preparing);
     if !confirm {
         return Err(AppError::Internal(
             "explicit confirmation is required before installing Windows Codex".to_string(),
         ));
     }
 
+    set_phase(OperationPhase::Downloading);
     let stage = stage_windows_update_with_install_mode_and_network(
         endpoints,
         settings,
@@ -1052,11 +1087,12 @@ pub fn perform_windows_update_with_install_mode_and_network(
     // sideloading — closes the gap after staging where a fully-cached MSIX skips
     // the download loop (so its cancel flag never arms) yet still reaches here.
     check_win_update_abort()?;
+    set_phase(OperationPhase::Committing);
 
     if stage.route == "portable-fallback" {
         log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
         close_existing_codex_before_portable_fallback(settings, current_installed.as_ref())?;
-        return install_portable_after_stage(settings, stage, None, None, current_installed);
+        return install_portable_after_stage(settings, stage, None, None, current_installed, phase);
     }
 
     let staged_path = stage
@@ -1086,7 +1122,7 @@ pub fn perform_windows_update_with_install_mode_and_network(
             precheck.reason
         ));
         let mut report =
-            install_portable_after_stage(settings, stage, None, None, current_installed)?;
+            install_portable_after_stage(settings, stage, None, None, current_installed, phase)?;
         report.action = WinPerformAction::PortableFallbackMissingFramework;
         return Ok(report);
     }
@@ -1144,6 +1180,7 @@ pub fn perform_windows_update_with_install_mode_and_network(
                 Some(sideload),
                 Some(health),
                 current_installed,
+                phase,
             )?;
             match remove_msix_package() {
                 Ok(remove) if remove.success => {
@@ -1242,7 +1279,7 @@ pub fn perform_windows_update_with_install_mode_and_network(
         return Ok(report);
     }
 
-    install_portable_after_stage(settings, stage, Some(sideload), None, current_installed)
+    install_portable_after_stage(settings, stage, Some(sideload), None, current_installed, phase)
 }
 
 fn install_portable_after_stage(
@@ -1251,7 +1288,11 @@ fn install_portable_after_stage(
     sideload: Option<MsixSideloadReport>,
     health: Option<MsixHealthReport>,
     previous_installed: Option<InstalledWindowsCodex>,
+    phase: Option<&PhaseHook<'_>>,
 ) -> Result<WinPerformReport, AppError> {
+    if let Some(hook) = phase {
+        hook(OperationPhase::Committing);
+    }
     let staged_path = stage
         .staged_path
         .as_ref()
@@ -1261,12 +1302,64 @@ fn install_portable_after_stage(
         .filter(|installed| installed.source == "portable")
         .map(|installed| installed.path.clone())
         .unwrap_or_else(|| settings.install_root.clone());
-    let portable = install_portable_from_msix(
-        PathBuf::from(staged_path).as_path(),
-        PathBuf::from(&install_root).as_path(),
+    let install_root_path = PathBuf::from(&install_root);
+    let msix_path = PathBuf::from(staged_path);
+    // Persist the transaction log on BeforeMoveOld (first destructive rename)
+    // using the real paths chosen by the engine.
+    let mut tx: Option<ActiveInstallTx> = None;
+    let mut observer = |boundary: PortableBoundary| -> Result<(), codex_win_engine::EngineError> {
+        match boundary {
+            PortableBoundary::BeforeMoveOld {
+                install_root,
+                payload,
+                backup,
+                had_previous,
+            } => {
+                let started = ActiveInstallTx::begin(
+                    InstallTxKind::WindowsPortable,
+                    &install_root,
+                    &payload,
+                    &backup,
+                    had_previous,
+                    None,
+                )
+                .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
+                tx = Some(started);
+                Ok(())
+            }
+            PortableBoundary::AfterMoveOld { .. } => {
+                if let Some(active) = tx.as_mut() {
+                    active
+                        .mark_old_moved()
+                        .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
+                }
+                Ok(())
+            }
+            PortableBoundary::BeforeMoveNew { .. } => Ok(()),
+            PortableBoundary::AfterMoveNew { .. } => {
+                if let Some(active) = tx.as_mut() {
+                    active
+                        .mark_new_installed()
+                        .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+    };
+    let portable = install_portable_from_msix_with_observer(
+        msix_path.as_path(),
+        install_root_path.as_path(),
         true,
+        true,
+        &mut observer,
     )
     .map_err(engine_err)?;
+    if let Some(active) = tx.take() {
+        active.succeed()?;
+    }
+    if let Some(hook) = phase {
+        hook(OperationPhase::Finishing);
+    }
 
     // Detect the PORTABLE install we just wrote — not detect_installed_codex,
     // which prefers MSIX and would return a still-present older MSIX package

@@ -175,6 +175,52 @@ pub fn same_volume(_a: &Path, _b: &Path) -> bool {
     true
 }
 
+/// Rename boundary markers for crash-recovery callbacks and fault injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapBoundary {
+    /// About to perform the first destructive rename (old → backup).
+    BeforeMoveOld,
+    /// Old install is at backup; install path is empty.
+    AfterMoveOld,
+    /// About to move staged new → install.
+    BeforeMoveNew,
+    /// New payload is at install path.
+    AfterMoveNew,
+}
+
+/// Optional observer invoked at each rename boundary. Used by the app layer to
+/// persist a transaction log before/after destructive steps. Returning `Err`
+/// aborts the swap (and rolls back if the old bundle was already moved).
+pub type SwapObserver<'a> = dyn FnMut(SwapBoundary) -> Result<(), EngineError> + 'a;
+
+/// Injected failure points for tests (and only tests / explicit hooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapFault {
+    /// Fail before moving the old install aside.
+    BeforeMoveOld,
+    /// Fail after old → backup succeeds, before new → install.
+    AfterMoveOld,
+    /// Fail the new → install rename (simulates disk error mid-commit).
+    OnMoveNew,
+}
+
+thread_local! {
+    static SWAP_FAULT: std::cell::Cell<Option<SwapFault>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install a one-shot fault for the next `swap_in_place*` call (test-only path).
+pub fn inject_swap_fault(fault: Option<SwapFault>) {
+    SWAP_FAULT.with(|cell| cell.set(fault));
+}
+
+fn take_fault() -> Option<SwapFault> {
+    SWAP_FAULT.with(|cell| cell.take())
+}
+
+fn fault_err(boundary: &str) -> EngineError {
+    EngineError::Io(format!("injected swap fault at {boundary}"))
+}
+
 /// Atomically replace `install_app` with `new_app`, preserving the previous
 /// bundle at `backup_app`. On failure after the old bundle is moved aside, the
 /// old bundle is restored before returning the error.
@@ -182,6 +228,17 @@ pub fn swap_in_place(
     install_app: &Path,
     new_app: &Path,
     backup_app: &Path,
+) -> Result<(), EngineError> {
+    swap_in_place_with_observer(install_app, new_app, backup_app, &mut |_| Ok(()))
+}
+
+/// Like [`swap_in_place`], but notifies `observer` at each rename boundary so
+/// callers can persist a crash-recovery transaction log.
+pub fn swap_in_place_with_observer(
+    install_app: &Path,
+    new_app: &Path,
+    backup_app: &Path,
+    observer: &mut SwapObserver<'_>,
 ) -> Result<(), EngineError> {
     let install_parent = install_app.parent().unwrap_or(install_app);
     if new_app.exists() && install_parent.exists() && !same_volume(new_app, install_parent) {
@@ -200,14 +257,55 @@ pub fn swap_in_place(
 
     let install_path = install_app.display();
     log::info!("atomic swap start install_path={install_path}");
+    let fault = take_fault();
     let had_old = install_app.exists();
+
+    observer(SwapBoundary::BeforeMoveOld)?;
+    if fault == Some(SwapFault::BeforeMoveOld) {
+        return Err(fault_err("before-move-old"));
+    }
+
     if had_old {
         std::fs::rename(install_app, backup_app)
             .map_err(|e| EngineError::Io(format!("move current bundle aside: {e}")))?;
     }
 
+    // Point of no return for "install missing": old is at backup (if any).
+    // Observer must persist OldMoved here. On failure: roll old back when
+    // possible so we never leave an empty install without a recovery path.
+    if let Err(obs_err) = observer(SwapBoundary::AfterMoveOld) {
+        if had_old {
+            if let Err(rb) = std::fs::rename(backup_app, install_app) {
+                log::error!(
+                    "observer failed after move-old and rollback also failed: obs={obs_err} rollback={rb}"
+                );
+                // Leave crash window (backup + new present, install empty) for
+                // startup recovery; do not swallow the original error.
+            }
+        }
+        return Err(obs_err);
+    }
+    if fault == Some(SwapFault::AfterMoveOld) {
+        // Leave paths as-is for recovery tests (do NOT auto-rollback).
+        return Err(fault_err("after-move-old"));
+    }
+
+    observer(SwapBoundary::BeforeMoveNew)?;
+    if fault == Some(SwapFault::OnMoveNew) {
+        if had_old {
+            let _ = std::fs::rename(backup_app, install_app);
+        }
+        return Err(fault_err("on-move-new"));
+    }
+
     match std::fs::rename(new_app, install_app) {
         Ok(()) => {
+            if let Err(obs_err) = observer(SwapBoundary::AfterMoveNew) {
+                // New is already at install; leave NewInstalled-pending for
+                // recovery rather than attempting a partial undo here.
+                log::error!("observer failed after move-new: {obs_err}");
+                return Err(obs_err);
+            }
             let install_path = install_app.display();
             log::info!("atomic swap completed install_path={install_path}");
             Ok(())
@@ -286,22 +384,37 @@ pub fn install_gated_bundle(
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    // Sandbox swap + rollback round-trip. Never touches /Applications.
-    #[test]
-    fn swap_and_rollback_roundtrip() {
-        let root = std::env::temp_dir().join(format!("codex-swap-test-{}", std::process::id()));
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn test_root(name: &str) -> std::path::PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "codex-swap-{name}-{}-{id}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        root
+    }
 
+    fn seed_bundles(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let install = root.join("Codex.app");
         let new_app = root.join("new-Codex.app");
         let backup = root.join("backup-Codex.app");
-
         fs::create_dir_all(install.join("Contents")).unwrap();
         fs::write(install.join("Contents/ver"), "3511").unwrap();
         fs::create_dir_all(new_app.join("Contents")).unwrap();
         fs::write(new_app.join("Contents/ver"), "3575").unwrap();
+        (install, new_app, backup)
+    }
+
+    // Sandbox swap + rollback round-trip. Never touches /Applications.
+    #[test]
+    fn swap_and_rollback_roundtrip() {
+        let root = test_root("roundtrip");
+        let (install, new_app, backup) = seed_bundles(&root);
 
         swap_in_place(&install, &new_app, &backup).unwrap();
         assert_eq!(fs::read_to_string(install.join("Contents/ver")).unwrap(), "3575");
@@ -311,6 +424,74 @@ mod tests {
         rollback(&install, &backup).unwrap();
         assert_eq!(fs::read_to_string(install.join("Contents/ver")).unwrap(), "3511");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn observer_sees_all_boundaries_on_success() {
+        let root = test_root("observer");
+        let (install, new_app, backup) = seed_bundles(&root);
+        let mut seen = Vec::new();
+        swap_in_place_with_observer(&install, &new_app, &backup, &mut |b| {
+            seen.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                SwapBoundary::BeforeMoveOld,
+                SwapBoundary::AfterMoveOld,
+                SwapBoundary::BeforeMoveNew,
+                SwapBoundary::AfterMoveNew,
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fault_before_move_old_leaves_install_intact() {
+        let root = test_root("fault-before-old");
+        let (install, new_app, backup) = seed_bundles(&root);
+        inject_swap_fault(Some(SwapFault::BeforeMoveOld));
+        let err = swap_in_place(&install, &new_app, &backup).unwrap_err();
+        assert!(err.to_string().contains("before-move-old"));
+        assert_eq!(fs::read_to_string(install.join("Contents/ver")).unwrap(), "3511");
+        assert!(new_app.exists());
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fault_after_move_old_leaves_install_empty_for_recovery() {
+        let root = test_root("fault-after-old");
+        let (install, new_app, backup) = seed_bundles(&root);
+        inject_swap_fault(Some(SwapFault::AfterMoveOld));
+        let err = swap_in_place(&install, &new_app, &backup).unwrap_err();
+        assert!(err.to_string().contains("after-move-old"));
+        // Crash window: old at backup, new staged, install missing.
+        assert!(!install.exists());
+        assert!(backup.exists());
+        assert!(new_app.exists());
+        assert_eq!(fs::read_to_string(backup.join("Contents/ver")).unwrap(), "3511");
+        assert_eq!(fs::read_to_string(new_app.join("Contents/ver")).unwrap(), "3575");
+        // Manual continue (recovery matrix: continue).
+        fs::rename(&new_app, &install).unwrap();
+        assert_eq!(fs::read_to_string(install.join("Contents/ver")).unwrap(), "3575");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fault_on_move_new_rolls_back_old_bundle() {
+        let root = test_root("fault-on-new");
+        let (install, new_app, backup) = seed_bundles(&root);
+        inject_swap_fault(Some(SwapFault::OnMoveNew));
+        let err = swap_in_place(&install, &new_app, &backup).unwrap_err();
+        assert!(err.to_string().contains("on-move-new"));
+        // In-process fault path restores old immediately (same as real rename fail).
+        assert!(install.exists());
+        assert_eq!(fs::read_to_string(install.join("Contents/ver")).unwrap(), "3511");
+        assert!(new_app.exists());
         let _ = fs::remove_dir_all(&root);
     }
 }

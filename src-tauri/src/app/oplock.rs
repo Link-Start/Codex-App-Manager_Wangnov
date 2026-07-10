@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs4::{FileExt as Fs4FileExt, TryLockError};
 
+use crate::app::op_phase::{OperationPhase, QuitPolicy};
+
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_STALE_AFTER_SECS: u64 = 5 * 60;
 
@@ -70,6 +72,8 @@ struct ActiveOp {
     /// unlocks when the last holder releases, so concurrent guards cannot free
     /// the lock while another worker still thinks it owns the lease.
     holders: u32,
+    /// Progress through the op lifecycle; drives quit policy.
+    phase: OperationPhase,
 }
 
 #[must_use = "持有 guard 才代表持有操作锁；提前 drop 会立即释放锁"]
@@ -229,6 +233,101 @@ impl OperationManager {
         }
     }
 
+    /// Current phase of the active same-process op, or `Idle` when free.
+    pub fn phase(&self) -> OperationPhase {
+        let Ok(inner) = self.inner.lock() else {
+            return OperationPhase::Idle;
+        };
+        inner
+            .active
+            .as_ref()
+            .map(|active| active.phase)
+            .unwrap_or(OperationPhase::Idle)
+    }
+
+    /// Kind of the active same-process op, if any.
+    pub fn active_kind(&self) -> Option<OperationKind> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        inner.active.as_ref().map(|active| active.kind)
+    }
+
+    /// Advance the phase for a validated token. No-op-safe if the token is gone.
+    pub fn set_phase(
+        &self,
+        token: &OperationToken,
+        phase: OperationPhase,
+    ) -> Result<(), OperationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationError::Lock("operation mutex poisoned".to_string()))?;
+        let Some(active) = inner.active.as_mut() else {
+            return Err(OperationError::InvalidToken);
+        };
+        if active.token != token.0 {
+            return Err(OperationError::InvalidToken);
+        }
+        if active.phase != phase {
+            log::info!(
+                "operation phase kind={} from={} to={} token_prefix={}",
+                active.kind.as_str(),
+                active.phase.as_str(),
+                phase.as_str(),
+                token_prefix(&token.0)
+            );
+            active.phase = phase;
+        }
+        Ok(())
+    }
+
+    /// Unified quit/close policy for window close, menu quit, and quit command.
+    ///
+    /// Reads busy/phase/kind under a **single** mutex hold so a concurrent
+    /// `end`/`set_phase` cannot TOCTOU the snapshot between separate queries.
+    pub fn quit_policy(&self, force_quit: bool, confirm_close: bool) -> QuitPolicy {
+        if force_quit {
+            return QuitPolicy::Allow;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            // Poisoned mutex: refuse exit rather than risk killing mid-swap.
+            return QuitPolicy::evaluate(
+                false,
+                confirm_close,
+                true,
+                OperationPhase::Finishing,
+                None,
+            );
+        };
+        // Reclaim abandoned unclaimed tokens before deciding.
+        let _ = self.reclaim_stale_detached(&mut inner);
+
+        let (busy, phase, kind) = if let Some(active) = inner.active.as_ref() {
+            (true, active.phase, Some(active.kind))
+        } else {
+            // Cross-process lock without a local ActiveOp: treat as
+            // non-interruptible finishing so we never kill another instance mid-swap.
+            let other_busy = match Self::lock_file_mut(&mut inner) {
+                Ok(lock_file) => match Fs4FileExt::try_lock(lock_file) {
+                    Ok(()) => {
+                        let _ = Fs4FileExt::unlock(lock_file);
+                        false
+                    }
+                    Err(TryLockError::WouldBlock) => true,
+                    Err(TryLockError::Error(_)) => false,
+                },
+                Err(_) => false,
+            };
+            if other_busy {
+                (true, OperationPhase::Finishing, None)
+            } else {
+                (false, OperationPhase::Idle, None)
+            }
+        };
+        QuitPolicy::evaluate(force_quit, confirm_close, busy, phase, kind)
+    }
+
     fn begin_inner(
         &self,
         kind: OperationKind,
@@ -273,6 +372,7 @@ impl OperationManager {
             detached,
             claimed,
             holders: 0,
+            phase: OperationPhase::Preparing,
         });
         log::info!(
             "acquired operation lock kind={} token_prefix={} detached={detached} claimed={claimed}",
@@ -590,6 +690,42 @@ mod tests {
             second.begin(OperationKind::Install),
             Err(OperationError::BusyOtherProcess)
         ));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_phase_drives_quit_policy_for_point_of_no_return() {
+        use crate::app::op_phase::{OperationPhase, QuitPolicy};
+
+        let path = lock_path("phase-quit");
+        let manager = OperationManager::new(path.clone());
+        let token = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&token).unwrap();
+
+        assert!(matches!(
+            manager.quit_policy(false, false),
+            QuitPolicy::Allow
+        ));
+
+        manager
+            .set_phase(&token, OperationPhase::Committing)
+            .unwrap();
+        assert!(matches!(
+            manager.quit_policy(false, false),
+            QuitPolicy::Block {
+                phase: OperationPhase::Committing,
+                ..
+            }
+        ));
+        // Force quit still wins.
+        assert_eq!(
+            manager.quit_policy(true, true),
+            QuitPolicy::Allow
+        );
+
+        manager.end(token).unwrap();
+        assert_eq!(manager.phase(), OperationPhase::Idle);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

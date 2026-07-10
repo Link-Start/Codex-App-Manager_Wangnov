@@ -71,51 +71,113 @@ function MinimizeButton() {
 /** The one close-confirm dialog. Raised by the backend close/exit guard (which
  *  covers the ✕, Alt+F4 and Cmd+Q alike) via app://confirm-quit, or by the
  *  browser-preview fallback. Mounted once at the app root so it overlays
- *  whichever view is showing; confirming asks the backend to actually exit. */
+ *  whichever view is showing; confirming asks the backend to actually exit.
+ *
+ *  When the backend is mid point-of-no-return install (`app://quit-blocked`),
+ *  a different sheet explains why quit is refused. */
 export function QuitConfirm() {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
+  const [blockedCode, setBlockedCode] = useState<string | null>(null);
+  const [blockedFallback, setBlockedFallback] = useState<string | null>(null);
   const titleId = useId();
   const bodyId = useId();
 
   useEffect(() => {
-    let un = () => {};
-    void listen("app://confirm-quit", () => setOpen(true))
-      .then((f) => (un = f))
+    let unConfirm = () => {};
+    let unBlocked = () => {};
+    void listen("app://confirm-quit", () => {
+      setBlockedCode(null);
+      setBlockedFallback(null);
+      setOpen(true);
+    })
+      .then((f) => (unConfirm = f))
       .catch(() => undefined);
-    const onWeb = () => setOpen(true);
+    void listen<{ reasonCode?: string; reason?: string }>("app://quit-blocked", (event) => {
+      const code =
+        typeof event.payload?.reasonCode === "string" && event.payload.reasonCode.trim()
+          ? event.payload.reasonCode
+          : "busy";
+      const fallback =
+        typeof event.payload?.reason === "string" && event.payload.reason.trim()
+          ? event.payload.reason
+          : null;
+      setBlockedCode(code);
+      setBlockedFallback(fallback);
+      setOpen(true);
+    })
+      .then((f) => (unBlocked = f))
+      .catch(() => undefined);
+    const onWeb = () => {
+      setBlockedCode(null);
+      setBlockedFallback(null);
+      setOpen(true);
+    };
     window.addEventListener("cam:confirm-quit", onWeb);
     return () => {
-      un();
+      unConfirm();
+      unBlocked();
       window.removeEventListener("cam:confirm-quit", onWeb);
     };
   }, []);
 
+  const blocked = blockedCode !== null;
+  const blockedBody = !blocked
+    ? t("close.confirm.body")
+    : blockedCode === "committing"
+      ? t("close.blocked.reason.committing")
+      : blockedCode === "finishing"
+        ? t("close.blocked.reason.finishing")
+        : blockedCode === "other-process"
+          ? t("close.blocked.reason.otherProcess")
+          : blockedFallback || t("close.blocked.body");
+
   return (
     <Sheet
       open={open}
-      onDismiss={() => setOpen(false)}
+      onDismiss={() => {
+        setOpen(false);
+        setBlockedCode(null);
+        setBlockedFallback(null);
+      }}
       scrimClass="quit-scrim"
       labelledBy={titleId}
       describedBy={bodyId}
       initialFocus="dismiss"
     >
       <Ring icon="info" variant="amber" />
-      <h3 id={titleId}>{t("close.confirm.title")}</h3>
-      <p id={bodyId}>{t("close.confirm.body")}</p>
+      <h3 id={titleId}>
+        {blocked ? t("close.blocked.title") : t("close.confirm.title")}
+      </h3>
+      <p id={bodyId}>{blocked ? blockedBody : t("close.confirm.body")}</p>
       <div className="row2 sheet-actions">
-        <button className="btn ghost" onClick={() => setOpen(false)}>
-          {t("confirm.cancel")}
-        </button>
-        <button
-          className="btn primary"
-          onClick={() => {
-            setOpen(false);
-            void managerApi.confirmQuit();
-          }}
-        >
-          {t("close.confirm.ok")}
-        </button>
+        {blocked ? (
+          <button
+            className="btn primary"
+            onClick={() => {
+              setOpen(false);
+              setBlockedCode(null);
+              setBlockedFallback(null);
+            }}
+          >
+            {t("close.blocked.ok")}
+          </button>
+        ) : (
+          <>
+            <button className="btn ghost" onClick={() => setOpen(false)}>
+              {t("confirm.cancel")}
+            </button>
+            <button
+              className="btn primary"
+              onClick={() => {
+                setOpen(false);
+                void managerApi.confirmQuit();
+              }}
+            >
+              {t("close.confirm.ok")}
+            </button>
+          </>
+        )}
       </div>
     </Sheet>
   );

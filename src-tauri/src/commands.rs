@@ -15,11 +15,12 @@ use crate::app::logging::redact_url;
 use crate::app::mac_update::{
     cancel_macos_download, detect_existing_install_at_path as detect_macos_install_at_path,
     discard_macos_download, install_macos_with_network, mac_adopt_path as adopt_macos_path,
-    pause_macos_download, perform_macos_update_with_network, plan_macos_update_with_network,
-    retry_macos_ancillary, stage_macos_update_with_network, uninstall_macos, InstalledCodex,
-    MacInstallStatus, MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport,
-    PerformExpectation,
+    pause_macos_download, perform_macos_update_with_network_and_phase,
+    plan_macos_update_with_network, retry_macos_ancillary, stage_macos_update_with_network,
+    uninstall_macos, InstalledCodex, MacInstallStatus, MacPerformReport, MacStageReport,
+    MacUninstallReport, MacUpdateReport, PerformExpectation,
 };
+use crate::app::op_phase::{OperationPhase, QuitPolicy};
 use crate::app::operation_outcome::{AncillaryRetryReport, AncillaryRetryRequest};
 use crate::app::oplock::{
     OperationError, OperationGuard, OperationKind, OperationManager, OperationToken,
@@ -33,7 +34,7 @@ use crate::app::win_update::{
     auto_stage_windows_update_with_install_mode_and_network, cancel_windows_download,
     detect_existing_windows_install_at_path as detect_windows_install_at_path,
     discard_windows_download, pause_windows_download,
-    perform_windows_update_with_install_mode_and_network,
+    perform_windows_update_with_install_mode_network_and_phase,
     plan_windows_update_with_install_mode_and_network,
     retry_windows_ancillary, stage_windows_update_with_install_mode_and_network,
     uninstall_windows_codex, win_adopt as adopt_windows_install,
@@ -300,6 +301,20 @@ impl DetachedGuard {
             operations,
             token: Some(token),
         })
+    }
+
+    fn set_phase(&self, phase: OperationPhase) {
+        if let Some(token) = self.token.as_ref() {
+            let _ = self.operations.set_phase(token, phase);
+        }
+    }
+
+    fn token_clone(&self) -> Option<OperationToken> {
+        self.token.clone()
+    }
+
+    fn operations(&self) -> OperationManager {
+        self.operations.clone()
     }
 }
 
@@ -604,7 +619,8 @@ pub async fn mac_perform_update(
             AppError::Internal("拒绝执行：破坏性更新必须带显式 confirm".to_string()).into(),
         );
     }
-    let _op = DetachedGuard::validate(&state, token)?;
+    let op = DetachedGuard::validate(&state, token)?;
+    op.set_phase(OperationPhase::Preparing);
     // Best-effort: a full-package update needs no delta tool, so don't reject the
     // whole operation when it's absent — only the delta branch requires it.
     let binary_delta = resolve_binary_delta(&app);
@@ -618,11 +634,24 @@ pub async fn mac_perform_update(
     };
     let progress_app = app.clone();
     let network = mac_network_config_for_settings()?;
+    let ops = op.operations();
+    let phase_token = op.token_clone();
     tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: crate::app::mac_update::DownloadProgress| {
             let _ = progress_app.emit("mac://download-progress", p);
         };
-        perform_macos_update_with_network(binary_delta, expected, &report, &network)
+        let phase_hook = |phase: OperationPhase| {
+            if let Some(token) = phase_token.as_ref() {
+                let _ = ops.set_phase(token, phase);
+            }
+        };
+        perform_macos_update_with_network_and_phase(
+            binary_delta,
+            expected,
+            &report,
+            &network,
+            Some(&phase_hook),
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -1058,12 +1087,36 @@ pub fn end_operation(
 
 /// The user confirmed quitting from the close dialog — flag it and exit so the
 /// CloseRequested / ExitRequested guards stop intercepting and let it go.
+/// Still refuses when the backend is in a non-interruptible install phase.
 #[tauri::command]
-pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) {
+pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    let confirm_close = crate::app::settings_store::AppSettings::load().confirm_close;
+    // Evaluate as if force_quit is not yet set so a point-of-no-return phase
+    // still blocks even after the user clicks the confirm dialog.
+    let policy = state.operations.quit_policy(false, confirm_close);
+    if let QuitPolicy::Block {
+        phase,
+        reason_code,
+        reason,
+        kind,
+    } = &policy
+    {
+        log::warn!(
+            "confirm_quit blocked phase={} reason_code={reason_code} kind={:?} reason={reason}",
+            phase.as_str(),
+            kind
+        );
+        let _ = app.emit("app://quit-blocked", &policy);
+        return Err(AppError::Busy(reason.clone()).into());
+    }
+    // Interruptible phases: best-effort cancel so partial downloads settle cleanly.
+    let _ = codex_mac_engine::cancel_active_download();
+    let _ = codex_win_engine::cancel_active_download();
     state
         .force_quit
         .store(true, std::sync::atomic::Ordering::SeqCst);
     app.exit(0);
+    Ok(())
 }
 
 /// Windows-only: return the current user's default portable install root.
@@ -1571,7 +1624,8 @@ pub async fn win_perform_update(
             AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
         );
     }
-    let _op = DetachedGuard::validate(&state, token)?;
+    let op = DetachedGuard::validate(&state, token)?;
+    op.set_phase(OperationPhase::Preparing);
     let endpoints = windows_endpoints_for_settings(&state)?;
     let mut settings = windows_domain_settings_for_persisted(&state);
     // Validate (but don't yet persist) an explicitly chosen install root: it
@@ -1588,11 +1642,18 @@ pub async fn win_perform_update(
     let install_mode = windows_install_mode_for_settings();
     let network = win_network_config_for_settings()?;
     let progress_app = app.clone();
+    let ops = op.operations();
+    let phase_token = op.token_clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: WinDownloadProgress| {
             let _ = progress_app.emit("win://download-progress", p);
         };
-        perform_windows_update_with_install_mode_and_network(
+        let phase_hook = |phase: OperationPhase| {
+            if let Some(token) = phase_token.as_ref() {
+                let _ = ops.set_phase(token, phase);
+            }
+        };
+        perform_windows_update_with_install_mode_network_and_phase(
             &endpoints,
             &settings,
             confirm,
@@ -1600,6 +1661,7 @@ pub async fn win_perform_update(
             expected,
             &report,
             &network,
+            Some(&phase_hook),
         )
     })
     .await

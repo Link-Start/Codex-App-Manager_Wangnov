@@ -18,17 +18,22 @@ use serde::Serialize;
 
 use codex_mac_engine::{
     apply_delta, download, gate_reconstructed, parse_appcast, plan_update, quit_codex_at, relaunch,
-    rollback, swap::codex_running_at, swap_in_place, sys, verify_sparkle, Appcast, NetworkConfig,
-    UpdatePlan, UpdateStrategy,
+    rollback, swap::codex_running_at, swap_in_place_with_observer, sys, verify_sparkle, Appcast,
+    NetworkConfig, SwapBoundary, UpdatePlan, UpdateStrategy,
 };
 
 use crate::app::disk;
+use crate::app::install_tx::{ActiveInstallTx, InstallTxKind};
+use crate::app::op_phase::OperationPhase;
 use crate::app::operation_outcome::{recovery, OperationOutcome, StepOutcome};
 use crate::app::provenance::ProvenanceStore;
 use crate::app::settings_store::UpdateSource;
 use crate::app::staging::{self, StagingDir};
 use crate::app::url_guard::validate_custom_source;
 use crate::errors::AppError;
+
+/// Optional hook for the command layer to publish operation phases (quit policy).
+pub type PhaseHook<'a> = dyn Fn(OperationPhase) + Send + Sync + 'a;
 
 const DITTO: &str = "/usr/bin/ditto";
 const OPEN: &str = "/usr/bin/open";
@@ -810,9 +815,31 @@ pub fn perform_macos_update_with_network(
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
 ) -> Result<MacPerformReport, AppError> {
+    perform_macos_update_with_network_and_phase(
+        binary_delta,
+        expected,
+        progress,
+        network,
+        None,
+    )
+}
+
+pub fn perform_macos_update_with_network_and_phase(
+    binary_delta: Option<PathBuf>,
+    expected: PerformExpectation,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase: Option<&PhaseHook<'_>>,
+) -> Result<MacPerformReport, AppError> {
+    let set_phase = |p: OperationPhase| {
+        if let Some(hook) = phase {
+            hook(p);
+        }
+    };
     // Reset the latch when THIS op ends (not at entry) so a cancel racing the
     // op's startup isn't wiped. See AbortGuard.
     let _abort_guard = AbortGuard;
+    set_phase(OperationPhase::Preparing);
     // A vanished install is itself a stale snapshot: the user confirmed an
     // update against a Codex that is no longer there (deleted / moved between
     // confirm and execute). Route it through StaleExpectation so the UI
@@ -906,6 +933,7 @@ pub fn perform_macos_update_with_network(
     // loop's own cancel flag takes over. A cancel pressed during "正在准备"
     // lands here and bails before any destructive prep.
     check_update_abort()?;
+    set_phase(OperationPhase::Downloading);
 
     // 1) Set up same-volume staging for the reconstructed bundle + backup.
     let staging = staging::create_unique_staging("update")?;
@@ -935,6 +963,7 @@ pub fn perform_macos_update_with_network(
                     progress,
                     network,
                 )?;
+                set_phase(OperationPhase::Applying);
                 match apply_delta(tool, &install_path, &out_app, &staged) {
                     Ok(()) => strategy_label(&plan.strategy),
                     Err(delta_err) => {
@@ -943,15 +972,18 @@ pub fn perform_macos_update_with_network(
                     }
                 }
             } else {
+                set_phase(OperationPhase::Applying);
                 reconstruct_full(&appcast, &work, &out_app, progress, network)?;
                 "full (delta 工具缺失，回退全量)".to_string()
             }
         } else {
+            set_phase(OperationPhase::Applying);
             reconstruct_full(&appcast, &work, &out_app, progress, network)?;
             "full".to_string()
         };
 
         // 3) gate the reconstructed bundle before it touches the install root.
+        set_phase(OperationPhase::Verifying);
         log::info!("macOS perform step=gate");
         gate_reconstructed(&out_app)
             .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝替换）: {e}")))?;
@@ -1005,13 +1037,42 @@ pub fn perform_macos_update_with_network(
         log::info!("macOS perform step=quit");
         quit_codex_gracefully(&install_path)?;
         log::info!("macOS perform step=swap");
-        if let Err(err) = swap_in_place(&install_path, &out_app, &backup) {
+        set_phase(OperationPhase::Committing);
+        let had_previous = install_path.exists();
+        let mut tx = ActiveInstallTx::begin(
+            InstallTxKind::MacosSwap,
+            &install_path,
+            &out_app,
+            &backup,
+            had_previous,
+            Some(was_running),
+        )?;
+        let mut observer = |boundary: SwapBoundary| -> Result<(), codex_mac_engine::EngineError> {
+            match boundary {
+                SwapBoundary::BeforeMoveOld => Ok(()),
+                SwapBoundary::AfterMoveOld => tx
+                    .mark_old_moved()
+                    .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
+                SwapBoundary::BeforeMoveNew => Ok(()),
+                SwapBoundary::AfterMoveNew => tx
+                    .mark_new_installed()
+                    .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
+            }
+        };
+        if let Err(err) =
+            swap_in_place_with_observer(&install_path, &out_app, &backup, &mut observer)
+        {
+            // In-process failure may have rolled back; if still mid-window the
+            // Drop of ActiveInstallTx keeps the log for startup recovery.
             if was_running {
                 let _ = relaunch(&install_path);
             }
             log::error!("macOS perform swap failed error={err}");
             return Err(AppError::Engine(err.to_string()));
         }
+        // Keep the transaction log through post-swap health / rollback — never
+        // complete() until that tail settles.
+        set_phase(OperationPhase::Finishing);
 
         // 6) filesystem health check on the installed root.
         log::info!("macOS perform step=health");
@@ -1044,6 +1105,8 @@ pub fn perform_macos_update_with_network(
                 log::info!("macOS perform step=relaunch");
                 if let Err(err) = relaunch(&install_path) {
                     keep_staging = true;
+                    // Leave NewInstalled log + backup for recovery / manual use.
+                    tx.leave_pending();
                     return Ok(MacPerformReport {
                         up_to_date: false,
                         from_build: installed.build,
@@ -1068,6 +1131,7 @@ pub fn perform_macos_update_with_network(
 
             // Not running, or relaunched cleanly → the backup is no longer needed.
             let _ = std::fs::remove_dir_all(&backup);
+            tx.succeed()?;
             let report = MacPerformReport {
                 up_to_date: false,
                 from_build: installed.build,
@@ -1089,8 +1153,16 @@ pub fn perform_macos_update_with_network(
             Ok(report)
         } else {
             log::warn!("macOS perform step=rollback");
-            rollback(&install_path, &backup)
-                .map_err(|e| AppError::Engine(format!("回滚失败（需人工介入）: {e}")))?;
+            match rollback(&install_path, &backup) {
+                Ok(()) => {
+                    tx.mark_rolled_back()?;
+                }
+                Err(e) => {
+                    // Leave NewInstalled log + materials for manual recovery.
+                    tx.leave_pending();
+                    return Err(AppError::Engine(format!("回滚失败（需人工介入）: {e}")));
+                }
+            }
             let relaunched = was_running && relaunch(&install_path).is_ok();
             Ok(MacPerformReport {
                 up_to_date: false,
