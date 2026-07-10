@@ -11,11 +11,26 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 
-import { managerApi } from "../services/managerApi";
+import { errorMessage, managerApi } from "../services/managerApi";
 import type { FailureSurface } from "./errorCopy";
 import { Icon, type IconName, CodexMark } from "./icons";
 import { useI18n } from "./i18n";
 import { Sheet } from "./Sheet";
+
+const FRONTEND_READY_EVENT = "cam:frontend-readiness";
+
+type FrontendReadiness = { generation: number; token: string };
+
+function frontendReadiness(): FrontendReadiness | null {
+  const readiness = (
+    window as typeof window & { __CAM_FRONTEND_READY__?: unknown }
+  ).__CAM_FRONTEND_READY__;
+  if (!readiness || typeof readiness !== "object") return null;
+  const { generation, token } = readiness as Partial<FrontendReadiness>;
+  if (!Number.isSafeInteger(generation) || (generation ?? 0) <= 0) return null;
+  if (typeof token !== "string" || !token.trim()) return null;
+  return { generation: generation as number, token };
+}
 
 function isTauri(): boolean {
   return (
@@ -76,38 +91,87 @@ function MinimizeButton() {
  *  When the backend is mid point-of-no-return install (`app://quit-blocked`),
  *  a different sheet explains why quit is refused. */
 export function QuitConfirm() {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const [open, setOpen] = useState(false);
   const [blockedCode, setBlockedCode] = useState<string | null>(null);
   const [blockedFallback, setBlockedFallback] = useState<string | null>(null);
+  const [listenersReady, setListenersReady] = useState(false);
   const titleId = useId();
   const bodyId = useId();
 
   useEffect(() => {
-    let unConfirm = () => {};
-    let unBlocked = () => {};
-    void listen("app://confirm-quit", () => {
-      setBlockedCode(null);
-      setBlockedFallback(null);
-      setOpen(true);
-    })
-      .then((f) => (unConfirm = f))
-      .catch(() => undefined);
-    void listen<{ reasonCode?: string; reason?: string }>("app://quit-blocked", (event) => {
-      const code =
-        typeof event.payload?.reasonCode === "string" && event.payload.reasonCode.trim()
-          ? event.payload.reasonCode
-          : "busy";
-      const fallback =
-        typeof event.payload?.reason === "string" && event.payload.reason.trim()
-          ? event.payload.reason
-          : null;
-      setBlockedCode(code);
-      setBlockedFallback(fallback);
-      setOpen(true);
-    })
-      .then((f) => (unBlocked = f))
-      .catch(() => undefined);
+    let disposed = false;
+    let retryTimer: number | null = null;
+    let attempt = 0;
+    const registered = new Set<() => void>();
+    const releaseListeners = (listeners = [...registered]) => {
+      listeners.forEach((unlisten) => {
+        if (!registered.delete(unlisten)) return;
+        unlisten();
+      });
+    };
+    const registerListeners = async () => {
+      attempt += 1;
+      const currentAttempt: Array<() => void> = [];
+      try {
+        const confirmUnlisten = await listen("app://confirm-quit", () => {
+          setBlockedCode(null);
+          setBlockedFallback(null);
+          setOpen(true);
+        });
+        registered.add(confirmUnlisten);
+        currentAttempt.push(confirmUnlisten);
+        if (disposed) {
+          releaseListeners(currentAttempt);
+          return;
+        }
+
+        const blockedUnlisten = await listen<{ reasonCode?: string; reason?: string }>(
+          "app://quit-blocked",
+          (event) => {
+            const code =
+              typeof event.payload?.reasonCode === "string" && event.payload.reasonCode.trim()
+                ? event.payload.reasonCode
+                : "busy";
+            const fallback =
+              typeof event.payload?.reason === "string" && event.payload.reason.trim()
+                ? event.payload.reason
+                : null;
+            setBlockedCode(code);
+            setBlockedFallback(fallback);
+            setOpen(true);
+          },
+        );
+        registered.add(blockedUnlisten);
+        currentAttempt.push(blockedUnlisten);
+        if (disposed) {
+          releaseListeners(currentAttempt);
+          return;
+        }
+        setListenersReady(true);
+      } catch (cause) {
+        releaseListeners(currentAttempt);
+        if (disposed) return;
+        const message = errorMessage(cause);
+        if (attempt === 1) {
+          console.error("[native-shell] quit listener registration failed", cause);
+          void managerApi.reportFrontendError({
+            kind: "native-shell-listeners",
+            message,
+            stack: cause instanceof Error ? cause.stack ?? null : null,
+            componentStack: null,
+          });
+        } else {
+          console.warn(`[native-shell] quit listener retry ${attempt} failed`, cause);
+        }
+        const delay = Math.min(5000, 250 * 2 ** Math.min(attempt - 1, 5));
+        retryTimer = window.setTimeout(() => void registerListeners(), delay);
+      }
+    };
+    // Browser previews have no Tauri event bridge. Their close-confirm path is
+    // the local cam:confirm-quit event below, so treating a missing bridge as a
+    // transient native failure would only create a permanent retry loop.
+    if (isTauri()) void registerListeners();
     const onWeb = () => {
       setBlockedCode(null);
       setBlockedFallback(null);
@@ -115,11 +179,81 @@ export function QuitConfirm() {
     };
     window.addEventListener("cam:confirm-quit", onWeb);
     return () => {
-      unConfirm();
-      unBlocked();
+      disposed = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      releaseListeners();
       window.removeEventListener("cam:confirm-quit", onWeb);
     };
   }, []);
+
+  useEffect(() => {
+    if (!listenersReady) return;
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    let attempt = 0;
+    let attemptKey: string | null = null;
+    let inFlight = false;
+    let rerun = false;
+    const announceReady = async () => {
+      if (inFlight) {
+        rerun = true;
+        return;
+      }
+      const readiness = frontendReadiness();
+      if (!readiness) return;
+      const key = `${readiness.generation}:${readiness.token}`;
+      if (attemptKey !== key) {
+        attemptKey = key;
+        attempt = 0;
+      }
+      attempt += 1;
+      inFlight = true;
+      try {
+        await managerApi.frontendReady(lang, readiness.generation, readiness.token);
+      } catch (cause) {
+        if (cancelled) return;
+        const message = errorMessage(cause);
+        if (attempt === 1) {
+          console.error("[native-shell] frontend-ready handshake failed; retrying", cause);
+          void managerApi.reportFrontendError({
+            kind: "native-shell-ready",
+            message,
+            stack: cause instanceof Error ? cause.stack ?? null : null,
+            componentStack: null,
+          });
+        } else {
+          console.warn(`[native-shell] frontend-ready retry ${attempt} failed`, cause);
+        }
+        const delay = Math.min(5000, 250 * 2 ** Math.min(attempt - 1, 5));
+        retryTimer = window.setTimeout(() => void announceReady(), delay);
+      } finally {
+        inFlight = false;
+        if (rerun && !cancelled) {
+          rerun = false;
+          if (retryTimer != null) {
+            window.clearTimeout(retryTimer);
+            retryTimer = null;
+          }
+          void announceReady();
+        }
+      }
+    };
+    const onToken = () => {
+      if (cancelled) return;
+      if (retryTimer != null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      void announceReady();
+    };
+    window.addEventListener(FRONTEND_READY_EVENT, onToken);
+    void announceReady();
+    return () => {
+      cancelled = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      window.removeEventListener(FRONTEND_READY_EVENT, onToken);
+    };
+  }, [lang, listenersReady]);
 
   const blocked = blockedCode !== null;
   const blockedBody = !blocked

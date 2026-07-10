@@ -12,6 +12,7 @@ pub mod oplock;
 pub mod paths;
 pub mod provenance;
 pub mod settings_store;
+pub mod shell;
 pub mod staging;
 pub mod url_guard;
 pub mod win_update;

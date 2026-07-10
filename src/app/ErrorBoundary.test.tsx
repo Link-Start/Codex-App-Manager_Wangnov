@@ -1,6 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { listen } from "@tauri-apps/api/event";
 
 import type { Diagnostics, OperationSnapshot } from "../shared/types";
 import { managerApi } from "../services/managerApi";
@@ -15,11 +16,13 @@ import { ThemeProvider } from "./theme";
 import { QuitConfirm } from "./components";
 
 vi.mock("../services/managerApi", () => ({
+  errorMessage: (cause: unknown) => (cause instanceof Error ? cause.message : String(cause)),
   managerApi: {
     getDiagnostics: vi.fn(),
     reportFrontendError: vi.fn(() => Promise.resolve()),
     getOperationSnapshot: vi.fn(() => Promise.resolve(null)),
     confirmQuit: vi.fn(() => Promise.resolve()),
+    frontendReady: vi.fn(() => Promise.resolve()),
     getSettings: vi.fn(() =>
       Promise.resolve({
         confirmClose: true,
@@ -59,6 +62,8 @@ const getDiagnostics = vi.mocked(managerApi.getDiagnostics);
 const reportFrontendError = vi.mocked(managerApi.reportFrontendError);
 const getOperationSnapshot = vi.mocked(managerApi.getOperationSnapshot);
 const confirmQuit = vi.mocked(managerApi.confirmQuit);
+const frontendReady = vi.mocked(managerApi.frontendReady);
+const listenMock = vi.mocked(listen);
 
 function enCrashStrings(): CrashStrings {
   const en = CATALOG.en;
@@ -79,12 +84,202 @@ function enCrashStrings(): CrashStrings {
 
 beforeEach(() => {
   localStorage.setItem("cam.lang", "en");
+  Object.defineProperty(window, "__TAURI_INTERNALS__", {
+    configurable: true,
+    writable: true,
+    value: {},
+  });
+  Object.defineProperty(window, "__CAM_FRONTEND_READY__", {
+    configurable: true,
+    writable: true,
+    value: { generation: 1, token: "test-generation-token" },
+  });
   getDiagnostics.mockResolvedValue(diagnostics);
   getOperationSnapshot.mockResolvedValue(null);
   confirmQuit.mockResolvedValue(undefined);
+  frontendReady.mockResolvedValue(undefined);
+  listenMock.mockResolvedValue(() => {});
 });
 
 describe("ErrorBoundary", () => {
+  it("uses only the local close event in a browser preview", () => {
+    delete (
+      window as typeof window & { __TAURI_INTERNALS__?: unknown }
+    ).__TAURI_INTERNALS__;
+
+    render(
+      <ThemeProvider>
+        <I18nProvider>
+          <QuitConfirm />
+        </I18nProvider>
+      </ThemeProvider>,
+    );
+
+    expect(listenMock).not.toHaveBeenCalled();
+    expect(reportFrontendError).not.toHaveBeenCalled();
+    expect(frontendReady).not.toHaveBeenCalled();
+  });
+
+  it("announces frontend readiness only after both native quit listeners register", async () => {
+    render(
+      <ThemeProvider>
+        <I18nProvider>
+          <QuitConfirm />
+        </I18nProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() => {
+      expect(listenMock).toHaveBeenCalledWith("app://confirm-quit", expect.any(Function));
+      expect(listenMock).toHaveBeenCalledWith("app://quit-blocked", expect.any(Function));
+      expect(frontendReady).toHaveBeenCalledWith("en", 1, "test-generation-token");
+    });
+    expect(listenMock.mock.invocationCallOrder[1]).toBeLessThan(
+      frontendReady.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("waits for the backend token before announcing the current document", async () => {
+    delete (
+      window as typeof window & { __CAM_FRONTEND_READY__?: unknown }
+    ).__CAM_FRONTEND_READY__;
+
+    render(
+      <ThemeProvider>
+        <I18nProvider>
+          <QuitConfirm />
+        </I18nProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() => expect(listenMock).toHaveBeenCalledTimes(2));
+    expect(frontendReady).not.toHaveBeenCalled();
+
+    Object.defineProperty(window, "__CAM_FRONTEND_READY__", {
+      configurable: true,
+      writable: true,
+      value: { generation: 2, token: "late-generation-token" },
+    });
+    window.dispatchEvent(new CustomEvent("cam:frontend-readiness"));
+
+    await waitFor(() =>
+      expect(frontendReady).toHaveBeenCalledWith("en", 2, "late-generation-token"),
+    );
+  });
+
+  it("logs listener registration failure without falsely announcing readiness", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    listenMock.mockRejectedValue(new Error("listener unavailable"));
+
+    render(
+      <ThemeProvider>
+        <I18nProvider>
+          <QuitConfirm />
+        </I18nProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() =>
+      expect(reportFrontendError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "native-shell-listeners",
+          message: "listener unavailable",
+        }),
+      ),
+    );
+    expect(frontendReady).not.toHaveBeenCalled();
+    consoleWarn.mockRestore();
+    consoleError.mockRestore();
+  });
+
+  it("retries partial listener registration and releases the orphaned listener once", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const orphanedUnlisten = vi.fn();
+    listenMock
+      .mockResolvedValueOnce(orphanedUnlisten)
+      .mockRejectedValueOnce(new Error("second listener unavailable"));
+
+    render(
+      <ThemeProvider>
+        <I18nProvider>
+          <QuitConfirm />
+        </I18nProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(
+      () => expect(frontendReady).toHaveBeenCalledWith("en", 1, "test-generation-token"),
+      { timeout: 2000 },
+    );
+    expect(orphanedUnlisten).toHaveBeenCalledTimes(1);
+    expect(reportFrontendError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "native-shell-listeners",
+        message: "second listener unavailable",
+      }),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("retries a transient frontend-ready IPC failure until queued events can drain", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    frontendReady.mockRejectedValueOnce(new Error("IPC warming up")).mockResolvedValue(undefined);
+
+    render(
+      <ThemeProvider>
+        <I18nProvider>
+          <QuitConfirm />
+        </I18nProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() => expect(frontendReady).toHaveBeenCalledTimes(2), { timeout: 2000 });
+    expect(frontendReady).toHaveBeenNthCalledWith(1, "en", 1, "test-generation-token");
+    expect(frontendReady).toHaveBeenNthCalledWith(2, "en", 1, "test-generation-token");
+    expect(reportFrontendError).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "native-shell-ready", message: "IPC warming up" }),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("reruns an in-flight handshake with the replacement document generation and token", async () => {
+    let resolveFirst: (() => void) | undefined;
+    frontendReady
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue(undefined);
+
+    render(
+      <ThemeProvider>
+        <I18nProvider>
+          <QuitConfirm />
+        </I18nProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() =>
+      expect(frontendReady).toHaveBeenCalledWith("en", 1, "test-generation-token"),
+    );
+    Object.defineProperty(window, "__CAM_FRONTEND_READY__", {
+      configurable: true,
+      writable: true,
+      value: { generation: 2, token: "replacement-token" },
+    });
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent("cam:frontend-readiness"));
+      resolveFirst?.();
+    });
+
+    await waitFor(() =>
+      expect(frontendReady).toHaveBeenCalledWith("en", 2, "replacement-token"),
+    );
+  });
+
   it("renders a crash screen and copies diagnostics with the JS error", async () => {
     const user = userEvent.setup();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -205,6 +400,9 @@ describe("ErrorBoundary", () => {
   it("keeps QuitConfirm available outside the boundary so crash-path quit works", async () => {
     const user = userEvent.setup();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    delete (
+      window as typeof window & { __TAURI_INTERNALS__?: unknown }
+    ).__TAURI_INTERNALS__;
 
     render(
       <ThemeProvider>

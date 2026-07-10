@@ -1189,16 +1189,13 @@ pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Re
             phase.as_str(),
             kind
         );
-        let _ = app.emit("app://quit-blocked", &policy);
+        crate::dispatch_shell_event(
+            &app,
+            crate::app::shell::ShellEvent::QuitBlocked(policy.clone()),
+        );
         return Err(AppError::Busy(reason.clone()).into());
     }
-    // Interruptible phases: best-effort cancel so partial downloads settle cleanly.
-    let _ = codex_mac_engine::cancel_active_download();
-    let _ = codex_win_engine::cancel_active_download();
-    state
-        .force_quit
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    app.exit(0);
+    crate::exit_after_confirm(&app);
     Ok(())
 }
 

@@ -6,6 +6,7 @@ use crate::app::config_health::ConfigHealth;
 use crate::app::oplock::OperationManager;
 use crate::app::provenance::ProvenanceStore;
 use crate::app::settings_store::AppSettings as PersistedAppSettings;
+use crate::app::shell::FrontendGate;
 use crate::domain::manifest::MirrorEndpoints;
 use crate::domain::settings::AppSettings;
 use crate::domain::target::Target;
@@ -19,6 +20,7 @@ pub struct ManagerState {
     pub force_quit: AtomicBool,
     pub operations: OperationManager,
     pub config_health: Mutex<ConfigHealth>,
+    pub frontend: FrontendGate,
 }
 
 impl ManagerState {
@@ -49,6 +51,7 @@ impl ManagerState {
             force_quit: AtomicBool::new(false),
             operations,
             config_health,
+            frontend: FrontendGate::default(),
         }
     }
 }

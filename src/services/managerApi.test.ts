@@ -124,6 +124,7 @@ describe("diagnostics API", () => {
     expect(diagnostics.os).toBe("browser");
     await expect(managerApi.openLogsDir()).resolves.toBeUndefined();
     await expect(managerApi.openCodexHome()).resolves.toBeUndefined();
+    await expect(managerApi.frontendReady("en", 1, "browser-token")).resolves.toBeUndefined();
     await expect(
       managerApi.reportFrontendError({
         kind: "test",
@@ -138,6 +139,19 @@ describe("diagnostics API", () => {
       expect.objectContaining({ kind: "test", message: "boom" }),
     );
     consoleError.mockRestore();
+  });
+
+  it("reports frontend readiness and application language through IPC", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue(undefined);
+
+    await expect(managerApi.frontendReady("zh-TW", 7, "generation-token")).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenCalledWith("frontend_ready", {
+      lang: "zh-TW",
+      generation: 7,
+      token: "generation-token",
+    });
   });
 
   it("invokes diagnostics commands inside Tauri", async () => {
