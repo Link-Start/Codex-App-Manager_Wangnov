@@ -53,6 +53,233 @@ fn apply_quit_policy(app: &tauri::AppHandle, policy: &QuitPolicy) -> bool {
     }
 }
 
+/// The bundled custom-protocol scheme differs by platform. Windows uses the
+/// HTTP(S) compatibility origin selected by `useHttpsScheme`; desktop WebKit
+/// uses the `tauri:` origin. Keep this decision next to the navigation gate so
+/// a future config change cannot silently widen the allowlist.
+fn bundled_app_scheme(use_https_scheme: bool) -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        if use_https_scheme {
+            "https"
+        } else {
+            "http"
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = use_https_scheme;
+        "tauri"
+    }
+}
+
+/// Only the exact bundled app origin may replace the top-level document.
+/// External links already go through the validated `open_url` command and
+/// system shell.
+fn is_allowed_app_navigation(url: &url::Url, allow_dev_server: bool, bundled_scheme: &str) -> bool {
+    let expected_host = if bundled_scheme == "tauri" {
+        "localhost"
+    } else {
+        "tauri.localhost"
+    };
+    let expected_port = match bundled_scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    let bundled_origin = url.scheme() == bundled_scheme
+        && url.host_str() == Some(expected_host)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == expected_port;
+    if bundled_origin {
+        return true;
+    }
+
+    allow_dev_server
+        && url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(1420)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn browser_accelerators_enabled(is_dev: bool) -> bool {
+    is_dev
+}
+
+fn initial_main_window_visibility(
+    configured_visible: bool,
+    is_windows: bool,
+    is_dev: bool,
+) -> bool {
+    configured_visible && (!is_windows || is_dev)
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_startup_error(detail: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let title: Vec<u16> = "Codex App Manager startup error\0".encode_utf16().collect();
+    let body: Vec<u16> = format!(
+        "The secure Windows interface could not be initialized. The app will close.\n\n{detail}\0"
+    )
+    .encode_utf16()
+    .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn abort_for_unsafe_windows_webview(app: &tauri::AppHandle, detail: &str) {
+    log::error!("WebView2 release safety gate failed: {detail}");
+    let state = app.state::<state::ManagerState>();
+    state.webview_gate_failed.store(true, Ordering::SeqCst);
+    show_windows_startup_error(detail);
+    state.force_quit.store(true, Ordering::SeqCst);
+    app.exit(1);
+}
+
+/// WebView2 handles browser accelerators before DOM `keydown`, so renderer
+/// `preventDefault()` cannot stop Ctrl+P, Ctrl+R or F5. Disable that native
+/// layer in release while retaining Tauri's built-in shortcuts for `tauri dev`.
+#[cfg(target_os = "windows")]
+fn configure_windows_browser_accelerators(
+    app: &tauri::App,
+    window: &tauri::WebviewWindow<tauri::Wry>,
+    enabled: bool,
+    show_after_gate: bool,
+) -> tauri::Result<()> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use windows_core::Interface;
+
+    if enabled {
+        return Ok(());
+    }
+
+    let label = window.label().to_string();
+    let callback_label = label.clone();
+    let app_handle = app.handle().clone();
+    let gated_window = window.clone();
+    let callback_result = window.with_webview(move |platform_webview| {
+        let result = unsafe {
+            (|| -> windows_core::Result<()> {
+                let webview = platform_webview.controller().CoreWebView2()?;
+                let settings = webview.Settings()?;
+                let settings3 = settings.cast::<ICoreWebView2Settings3>()?;
+                settings3.SetAreBrowserAcceleratorKeysEnabled(false)
+            })()
+        };
+        match result {
+            Ok(()) => {
+                if !show_after_gate {
+                    app_handle
+                        .state::<state::ManagerState>()
+                        .webview_safe_to_show
+                        .store(true, Ordering::SeqCst);
+                    log::info!(
+                        "disabled native WebView2 browser accelerators window={callback_label}"
+                    );
+                } else {
+                    match gated_window.show() {
+                        Ok(()) => {
+                            app_handle
+                                .state::<state::ManagerState>()
+                                .webview_safe_to_show
+                                .store(true, Ordering::SeqCst);
+                            log::info!(
+                                "disabled native WebView2 browser accelerators and opened window={callback_label}"
+                            );
+                        }
+                        Err(error) => abort_for_unsafe_windows_webview(
+                            &app_handle,
+                            &format!("failed to show gated window={callback_label}: {error}"),
+                        ),
+                    }
+                }
+            }
+            Err(error) => abort_for_unsafe_windows_webview(
+                &app_handle,
+                &format!(
+                    "failed to disable browser accelerators window={callback_label}: {error}"
+                ),
+            ),
+        }
+    });
+    if let Err(error) = callback_result {
+        let detail = format!("failed to schedule WebView2 safety gate window={label}: {error}");
+        log::error!("{detail}");
+        show_windows_startup_error(&detail);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Build the configured main window ourselves so the native webview receives
+/// navigation and new-window handlers before its first document is loaded.
+fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
+    let mut config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .ok_or_else(|| {
+            tauri::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing main window config",
+            ))
+        })?
+        .clone();
+
+    #[cfg(target_os = "windows")]
+    let configured_visible = config.visible;
+    config.visible =
+        initial_main_window_visibility(config.visible, cfg!(target_os = "windows"), cfg!(dev));
+
+    let bundled_scheme = bundled_app_scheme(config.use_https_scheme);
+    let window = tauri::WebviewWindowBuilder::from_config(app, &config)?
+        .on_navigation(move |url| {
+            // `cfg(dev)` is emitted by Tauri itself and remains true for the
+            // supported `tauri dev --release` mode. `debug_assertions` does not.
+            let allowed = is_allowed_app_navigation(url, cfg!(dev), bundled_scheme);
+            if !allowed {
+                log::warn!(
+                    "blocked top-level webview navigation scheme={} host={}",
+                    url.scheme(),
+                    url.host_str().unwrap_or("<none>")
+                );
+            }
+            allowed
+        })
+        .on_new_window(|url, _features| {
+            log::warn!(
+                "blocked webview new-window request scheme={} host={}",
+                url.scheme(),
+                url.host_str().unwrap_or("<none>")
+            );
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .build()?;
+    #[cfg(target_os = "windows")]
+    configure_windows_browser_accelerators(
+        app,
+        &window,
+        browser_accelerators_enabled(cfg!(dev)),
+        configured_visible,
+    )?;
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+    Ok(())
+}
+
 /// macOS routes Cmd+Q through the app-menu Quit item, which terminates *below*
 /// the RunEvent loop (so ExitRequested can't hold it). Replace the default menu
 /// with one whose Quit item is ours — its activation lands in `on_menu_event`
@@ -100,6 +327,15 @@ fn install_macos_menu(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            #[cfg(target_os = "windows")]
+            if !app
+                .state::<state::ManagerState>()
+                .webview_safe_to_show
+                .load(Ordering::SeqCst)
+            {
+                log::warn!("ignored second-instance focus before WebView2 safety gate completed");
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -199,6 +435,7 @@ pub fn run() {
             commands::log_frontend_error,
         ])
         .setup(|app| {
+            build_main_window(app)?;
             #[cfg(target_os = "macos")]
             install_macos_menu(app)?;
             log::info!(
@@ -216,7 +453,27 @@ pub fn run() {
                 });
             }
             let operations = app.state::<state::ManagerState>().operations.clone();
+            #[cfg(target_os = "windows")]
+            let recovery_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
+                #[cfg(target_os = "windows")]
+                loop {
+                    match recovery_app
+                        .state::<state::ManagerState>()
+                        .webview_startup_gate()
+                    {
+                        state::WebviewStartupGate::Proceed => break,
+                        state::WebviewStartupGate::Abort => {
+                            log::warn!(
+                                "startup recovery skipped after WebView2 safety gate failure"
+                            );
+                            return;
+                        }
+                        state::WebviewStartupGate::Wait => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
                 // Crash-safe install recovery MUST run before ordinary staging
                 // cleanup so recovery materials (backup / staged new) are not
                 // deleted out from under an incomplete swap.
@@ -304,4 +561,88 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        browser_accelerators_enabled, initial_main_window_visibility, is_allowed_app_navigation,
+    };
+
+    #[test]
+    fn native_browser_accelerators_are_release_only_disabled() {
+        assert!(!browser_accelerators_enabled(false));
+        assert!(browser_accelerators_enabled(true));
+    }
+
+    #[test]
+    fn windows_release_window_stays_hidden_until_the_native_gate_succeeds() {
+        assert!(!initial_main_window_visibility(true, true, false));
+        assert!(initial_main_window_visibility(true, true, true));
+        assert!(initial_main_window_visibility(true, false, false));
+        assert!(!initial_main_window_visibility(false, true, true));
+    }
+
+    #[test]
+    fn navigation_policy_allows_only_the_selected_bundled_origin_in_release() {
+        for allowed in ["tauri://localhost/", "tauri://localhost/assets/app.js"] {
+            let url = url::Url::parse(allowed).unwrap();
+            assert!(is_allowed_app_navigation(&url, false, "tauri"), "{allowed}");
+        }
+
+        for blocked in [
+            "http://tauri.localhost/",
+            "https://tauri.localhost/",
+            "tauri://localhost:1420/",
+            "tauri://user@localhost/",
+            "https://github.com/Wangnov/Codex-App-Manager",
+            "javascript:alert(1)",
+            "data:text/html,boom",
+            "file:///tmp/unsafe.html",
+            "http://127.0.0.1:1420/",
+        ] {
+            let url = url::Url::parse(blocked).unwrap();
+            assert!(
+                !is_allowed_app_navigation(&url, false, "tauri"),
+                "{blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_policy_honors_the_configured_windows_scheme_and_port() {
+        let http = url::Url::parse("http://tauri.localhost/assets/app.js").unwrap();
+        let https = url::Url::parse("https://tauri.localhost/assets/app.js").unwrap();
+        let alternate_port = url::Url::parse("http://tauri.localhost:1420/").unwrap();
+
+        assert!(is_allowed_app_navigation(&http, false, "http"));
+        assert!(!is_allowed_app_navigation(&https, false, "http"));
+        assert!(!is_allowed_app_navigation(&alternate_port, false, "http"));
+        assert!(is_allowed_app_navigation(&https, false, "https"));
+        assert!(!is_allowed_app_navigation(&http, false, "https"));
+    }
+
+    #[test]
+    fn navigation_policy_limits_development_to_the_configured_loopback_port() {
+        assert!(is_allowed_app_navigation(
+            &url::Url::parse("http://127.0.0.1:1420/").unwrap(),
+            true,
+            "tauri"
+        ));
+        assert!(is_allowed_app_navigation(
+            &url::Url::parse("http://localhost:1420/src/main.tsx").unwrap(),
+            true,
+            "tauri"
+        ));
+        assert!(!is_allowed_app_navigation(
+            &url::Url::parse("http://127.0.0.1:3000/").unwrap(),
+            true,
+            "tauri"
+        ));
+        assert!(!is_allowed_app_navigation(
+            &url::Url::parse("https://example.com:1420/").unwrap(),
+            true,
+            "tauri"
+        ));
+    }
 }
