@@ -897,21 +897,10 @@ pub fn purge_codex_user_data(notes: &mut Vec<String>) -> Result<bool, EngineErro
     }
 }
 
-pub fn uninstall_portable(
-    install_root: &Path,
-    purge_user_data: bool,
-) -> Result<PortableUninstallReport, EngineError> {
-    let path = install_root.display();
-    log::info!("portable uninstall start path={path}");
-    request_codex_close_for_root(30, install_root)?;
-
-    let removed_files = if install_root.exists() {
-        fs::remove_dir_all(install_root).map_err(|e| io_err("remove portable install", e))?;
-        true
-    } else {
-        false
-    };
-
+/// Ancillary-only cleanup after the portable app tree is already gone (or
+/// never existed). Retries Start Menu shortcut + Apps & Features entry removal
+/// without touching an install directory. Optional user-data purge.
+pub fn cleanup_portable_metadata(purge_user_data: bool) -> Result<PortableUninstallReport, EngineError> {
     let mut notes = Vec::new();
     let removed_shortcut = match remove_start_menu_shortcut() {
         Ok(removed) => removed,
@@ -929,38 +918,116 @@ pub fn uninstall_portable(
             false
         }
     };
+    // User-data purge is ancillary: a failure must not abort the whole cleanup
+    // report (matches the MSIX uninstall path — partial success + recovery CTA).
     let purged_user_data = if purge_user_data {
-        purge_codex_user_data(&mut notes)?
+        match purge_codex_user_data(&mut notes) {
+            Ok(purged) => purged,
+            Err(err) => {
+                notes.push(format!("User data cleanup failed: {err}"));
+                false
+            }
+        }
     } else {
         false
     };
     let partial = notes.iter().any(|note| note.contains("cleanup failed"));
-
-    let report = PortableUninstallReport {
+    Ok(PortableUninstallReport {
         success: true,
         partial,
-        install_root: install_root.to_string_lossy().into_owned(),
-        removed_files,
+        install_root: String::new(),
+        removed_files: false,
         removed_shortcut,
         removed_uninstall_entry,
         purged_user_data,
         message: if partial {
-            "Portable Codex uninstall completed with cleanup warnings.".to_string()
+            "Portable metadata cleanup completed with warnings.".to_string()
         } else {
-            "Portable Codex uninstall completed.".to_string()
+            "Portable metadata cleanup completed.".to_string()
         },
         notes,
+    })
+}
+
+pub fn uninstall_portable(
+    install_root: &Path,
+    purge_user_data: bool,
+) -> Result<PortableUninstallReport, EngineError> {
+    let path = install_root.display();
+    log::info!("portable uninstall start path={path}");
+    request_codex_close_for_root(30, install_root)?;
+
+    let removed_files = if install_root.exists() {
+        fs::remove_dir_all(install_root).map_err(|e| io_err("remove portable install", e))?;
+        true
+    } else {
+        false
     };
-    let path = &report.install_root;
+
+    let mut meta = cleanup_portable_metadata(purge_user_data)?;
+    // Preserve install-root context on the combined report.
+    meta.install_root = install_root.to_string_lossy().into_owned();
+    meta.removed_files = removed_files;
+    meta.message = if meta.partial {
+        "Portable Codex uninstall completed with cleanup warnings.".to_string()
+    } else {
+        "Portable Codex uninstall completed.".to_string()
+    };
+    let path = &meta.install_root;
     log::info!("portable uninstall completed path={path}");
-    Ok(report)
+    Ok(meta)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use zip::write::SimpleFileOptions;
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "codex-portable-{name}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// When `~/.codex` is a file (not a directory), purge fails — must stay
+    /// non-fatal so the portable uninstall can still report partial success.
+    #[test]
+    fn user_data_purge_failure_is_non_fatal_in_metadata_cleanup() {
+        let home = temp_test_dir("purge-home");
+        // A regular file at `.codex` makes remove_dir_all fail.
+        fs::write(home.join(".codex"), b"not-a-directory").unwrap();
+        let prev_user = std::env::var_os("USERPROFILE");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: test-only, serialised by the unique temp dir; restored below.
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("HOME", &home);
+        let report = cleanup_portable_metadata(true).expect("purge failure must not Err");
+        match prev_user {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(report.success);
+        assert!(report.partial, "purge IO failure should mark partial");
+        assert!(!report.purged_user_data);
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.contains("User data cleanup failed")));
+        let _ = fs::remove_dir_all(home);
+    }
 
     fn write_fake_msix(path: &Path) {
         let file = fs::File::create(path).unwrap();

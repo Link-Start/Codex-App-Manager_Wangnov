@@ -12,22 +12,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use codex_win_engine::{
-    cancel_active_download, close_codex_gracefully_for_root, close_msix_codex_processes,
-    detect_installed_codex,
-    detect_portable_install, download_to_with_progress_bounded_with_network,
-    fetch_text_with_network, find_msix_sha256, install_msix_sideload,
-    install_portable_from_msix_with_observer, limits::MAX_PACKAGE_BYTES, parse_manifest,
-    pause_active_download, plan_update, precheck_msix_dependencies, probe_capabilities,
-    purge_codex_user_data, read_msix_identity, remove_msix_package, sha256_file, uninstall_portable,
-    validate_codex_identity, verify_msix_health, verify_openai_authenticode, version_key,
-    AuthenticodeReport, CapabilityState, InstalledWindowsCodex, MsixHealthReport, MsixIdentity,
-    MsixRemoveReport, MsixSideloadReport, NetworkConfig, PortableBoundary, PortableInstallReport,
-    PortableUninstallReport, WinCapabilityReport, WinInstallRoute, WindowsRelease,
-    WindowsUpdatePlan,
+    cancel_active_download, cleanup_portable_metadata, close_codex_gracefully_for_root,
+    close_msix_codex_processes, detect_installed_codex, detect_portable_install,
+    download_to_with_progress_bounded_with_network, fetch_text_with_network, find_msix_sha256,
+    install_msix_sideload, install_portable_from_msix_with_observer, limits::MAX_PACKAGE_BYTES,
+    parse_manifest, pause_active_download, plan_update, precheck_msix_dependencies,
+    probe_capabilities, purge_codex_user_data, read_msix_identity, remove_msix_package,
+    sha256_file, uninstall_portable, validate_codex_identity, verify_msix_health,
+    verify_openai_authenticode, version_key, AuthenticodeReport, CapabilityState,
+    InstalledWindowsCodex, MsixHealthReport, MsixIdentity, MsixRemoveReport, MsixSideloadReport,
+    NetworkConfig, PortableBoundary, PortableInstallReport, PortableUninstallReport,
+    WinCapabilityReport, WinInstallRoute, WindowsRelease, WindowsUpdatePlan,
 };
 
 use crate::app::install_tx::{ActiveInstallTx, InstallTxKind};
 use crate::app::op_phase::OperationPhase;
+use crate::app::operation_outcome::{
+    recovery, AncillaryRetryReport, OperationOutcome, StepOutcome,
+};
 use crate::app::provenance::ProvenanceStore;
 use crate::app::staging;
 use crate::domain::manifest::MirrorEndpoints;
@@ -96,6 +98,9 @@ pub struct WinPerformReport {
     pub fallback_available: bool,
     pub fallback_attempted: bool,
     pub notes: Vec<String>,
+    /// Structured primary/ancillary result (provenance save, residual cleanup).
+    #[serde(default)]
+    pub outcome: OperationOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -148,6 +153,9 @@ pub struct WinUninstallReport {
     pub portable: Option<PortableUninstallReport>,
     pub purged_user_data: bool,
     pub notes: Vec<String>,
+    /// Structured primary/ancillary result for partial-success recovery.
+    #[serde(default)]
+    pub outcome: OperationOutcome,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +177,113 @@ pub struct DownloadProgress {
 
 fn engine_err(err: impl ToString) -> AppError {
     AppError::Engine(err.to_string())
+}
+
+/// Record a managed install without failing the primary install/update when the
+/// provenance store cannot be written. Surfaces the failure via [`OperationOutcome`].
+fn record_managed_install(
+    previous: Option<&InstalledWindowsCodex>,
+    installed: &InstalledWindowsCodex,
+    source: &str,
+) -> OperationOutcome {
+    let mut outcome =
+        OperationOutcome::full_success("present", Some("managed")).with_path(installed.path.clone());
+    outcome.cleanup = StepOutcome::not_applicable();
+    let mut store = ProvenanceStore::load();
+    if let Some(previous) = previous {
+        store.remove(&previous.path);
+    }
+    store.record(
+        installed.path.clone(),
+        version_key(&installed.version),
+        source,
+    );
+    match store.save() {
+        Ok(()) => outcome,
+        Err(e) => {
+            let detail = format!("托管记录保存失败（{e}）");
+            outcome.provenance = StepOutcome::failed(detail.clone());
+            outcome.install_class = Some("external".to_string());
+            outcome.push_warning(format!(
+                "{detail}；应用已安装，请用「开始管理」重试写入托管记录，勿重复安装"
+            ));
+            outcome.push_recovery(recovery::RECORD_PROVENANCE);
+            outcome
+        }
+    }
+}
+
+/// Build a structured outcome after portable uninstall.
+///
+/// Primary success means the install tree is gone (removed this run **or**
+/// already absent). Cleanup/metadata/provenance failures are partial, not hard
+/// failures — the UI can offer ancillary-only recovery CTAs.
+fn outcome_from_portable_uninstall(
+    portable: &PortableUninstallReport,
+    provenance: StepOutcome,
+    path: &str,
+) -> OperationOutcome {
+    let provenance_failed = provenance.is_failed();
+    // `removed_files == false` with `success` means the tree was already gone —
+    // that is still a successful primary uninstall (nothing left to delete).
+    let primary_ok = portable.success;
+    let mut outcome = OperationOutcome {
+        primary_ok,
+        app_state: if primary_ok {
+            "absent".to_string()
+        } else {
+            "present".to_string()
+        },
+        install_class: if primary_ok {
+            Some("none".to_string())
+        } else {
+            None
+        },
+        path: Some(path.to_string()),
+        provenance,
+        cleanup: if portable.partial {
+            StepOutcome::failed(
+                portable
+                    .notes
+                    .iter()
+                    .find(|n| n.contains("cleanup failed"))
+                    .cloned()
+                    .unwrap_or_else(|| "metadata cleanup failed".to_string()),
+            )
+        } else {
+            StepOutcome::ok()
+        },
+        warnings: portable.notes.clone(),
+        recovery_actions: Vec::new(),
+    };
+    if !portable.removed_files && primary_ok {
+        outcome.push_warning(
+            "Install tree was already absent; performed ancillary cleanup only.".to_string(),
+        );
+    }
+    if outcome.cleanup.is_failed() {
+        // Shortcut / uninstall-entry failures.
+        if portable.notes.iter().any(|n| {
+            n.contains("Start Menu") || n.contains("Apps & Features") || n.contains("uninstall entry")
+        }) {
+            outcome.push_recovery(recovery::CLEANUP_METADATA);
+        }
+        // User-data purge failures (non-fatal).
+        if portable.notes.iter().any(|n| {
+            let lower = n.to_ascii_lowercase();
+            lower.contains("user data") && lower.contains("failed")
+        }) {
+            outcome.push_recovery(recovery::PURGE_USER_DATA);
+        }
+        // Fallback: any partial cleanup gets a metadata retry.
+        if outcome.recovery_actions.is_empty() {
+            outcome.push_recovery(recovery::CLEANUP_METADATA);
+        }
+    }
+    if provenance_failed {
+        outcome.push_recovery(recovery::CLEAR_PROVENANCE);
+    }
+    outcome
 }
 
 fn host_of(url: &str) -> String {
@@ -957,6 +1072,14 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
             fallback_attempted: false,
             notes: stage.notes.clone(),
             stage,
+            outcome: OperationOutcome::full_success(
+                "present",
+                Some(if win_install_status(settings).status == "managed" {
+                    "managed"
+                } else {
+                    "external"
+                }),
+            ),
         });
     }
 
@@ -1087,31 +1210,64 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
             .installed
             .clone()
             .or_else(|| win_install_status(settings).installed);
-        if let Some(installed) = &installed {
-            let mut store = ProvenanceStore::load();
-            if let Some(previous) = &current_installed {
-                store.remove(&previous.path);
+        let mut notes = stage.notes.clone();
+        let outcome = match &installed {
+            Some(installed) => {
+                let outcome = record_managed_install(
+                    current_installed.as_ref(),
+                    installed,
+                    "manager-installed-msix",
+                );
+                notes.extend(outcome.warnings.iter().cloned());
+                outcome
             }
-            store.record(
-                installed.path.clone(),
-                version_key(&installed.version),
-                "manager-installed-msix",
-            );
-            store.save()?;
-        }
+            None => {
+                // Sideload claimed success but we cannot see an install — do not
+                // pretend managed/ok provenance.
+                let mut outcome = OperationOutcome {
+                    primary_ok: true,
+                    app_state: "unknown".to_string(),
+                    install_class: None,
+                    path: None,
+                    provenance: StepOutcome::failed(
+                        "安装完成但未检测到可记录的安装，托管状态未知",
+                    ),
+                    cleanup: StepOutcome::not_applicable(),
+                    warnings: vec![
+                        "MSIX sideload reported success but no install was detected afterward."
+                            .to_string(),
+                    ],
+                    recovery_actions: vec![recovery::RECORD_PROVENANCE.to_string()],
+                };
+                notes.extend(outcome.warnings.iter().cloned());
+                outcome.push_warning(
+                    "请重新检查状态；若 Codex 已可用，用「开始管理」写入托管记录，勿盲目重装"
+                        .to_string(),
+                );
+                outcome
+            }
+        };
 
         let report = WinPerformReport {
             success: true,
             action: WinPerformAction::MsixSideload,
-            message: sideload.message.clone(),
+            message: if outcome.is_partial() || outcome.provenance.is_failed() {
+                format!(
+                    "{}（已安装，但托管记录未写入 — 请「开始管理」重试，勿重复安装）",
+                    sideload.message
+                )
+            } else {
+                sideload.message.clone()
+            },
             installed,
             sideload: Some(sideload),
             portable: None,
             msix_health: Some(health),
             fallback_available: stage.portable_fallback_ready,
             fallback_attempted: false,
-            notes: stage.notes.clone(),
+            notes,
             stage,
+            outcome,
         };
         let action = report.action.as_str();
         let installed_version = report
@@ -1210,18 +1366,31 @@ fn install_portable_after_stage(
     // (e.g. when sideload was blocked by policy), recording the wrong target so
     // the user keeps seeing the same update and the portable build goes unmanaged.
     let installed = detect_portable_install(PathBuf::from(&install_root).as_path());
-    if let Some(installed) = &installed {
-        let mut store = ProvenanceStore::load();
-        if let Some(previous) = &previous_installed {
-            store.remove(&previous.path);
-        }
-        store.record(
-            installed.path.clone(),
-            version_key(&installed.version),
+    let outcome = match &installed {
+        Some(installed) => record_managed_install(
+            previous_installed.as_ref(),
+            installed,
             "manager-installed-portable",
-        );
-        store.save()?;
-    }
+        ),
+        None => OperationOutcome {
+            primary_ok: portable.success,
+            app_state: if portable.success {
+                "unknown".to_string()
+            } else {
+                "absent".to_string()
+            },
+            install_class: None,
+            path: Some(install_root.clone()),
+            provenance: StepOutcome::failed(
+                "便携安装完成但未检测到可记录的安装，托管状态未知",
+            ),
+            cleanup: StepOutcome::not_applicable(),
+            warnings: vec![
+                "Portable install finished but no install was detected for provenance.".to_string(),
+            ],
+            recovery_actions: vec![recovery::RECORD_PROVENANCE.to_string()],
+        },
+    };
 
     let mut notes = stage.notes.clone();
     let msix_unhealthy = health.as_ref().is_some_and(|h| !h.healthy);
@@ -1239,6 +1408,7 @@ fn install_portable_after_stage(
         ));
     }
     notes.extend(portable.notes.clone());
+    notes.extend(outcome.warnings.iter().cloned());
 
     let action = if msix_unhealthy {
         WinPerformAction::PortableFallbackAfterMsixUnhealthy
@@ -1251,7 +1421,14 @@ fn install_portable_after_stage(
     let report = WinPerformReport {
         success: true,
         action,
-        message: portable.message.clone(),
+        message: if outcome.is_partial() {
+            format!(
+                "{}（已安装，但托管记录未写入 — 请「开始管理」重试，勿重复安装）",
+                portable.message
+            )
+        } else {
+            portable.message.clone()
+        },
         installed,
         sideload,
         portable: Some(portable),
@@ -1260,6 +1437,7 @@ fn install_portable_after_stage(
         fallback_attempted: true,
         notes,
         stage,
+        outcome,
     };
     let action = report.action.as_str();
     let installed_version = report
@@ -1391,6 +1569,7 @@ pub fn uninstall_windows_codex(
             portable: None,
             purged_user_data: false,
             notes: vec![],
+            outcome: OperationOutcome::full_success("absent", Some("none")),
         });
     };
 
@@ -1415,6 +1594,10 @@ pub fn uninstall_windows_codex(
             portable: None,
             purged_user_data: false,
             notes: vec!["No files or packages were removed.".to_string()],
+            outcome: OperationOutcome::primary_failed(
+                "present",
+                "external install — refuse to uninstall",
+            ),
         });
     }
 
@@ -1424,30 +1607,59 @@ pub fn uninstall_windows_codex(
         let msix = remove_msix_package().map_err(engine_err)?;
         let mut notes = Vec::new();
         let mut purged_user_data = false;
+        let mut outcome = if msix.success {
+            OperationOutcome::full_success("absent", Some("none"))
+        } else {
+            OperationOutcome::primary_failed("present", msix.message.clone())
+        };
         if msix.success {
             store.remove(&installed_before.path);
-            store.save()?;
+            if let Err(e) = store.save() {
+                let detail = format!("托管记录清除失败（{e}）");
+                outcome.provenance = StepOutcome::failed(detail.clone());
+                outcome.push_warning(detail);
+                outcome.push_recovery(recovery::CLEAR_PROVENANCE);
+                outcome.path = Some(installed_before.path.clone());
+            }
             notes.extend(msix.notes.clone());
             // Honor the user's "don't keep my data" choice on the MSIX path too,
             // exactly like the portable path — remove ~/.codex when asked.
             if purge_user_data {
-                purged_user_data = purge_codex_user_data(&mut notes).map_err(engine_err)?;
-                if purged_user_data {
-                    notes.push("User data was removed.".to_string());
+                match purge_codex_user_data(&mut notes) {
+                    Ok(purged) => {
+                        purged_user_data = purged;
+                        if purged {
+                            notes.push("User data was removed.".to_string());
+                        }
+                        outcome.cleanup = StepOutcome::ok();
+                    }
+                    Err(err) => {
+                        let detail = format!("user data purge failed: {err}");
+                        notes.push(detail.clone());
+                        outcome.cleanup = StepOutcome::failed(detail);
+                        outcome.push_recovery(recovery::PURGE_USER_DATA);
+                    }
                 }
             } else {
                 notes.push("User data was preserved.".to_string());
+                outcome.cleanup = StepOutcome::skipped("user data preserved");
             }
         }
+        notes.extend(outcome.warnings.iter().cloned());
         let report = WinUninstallReport {
             success: msix.success,
             action: "remove-msix".to_string(),
-            message: msix.message.clone(),
+            message: if outcome.is_partial() {
+                format!("{}（主卸载已完成，附属步骤有失败 — 可仅重试清理）", msix.message)
+            } else {
+                msix.message.clone()
+            },
             installed_before: Some(installed_before),
             msix: Some(msix),
             portable: None,
             purged_user_data,
             notes,
+            outcome,
         };
         log::info!("Windows uninstall complete purge_user_data={purge_user_data}");
         return Ok(report);
@@ -1458,33 +1670,169 @@ pub fn uninstall_windows_codex(
         purge_user_data,
     )
     .map_err(engine_err)?;
+    let mut provenance = StepOutcome::ok();
     if portable.success {
         store.remove(&installed_before.path);
-        store.save()?;
+        if let Err(e) = store.save() {
+            provenance = StepOutcome::failed(format!("托管记录清除失败（{e}）"));
+        }
     }
+    let outcome =
+        outcome_from_portable_uninstall(&portable, provenance, &installed_before.path);
+    let mut notes = portable.notes.clone();
+    notes.extend(outcome.warnings.iter().cloned());
     let report = WinUninstallReport {
         success: portable.success,
         action: "remove-portable".to_string(),
-        message: portable.message.clone(),
+        message: if outcome.is_partial() {
+            format!(
+                "{}（主卸载已完成，附属步骤有失败 — 可仅重试清理）",
+                portable.message
+            )
+        } else {
+            portable.message.clone()
+        },
         installed_before: Some(installed_before),
         msix: None,
         purged_user_data: portable.purged_user_data,
-        notes: portable.notes.clone(),
+        notes,
         portable: Some(portable),
+        outcome,
     };
     log::info!("Windows uninstall complete purge_user_data={purge_user_data}");
     Ok(report)
+}
+
+/// Retry only failed ancillary steps after a Windows install/uninstall.
+/// Never re-runs full install or package removal.
+pub fn retry_windows_ancillary(
+    settings: &AppSettings,
+    actions: &[String],
+    path: Option<&str>,
+    purge_user_data: bool,
+) -> Result<AncillaryRetryReport, AppError> {
+    let mut outcome = OperationOutcome {
+        primary_ok: true,
+        app_state: "unknown".to_string(),
+        install_class: None,
+        path: path.map(str::to_string),
+        provenance: StepOutcome::not_applicable(),
+        cleanup: StepOutcome::not_applicable(),
+        warnings: Vec::new(),
+        recovery_actions: Vec::new(),
+    };
+    let mut messages = Vec::new();
+
+    if actions.iter().any(|a| a == recovery::RECORD_PROVENANCE) {
+        let status = win_install_status(settings);
+        match status.installed {
+            Some(installed) => {
+                let recorded =
+                    record_managed_install(None, &installed, "manager-installed-recovery");
+                outcome.provenance = recorded.provenance.clone();
+                outcome.app_state = recorded.app_state;
+                outcome.install_class = recorded.install_class;
+                if recorded.provenance.is_failed() {
+                    outcome.push_recovery(recovery::RECORD_PROVENANCE);
+                    messages.push(
+                        recorded
+                            .warnings
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "托管记录写入失败".to_string()),
+                    );
+                } else {
+                    messages.push("托管记录已重新写入".to_string());
+                }
+            }
+            None => {
+                outcome.provenance = StepOutcome::failed("未检测到可记录的 Codex 安装");
+                outcome.app_state = "absent".to_string();
+                messages.push("未检测到 Codex，无法写入托管记录".to_string());
+            }
+        }
+    }
+
+    if actions.iter().any(|a| a == recovery::CLEAR_PROVENANCE) {
+        let mut store = ProvenanceStore::load();
+        if let Some(path) = path {
+            store.remove(path);
+        } else {
+            store.managed.retain(|r| Path::new(&r.path).exists());
+        }
+        match store.save() {
+            Ok(()) => {
+                outcome.provenance = StepOutcome::ok();
+                messages.push("陈旧托管记录已清除".to_string());
+            }
+            Err(e) => {
+                outcome.provenance = StepOutcome::failed(e.to_string());
+                outcome.push_recovery(recovery::CLEAR_PROVENANCE);
+                messages.push(format!("清除托管记录仍失败: {e}"));
+            }
+        }
+    }
+
+    if actions.iter().any(|a| a == recovery::CLEANUP_METADATA) {
+        match cleanup_portable_metadata(false).map_err(engine_err) {
+            Ok(report) => {
+                if report.partial {
+                    outcome.cleanup = StepOutcome::failed(report.message.clone());
+                    outcome.push_recovery(recovery::CLEANUP_METADATA);
+                } else {
+                    outcome.cleanup = StepOutcome::ok();
+                }
+                messages.push(report.message);
+                outcome.warnings.extend(report.notes);
+            }
+            Err(err) => {
+                outcome.cleanup = StepOutcome::failed(err.to_string());
+                outcome.push_recovery(recovery::CLEANUP_METADATA);
+                messages.push(format!("元数据清理失败: {err}"));
+            }
+        }
+    }
+
+    if actions.iter().any(|a| a == recovery::PURGE_USER_DATA) && purge_user_data {
+        let mut notes = Vec::new();
+        match purge_codex_user_data(&mut notes).map_err(engine_err) {
+            Ok(_) => {
+                outcome.cleanup = StepOutcome::ok_detail("user data purged");
+                messages.push("用户数据已清除".to_string());
+            }
+            Err(err) => {
+                outcome.cleanup = StepOutcome::failed(err.to_string());
+                outcome.push_recovery(recovery::PURGE_USER_DATA);
+                messages.push(format!("清除用户数据仍失败: {err}"));
+            }
+        }
+        outcome.warnings.extend(notes);
+    }
+
+    if messages.is_empty() {
+        return Err(AppError::Internal(
+            "没有可执行的恢复步骤（请传入 record_provenance / clear_provenance / cleanup_metadata / purge_user_data）"
+                .to_string(),
+        ));
+    }
+
+    Ok(AncillaryRetryReport {
+        message: messages.join("; "),
+        outcome,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         bind_manifest_checksums, check_win_update_abort, detect_existing_windows_install_at_path,
-        detect_managed_codex, WinAbortGuard, WinPerformAction, WIN_UPDATE_ABORT,
+        detect_managed_codex, outcome_from_portable_uninstall, WinAbortGuard, WinPerformAction,
+        WIN_UPDATE_ABORT,
     };
+    use crate::app::operation_outcome::{recovery, StepOutcome};
     use crate::app::provenance::ProvenanceStore;
     use crate::domain::settings::AppSettings;
-    use codex_win_engine::WindowsRelease;
+    use codex_win_engine::{PortableUninstallReport, WindowsRelease};
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
@@ -1681,5 +2029,81 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
             "https://example.com/OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0.Msix",
         )
         .is_err());
+    }
+
+    #[test]
+    fn portable_uninstall_primary_ok_when_tree_already_absent() {
+        let portable = PortableUninstallReport {
+            success: true,
+            partial: true,
+            install_root: r"C:\Codex".into(),
+            removed_files: false, // already gone
+            removed_shortcut: false,
+            removed_uninstall_entry: false,
+            purged_user_data: false,
+            message: "cleanup warnings".into(),
+            notes: vec!["Start Menu shortcut cleanup failed: access denied".into()],
+        };
+        let outcome = outcome_from_portable_uninstall(
+            &portable,
+            StepOutcome::ok(),
+            r"C:\Codex",
+        );
+        assert!(outcome.primary_ok, "absent tree is still primary success");
+        assert_eq!(outcome.app_state, "absent");
+        assert_eq!(outcome.path.as_deref(), Some(r"C:\Codex"));
+        assert!(outcome.is_partial());
+        assert!(outcome
+            .recovery_actions
+            .iter()
+            .any(|a| a == recovery::CLEANUP_METADATA));
+        // Path lives in the field, not smuggled through warnings.
+        assert!(!outcome.warnings.iter().any(|w| w.starts_with("path:")));
+    }
+
+    #[test]
+    fn portable_uninstall_surfaces_user_data_purge_failure_as_partial() {
+        let portable = PortableUninstallReport {
+            success: true,
+            partial: true,
+            install_root: r"C:\Codex".into(),
+            removed_files: true,
+            removed_shortcut: true,
+            removed_uninstall_entry: true,
+            purged_user_data: false,
+            message: "cleanup warnings".into(),
+            notes: vec!["User data cleanup failed: access denied".into()],
+        };
+        let outcome = outcome_from_portable_uninstall(
+            &portable,
+            StepOutcome::ok(),
+            r"C:\Codex",
+        );
+        assert!(outcome.primary_ok);
+        assert!(outcome.is_partial());
+        assert!(outcome
+            .recovery_actions
+            .iter()
+            .any(|a| a == recovery::PURGE_USER_DATA));
+    }
+
+    #[test]
+    fn portable_uninstall_hard_failure_is_not_partial() {
+        let portable = PortableUninstallReport {
+            success: false,
+            partial: false,
+            install_root: r"C:\Codex".into(),
+            removed_files: false,
+            removed_shortcut: false,
+            removed_uninstall_entry: false,
+            purged_user_data: false,
+            message: "remove failed".into(),
+            notes: vec![],
+        };
+        let outcome =
+            outcome_from_portable_uninstall(&portable, StepOutcome::ok(), r"C:\Codex");
+        assert!(!outcome.primary_ok);
+        assert!(!outcome.is_partial());
+        assert_eq!(outcome.app_state, "present");
     }
 }
