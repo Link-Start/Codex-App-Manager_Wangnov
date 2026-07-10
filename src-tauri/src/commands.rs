@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use codex_win_engine::InstalledWindowsCodex;
 use serde::{Deserialize, Serialize};
@@ -20,6 +25,16 @@ use crate::app::mac_update::{
     uninstall_macos, InstalledCodex, MacInstallStatus, MacPerformReport, MacStageReport,
     MacUninstallReport, MacUpdateReport, PerformExpectation,
 };
+use crate::app::manager_update_handoff::clear_for_platform as clear_manager_update_handoff;
+#[cfg(target_os = "windows")]
+use crate::app::manager_update_handoff::{
+    now_unix_ms, persist_for_platform as persist_manager_update_handoff,
+    ManagerUpdateHandoff,
+};
+use crate::app::manager_update_handoff::{
+    status_for_platform as manager_update_handoff_status, ManagerUpdateHandoffStatus,
+};
+use crate::app::manager_update_runtime::ManagerUpdateRuntimeSnapshot;
 use crate::app::op_phase::{OperationPhase, QuitPolicy};
 use crate::app::operation_outcome::{AncillaryRetryReport, AncillaryRetryRequest};
 use crate::app::oplock::{
@@ -46,7 +61,7 @@ use crate::app::win_update::{
 use crate::domain::settings::AppSettings as DomainAppSettings;
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
-use crate::state::ManagerState;
+use crate::state::{manager_update_handoff_timeout, ManagerState};
 
 fn normalize_windows_source_base(raw: &str) -> Option<String> {
     let mut base = raw.trim().trim_end_matches('/').to_string();
@@ -158,8 +173,48 @@ pub struct ManagerUpdateMetadata {
     pub body: Option<String>,
 }
 
-fn manager_updater_builder(
+const MANAGER_UPDATE_STATE_EVENT: &str = "manager://update-state";
+const MANAGER_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const MANAGER_UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const MANAGER_UPDATE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn emit_manager_update_state(app: &AppHandle, snapshot: ManagerUpdateRuntimeSnapshot) {
+    let _ = app.emit(MANAGER_UPDATE_STATE_EVENT, snapshot);
+}
+
+fn persist_manager_update_handoff_before_install(
+    snapshot: &ManagerUpdateRuntimeSnapshot,
+) -> Result<Option<u64>, AppError> {
+    #[cfg(target_os = "windows")]
+    {
+        let started_at_unix_ms = now_unix_ms();
+        persist_manager_update_handoff(&ManagerUpdateHandoff {
+            version: snapshot.version.clone(),
+            current_version: snapshot.current_version.clone(),
+            body: snapshot.body.clone(),
+            started_at_unix_ms,
+        })
+        .map_err(|error| AppError::Internal(format!("persist manager updater handoff: {error}")))?;
+        Ok(Some(started_at_unix_ms))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = snapshot;
+        Ok(None)
+    }
+}
+
+fn release_manager_update_handoff_guard(state: &ManagerState) {
+    state
+        .manager_update_handoff_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+}
+
+fn manager_updater_builder_for_endpoints(
     app: &AppHandle,
+    endpoints: Option<Vec<url::Url>>,
 ) -> Result<tauri_plugin_updater::UpdaterBuilder, AppError> {
     let saved = PersistedAppSettings::load();
     let mut builder = app.updater_builder();
@@ -176,7 +231,145 @@ fn manager_updater_builder(
             builder = builder.proxy(proxy);
         }
     }
-    Ok(builder)
+    if let Some(endpoints) = endpoints {
+        builder = builder
+            .endpoints(endpoints)
+            .map_err(|e| AppError::Engine(format!("configure manager updater endpoints: {e}")))?;
+    }
+    // `UpdaterBuilder::timeout` only reaches manifest checks. The updater
+    // deliberately creates downloads without that total timeout, so keep
+    // downloads unbounded while data is flowing and enforce a read-stall
+    // timeout through the shared reqwest client configuration instead.
+    Ok(builder
+        .timeout(MANAGER_UPDATE_CHECK_TIMEOUT)
+        .configure_client(|client| {
+            client
+                .connect_timeout(MANAGER_UPDATE_CONNECT_TIMEOUT)
+                .read_timeout(MANAGER_UPDATE_READ_TIMEOUT)
+        }))
+}
+
+fn configured_manager_update_endpoints(app: &AppHandle) -> Result<Vec<url::Url>, AppError> {
+    let raw = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .cloned()
+        .ok_or_else(|| AppError::Internal("missing updater plugin configuration".to_string()))?;
+    let config: tauri_plugin_updater::Config = serde_json::from_value(raw)
+        .map_err(|e| AppError::Internal(format!("read updater plugin configuration: {e}")))?;
+    if config.endpoints.is_empty() {
+        return Err(AppError::Internal(
+            "updater plugin has no configured endpoints".to_string(),
+        ));
+    }
+    Ok(config.endpoints)
+}
+
+async fn download_with_manager_fallback<T, Attempt, AttemptFuture>(
+    endpoints: Vec<url::Url>,
+    mut attempt: Attempt,
+) -> Result<T, AppError>
+where
+    Attempt: FnMut(url::Url) -> AttemptFuture,
+    AttemptFuture: Future<Output = Result<T, AppError>>,
+{
+    let mut failures = Vec::new();
+    let mut stale_failures = Vec::new();
+    for endpoint in endpoints {
+        let origin = redact_url(endpoint.as_str());
+        match attempt(endpoint).await {
+            Ok(value) => return Ok(value),
+            // Consent is bound to the exact expected version/current pair, not
+            // to one particular feed. A stale mirror may safely fall through to
+            // GitHub, but no mismatching package is ever downloaded/installed.
+            Err(AppError::StaleExpectation(message)) => {
+                log::warn!("manager updater endpoint is stale origin={origin} error={message}");
+                stale_failures.push(format!("{origin}: {message}"));
+            }
+            Err(err) => {
+                log::warn!("manager updater endpoint attempt failed origin={origin} error={err}");
+                failures.push(format!("{origin}: {err}"));
+            }
+        }
+    }
+
+    if !stale_failures.is_empty() {
+        let mut details = stale_failures;
+        details.extend(failures);
+        return Err(AppError::StaleExpectation(format!(
+            "管理器更新内容已变化，请重新检查后再确认。({})",
+            details.join("; ")
+        )));
+    }
+
+    Err(AppError::Engine(format!(
+        "manager update download failed for all configured endpoints: {}",
+        failures.join("; ")
+    )))
+}
+
+async fn check_with_manager_fallback<T, Attempt, AttemptFuture>(
+    endpoints: Vec<url::Url>,
+    mut attempt: Attempt,
+) -> Result<Option<T>, AppError>
+where
+    Attempt: FnMut(url::Url) -> AttemptFuture,
+    AttemptFuture: Future<Output = Result<Option<T>, AppError>>,
+{
+    let mut failures_after_last_success = Vec::new();
+    let mut saw_no_update = false;
+
+    for endpoint in endpoints {
+        let origin = redact_url(endpoint.as_str());
+        match attempt(endpoint).await {
+            Ok(Some(update)) => return Ok(Some(update)),
+            Ok(None) => {
+                // A valid but stale mirror (including HTTP 204) is not proof
+                // that the authoritative fallback has no update. Continue all
+                // the way through the configured feeds. A later successful
+                // no-update result supersedes earlier transport failures.
+                log::debug!("manager updater endpoint has no update origin={origin}");
+                saw_no_update = true;
+                failures_after_last_success.clear();
+            }
+            Err(err) => {
+                log::warn!("manager updater check failed origin={origin} error={err}");
+                failures_after_last_success.push(format!("{origin}: {err}"));
+            }
+        }
+    }
+
+    if saw_no_update && failures_after_last_success.is_empty() {
+        return Ok(None);
+    }
+
+    Err(AppError::Engine(format!(
+        "manager update check failed for all configured endpoints: {}",
+        failures_after_last_success.join("; ")
+    )))
+}
+
+async fn download_then_install_manager_update<T, Attempt, AttemptFuture, Install>(
+    endpoints: Vec<url::Url>,
+    attempt: Attempt,
+    install: Install,
+) -> Result<(), AppError>
+where
+    Attempt: FnMut(url::Url) -> AttemptFuture,
+    AttemptFuture: Future<Output = Result<T, AppError>>,
+    Install: FnOnce(T) -> Result<(), AppError>,
+{
+    // The fallback boundary ends when a fully downloaded package has passed its
+    // Tauri signature verification. Installation is invoked exactly once.
+    let package = download_with_manager_fallback(endpoints, attempt).await?;
+    install(package)
+}
+
+struct DownloadedManagerUpdate {
+    update: tauri_plugin_updater::Update,
+    bytes: Vec<u8>,
 }
 
 fn manager_update_matches_confirmation(
@@ -192,13 +385,20 @@ fn manager_update_matches_confirmation(
 pub async fn manager_check_update(
     app: AppHandle,
 ) -> Result<Option<ManagerUpdateMetadata>, CommandError> {
-    let updater = manager_updater_builder(&app)?
-        .build()
-        .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| AppError::Engine(format!("check manager update: {e}")))?;
+    let endpoints = configured_manager_update_endpoints(&app)?;
+    let update = check_with_manager_fallback(endpoints, |endpoint| {
+        let app = app.clone();
+        async move {
+            let updater = manager_updater_builder_for_endpoints(&app, Some(vec![endpoint]))?
+                .build()
+                .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
+            updater
+                .check()
+                .await
+                .map_err(|e| AppError::Engine(format!("check manager update: {e}")))
+        }
+    })
+    .await?;
     Ok(update.map(|update| ManagerUpdateMetadata {
         version: update.version,
         current_version: update.current_version,
@@ -207,35 +407,218 @@ pub async fn manager_check_update(
 }
 
 #[tauri::command]
+pub fn manager_get_update_runtime(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+) -> Option<ManagerUpdateRuntimeSnapshot> {
+    let snapshot = state.manager_update.snapshot()?;
+    if snapshot.handoff_started_at.is_none() {
+        return Some(snapshot);
+    }
+
+    let current_version = app.package_info().version.to_string();
+    match manager_update_handoff_status(&current_version) {
+        ManagerUpdateHandoffStatus::Active(record)
+            if record.version == snapshot.version
+                && record.current_version == snapshot.current_version
+                && record.started_at_unix_ms == snapshot.handoff_started_at.unwrap_or_default() =>
+        {
+            Some(snapshot)
+        }
+        ManagerUpdateHandoffStatus::Active(_)
+        | ManagerUpdateHandoffStatus::Expired(_)
+        | ManagerUpdateHandoffStatus::None => {
+            // Missing, mismatched, or expired durable evidence must release the
+            // recovered cross-process lock and become an explicit retry surface.
+            clear_manager_update_handoff();
+            release_manager_update_handoff_guard(&state);
+            state
+                .manager_update
+                .failed(manager_update_handoff_timeout())
+        }
+    }
+}
+
+#[tauri::command]
+pub fn manager_ack_update_runtime(
+    state: State<'_, ManagerState>,
+    revision: u64,
+    version: String,
+    current_version: String,
+) -> bool {
+    state
+        .manager_update
+        .acknowledge_terminal(revision, &version, &current_version)
+}
+
+#[tauri::command]
 pub async fn manager_install_update(
     app: AppHandle,
+    state: State<'_, ManagerState>,
     expected_version: String,
     expected_current_version: String,
+    expected_body: Option<String>,
 ) -> Result<(), CommandError> {
-    let updater = manager_updater_builder(&app)?
-        .build()
-        .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| AppError::Engine(format!("check manager update before install: {e}")))?
-        .ok_or_else(|| AppError::Engine("No manager update is available.".to_string()))?;
-    if !manager_update_matches_confirmation(
-        &update.version,
-        &update.current_version,
-        &expected_version,
-        &expected_current_version,
-    ) {
-        return Err(AppError::StaleExpectation(
-            "管理器更新内容已变化，请重新检查后再确认。".to_string(),
+    // Own the same process/cross-process lock as Codex mutations. This is both
+    // the final busy preflight and a race-free reservation: once acquired, no
+    // install/update can start while the manager package is downloading.
+    let op = begin_guard(&state, OperationKind::ManagerUpdate)?;
+    let start = state.manager_update.begin(
+        expected_version.clone(),
+        expected_current_version.clone(),
+        expected_body,
+    );
+    emit_manager_update_state(&app, start);
+
+    let result = async {
+        state
+            .operations
+            .set_phase(op.token(), OperationPhase::Downloading)
+            .map_err(AppError::from)?;
+        let endpoints = configured_manager_update_endpoints(&app)?;
+        let runtime_for_attempts = state.manager_update.clone();
+        let operations_for_attempts = state.operations.clone();
+        let token_for_attempts = op.token().clone();
+        let app_for_attempts = app.clone();
+        let expected_version = Arc::new(expected_version);
+        let expected_current_version = Arc::new(expected_current_version);
+
+        download_then_install_manager_update(
+            endpoints,
+            move |endpoint| {
+                let runtime = runtime_for_attempts.clone();
+                let operations = operations_for_attempts.clone();
+                let token = token_for_attempts.clone();
+                let app = app_for_attempts.clone();
+                let expected_version = Arc::clone(&expected_version);
+                let expected_current_version = Arc::clone(&expected_current_version);
+                async move {
+                    operations
+                        .set_phase(&token, OperationPhase::Downloading)
+                        .map_err(AppError::from)?;
+                    if let Some(snapshot) = runtime.downloading(0, None) {
+                        emit_manager_update_state(&app, snapshot);
+                    }
+
+                    let updater =
+                        manager_updater_builder_for_endpoints(&app, Some(vec![endpoint.clone()]))?
+                            .build()
+                            .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
+                    let update = updater
+                        .check()
+                        .await
+                        .map_err(|e| {
+                            AppError::Engine(format!("check manager update before install: {e}"))
+                        })?
+                        .ok_or_else(|| {
+                            AppError::StaleExpectation(
+                                "管理器更新内容已变化，请重新检查后再确认。".to_string(),
+                            )
+                        })?;
+                    if !manager_update_matches_confirmation(
+                        &update.version,
+                        &update.current_version,
+                        expected_version.as_str(),
+                        expected_current_version.as_str(),
+                    ) {
+                        return Err(AppError::StaleExpectation(
+                            "管理器更新内容已变化，请重新检查后再确认。".to_string(),
+                        ));
+                    }
+
+                    let source = redact_url(endpoint.as_str());
+                    let runtime_for_progress = runtime.clone();
+                    let operations_for_progress = operations.clone();
+                    let token_for_progress = token.clone();
+                    let app_for_progress = app.clone();
+                    let operations_for_verify = operations.clone();
+                    let token_for_verify = token.clone();
+                    let mut downloaded = 0_u64;
+                    let bytes = update
+                        .download(
+                            move |chunk, total| {
+                                downloaded = downloaded.saturating_add(chunk as u64);
+                                let _ = operations_for_progress.set_progress(
+                                    &token_for_progress,
+                                    OperationProgress {
+                                        downloaded,
+                                        total: total.unwrap_or(0),
+                                        source: source.clone(),
+                                    },
+                                );
+                                if let Some(snapshot) =
+                                    runtime_for_progress.downloading(downloaded, total)
+                                {
+                                    emit_manager_update_state(&app_for_progress, snapshot);
+                                }
+                            },
+                            move || {
+                                // `download` invokes this before minisign verification.
+                                // Verifying remains interruptible and may still fall back.
+                                let _ = operations_for_verify
+                                    .set_phase(&token_for_verify, OperationPhase::Verifying);
+                            },
+                        )
+                        .await
+                        .map_err(|e| AppError::Engine(format!("download manager update: {e}")))?;
+                    Ok(DownloadedManagerUpdate { update, bytes })
+                }
+            },
+            |package| {
+                // This is the no-return boundary on Windows. Set all durable and
+                // renderer-independent state before invoking the installer.
+                state
+                    .operations
+                    .set_phase(op.token(), OperationPhase::Committing)
+                    .map_err(AppError::from)?;
+                let runtime = state.manager_update.snapshot().ok_or_else(|| {
+                    AppError::Internal("manager update runtime disappeared before install".into())
+                })?;
+                let handoff_started_at = persist_manager_update_handoff_before_install(&runtime)?;
+                let snapshot = state
+                    .manager_update
+                    .installing(handoff_started_at)
+                    .ok_or_else(|| {
+                        clear_manager_update_handoff();
+                        AppError::Internal(
+                            "manager update runtime disappeared during install handoff".into(),
+                        )
+                    })?;
+                emit_manager_update_state(&app, snapshot);
+                let installed = package
+                    .update
+                    .install(package.bytes)
+                    .map_err(|e| AppError::Engine(format!("install manager update: {e}")));
+                if installed.is_err() {
+                    clear_manager_update_handoff();
+                }
+                installed
+            },
         )
-        .into());
+        .await?;
+
+        state
+            .operations
+            .set_phase(op.token(), OperationPhase::Finishing)
+            .map_err(AppError::from)?;
+        if let Some(snapshot) = state.manager_update.installed() {
+            emit_manager_update_state(&app, snapshot);
+        }
+        clear_manager_update_handoff();
+        Ok::<(), AppError>(())
     }
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| AppError::Engine(format!("install manager update: {e}")))?;
-    Ok(())
+    .await;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let command_error = CommandError::from(err);
+            if let Some(snapshot) = state.manager_update.failed(command_error.clone()) {
+                emit_manager_update_state(&app, snapshot);
+            }
+            Err(command_error)
+        }
+    }
 }
 
 fn windows_domain_settings_for_persisted(state: &ManagerState) -> DomainAppSettings {
@@ -1818,11 +2201,14 @@ pub async fn win_uninstall(
 #[cfg(test)]
 mod tests {
     use super::{
+        check_with_manager_fallback, download_then_install_manager_update,
         install_root_from_picked_dir, manager_update_matches_confirmation,
         normalize_windows_source_base, validate_install_root_path,
         validated_custom_proxy_for_settings,
     };
+    use crate::errors::AppError;
     use std::fs;
+    use std::sync::{Arc, Mutex};
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
@@ -1874,6 +2260,289 @@ mod tests {
         assert!(!manager_update_matches_confirmation(
             "0.2.1", "0.2.1", "0.2.1", "0.2.0"
         ));
+    }
+
+    fn manager_update_test_endpoints() -> Vec<url::Url> {
+        vec![
+            url::Url::parse("https://mirror.example/latest.json").unwrap(),
+            url::Url::parse("https://github.com/example/releases/latest/download/latest.json")
+                .unwrap(),
+        ]
+    }
+
+    #[test]
+    fn manager_update_check_falls_back_after_primary_reports_no_update() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_check = Arc::clone(&attempts);
+
+        let result = tauri::async_runtime::block_on(check_with_manager_fallback(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_check);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    if endpoint.host_str() == Some("mirror.example") {
+                        Ok(None)
+                    } else {
+                        Ok(Some("github-update"))
+                    }
+                }
+            },
+        ));
+
+        assert_eq!(result.unwrap(), Some("github-update"));
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["mirror.example", "github.com"]
+        );
+    }
+
+    #[test]
+    fn manager_update_check_falls_back_after_primary_check_failure() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_check = Arc::clone(&attempts);
+
+        let result = tauri::async_runtime::block_on(check_with_manager_fallback(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_check);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    if endpoint.host_str() == Some("mirror.example") {
+                        Err(AppError::Engine(
+                            "manifest has no current platform".to_string(),
+                        ))
+                    } else {
+                        Ok(Some("github-update"))
+                    }
+                }
+            },
+        ));
+
+        assert_eq!(result.unwrap(), Some("github-update"));
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["mirror.example", "github.com"]
+        );
+    }
+
+    #[test]
+    fn manager_update_check_accepts_final_no_update_after_primary_failure() {
+        let result = tauri::async_runtime::block_on(check_with_manager_fallback(
+            manager_update_test_endpoints(),
+            |endpoint| async move {
+                if endpoint.host_str() == Some("mirror.example") {
+                    Err(AppError::Engine("timed out".to_string()))
+                } else {
+                    Ok(None::<&'static str>)
+                }
+            },
+        ));
+
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn manager_update_check_rejects_unconfirmed_no_update() {
+        let error = tauri::async_runtime::block_on(check_with_manager_fallback(
+            manager_update_test_endpoints(),
+            |endpoint| async move {
+                if endpoint.host_str() == Some("mirror.example") {
+                    Ok(None::<&'static str>)
+                } else {
+                    Err(AppError::Engine("timed out".to_string()))
+                }
+            },
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("github.com"));
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn manager_update_falls_back_after_mirror_artifact_failure() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let installed = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_download = Arc::clone(&attempts);
+        let installed_for_install = Arc::clone(&installed);
+
+        let result = tauri::async_runtime::block_on(download_then_install_manager_update(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_download);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    if endpoint.host_str() == Some("mirror.example") {
+                        Err(AppError::Engine(
+                            "download manager update: HTTP 404".to_string(),
+                        ))
+                    } else {
+                        Ok("github-verified-package")
+                    }
+                }
+            },
+            move |package| {
+                installed_for_install.lock().unwrap().push(package);
+                Ok(())
+            },
+        ));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["mirror.example", "github.com"]
+        );
+        assert_eq!(*installed.lock().unwrap(), vec!["github-verified-package"]);
+    }
+
+    #[test]
+    fn manager_update_falls_back_after_mirror_stream_resets() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_download = Arc::clone(&attempts);
+
+        let result = tauri::async_runtime::block_on(download_then_install_manager_update(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_download);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    if endpoint.host_str() == Some("mirror.example") {
+                        Err(AppError::Engine(
+                            "download manager update: connection reset mid-stream".to_string(),
+                        ))
+                    } else {
+                        Ok("github-verified-package")
+                    }
+                }
+            },
+            |_| Ok(()),
+        ));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["mirror.example", "github.com"]
+        );
+    }
+
+    #[test]
+    fn manager_update_falls_back_when_primary_manifest_is_stale() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_download = Arc::clone(&attempts);
+
+        let result = tauri::async_runtime::block_on(download_then_install_manager_update(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_download);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    if endpoint.host_str() == Some("mirror.example") {
+                        Err(AppError::StaleExpectation("mirror is stale".to_string()))
+                    } else {
+                        Ok("github-exact-expected-package")
+                    }
+                }
+            },
+            |_| Ok(()),
+        ));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["mirror.example", "github.com"]
+        );
+    }
+
+    #[test]
+    fn manager_update_reports_when_both_artifact_sources_fail() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let install_called = Arc::new(Mutex::new(false));
+        let attempts_for_download = Arc::clone(&attempts);
+        let install_called_for_install = Arc::clone(&install_called);
+
+        let error = tauri::async_runtime::block_on(download_then_install_manager_update::<
+            &'static str,
+            _,
+            _,
+            _,
+        >(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_download);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    Err(AppError::Engine(format!(
+                        "download failed from {}",
+                        endpoint.host_str().unwrap()
+                    )))
+                }
+            },
+            move |_| {
+                *install_called_for_install.lock().unwrap() = true;
+                Ok(())
+            },
+        ))
+        .unwrap_err();
+
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["mirror.example", "github.com"]
+        );
+        assert!(!*install_called.lock().unwrap());
+        assert!(error.to_string().contains("mirror.example"));
+        assert!(error.to_string().contains("github.com"));
+    }
+
+    #[test]
+    fn manager_update_never_falls_back_after_install_starts() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let install_calls = Arc::new(Mutex::new(0_u32));
+        let attempts_for_download = Arc::clone(&attempts);
+        let install_calls_for_install = Arc::clone(&install_calls);
+
+        let error = tauri::async_runtime::block_on(download_then_install_manager_update(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_download);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    Ok("verified-package")
+                }
+            },
+            move |_| {
+                *install_calls_for_install.lock().unwrap() += 1;
+                Err(AppError::Engine(
+                    "installer failed after launch".to_string(),
+                ))
+            },
+        ))
+        .unwrap_err();
+
+        assert_eq!(*attempts.lock().unwrap(), vec!["mirror.example"]);
+        assert_eq!(*install_calls.lock().unwrap(), 1);
+        assert!(error.to_string().contains("installer failed after launch"));
     }
 
     #[test]

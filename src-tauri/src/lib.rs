@@ -161,6 +161,8 @@ pub fn run() {
             commands::mac_launch_codex,
             commands::mac_uninstall,
             commands::manager_check_update,
+            commands::manager_ack_update_runtime,
+            commands::manager_get_update_runtime,
             commands::manager_install_update,
             commands::get_settings,
             commands::set_settings,
@@ -199,6 +201,9 @@ pub fn run() {
             commands::log_frontend_error,
         ])
         .setup(|app| {
+            let current_version = app.package_info().version.to_string();
+            app.state::<state::ManagerState>()
+                .restore_manager_update_handoff(&current_version);
             #[cfg(target_os = "macos")]
             install_macos_menu(app)?;
             log::info!(

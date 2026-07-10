@@ -17,6 +17,7 @@ const DEFAULT_STALE_AFTER_SECS: u64 = 5 * 60;
 pub enum OperationKind {
     Install,
     Update,
+    ManagerUpdate,
     Uninstall,
     SetInstallRoot,
     Adopt,
@@ -27,6 +28,7 @@ impl OperationKind {
         match self {
             Self::Install => "install",
             Self::Update => "update",
+            Self::ManagerUpdate => "manager-update",
             Self::Uninstall => "uninstall",
             Self::SetInstallRoot => "set-install-root",
             Self::Adopt => "adopt",
@@ -617,6 +619,31 @@ mod tests {
         assert!(!manager.is_busy());
         assert!(manager.begin(OperationKind::Install).is_ok());
 
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn manager_update_lease_blocks_codex_mutations() {
+        let path = lock_path("manager-update");
+        let manager = OperationManager::new(path.clone());
+        let guard = manager.begin(OperationKind::ManagerUpdate).unwrap();
+
+        assert_eq!(guard.kind().as_str(), "manager-update");
+        assert_eq!(
+            manager.snapshot().map(|snapshot| snapshot.kind),
+            Some(OperationKind::ManagerUpdate)
+        );
+        assert!(matches!(
+            manager.begin(OperationKind::Install),
+            Err(OperationError::BusySameProcess("manager-update"))
+        ));
+        assert!(matches!(
+            manager.begin(OperationKind::Update),
+            Err(OperationError::BusySameProcess("manager-update"))
+        ));
+
+        drop(guard);
+        assert!(manager.begin(OperationKind::Update).is_ok());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

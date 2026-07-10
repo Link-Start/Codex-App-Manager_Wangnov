@@ -1,11 +1,10 @@
 # Verify Authenticode signatures on Windows PE files (installer, app, uninstaller).
 #
 # Modes:
-#   optional  — report status; unsigned/NotSigned exits 0 (current milestone while
-#               OV/EV cert budget is not in place). Fail only if a path is missing
-#               or Get-AuthenticodeSignature itself errors.
-#   required  — every path must have Status -eq Valid. Use after cert is wired
-#               into release (repo var AUTHENTICODE_REQUIRED=true).
+#   optional  — PR/local diagnostic for builds that intentionally receive no
+#               release certificate. Reports unsigned files without blocking.
+#   required  — release gate: every path must have Status -eq Valid. Can also
+#               pin the imported thumbprint and require RFC3161 evidence.
 #
 # Usage:
 #   pwsh scripts/verify-windows-authenticode.ps1 -Path a.exe,b.exe -Mode optional
@@ -25,6 +24,18 @@ param(
     # When set (required mode), SignerCertificate.Subject must contain this.
     [string]$ExpectedSubject = "",
 
+    # When set (required mode), the signer must be the exact certificate that
+    # the release job imported, not merely any locally trusted publisher.
+    [string]$ExpectedThumbprint = "",
+
+    # Tauri is configured with tsp=true (/tr + /td SHA256). Requiring a
+    # countersigner here ensures the RFC3161 timestamp was actually embedded.
+    [switch]$RequireTimestamp,
+
+    # Required together with -RequireTimestamp. The generated Tauri config is
+    # the build-time proof that signing used RFC3161 (/tr), not legacy /t.
+    [string]$SigningConfigPath = "",
+
     [string]$Stage = "sign-verify"
 )
 
@@ -42,6 +53,24 @@ function Close-Stage {
 function Fail-Stage([string]$Message) {
     Write-Host "::error::[$Stage] $Message"
     throw "[$Stage] $Message"
+}
+
+if ($RequireTimestamp) {
+    if ([string]::IsNullOrWhiteSpace($SigningConfigPath) -or -not (Test-Path -LiteralPath $SigningConfigPath)) {
+        Fail-Stage "-RequireTimestamp also requires the generated Tauri signing config"
+    }
+    $signingConfig = Get-Content -LiteralPath $SigningConfigPath -Raw | ConvertFrom-Json
+    $windowsSigning = $signingConfig.bundle.windows
+    if ($windowsSigning.tsp -ne $true) {
+        Fail-Stage "Tauri signing config must set bundle.windows.tsp=true (RFC3161 /tr)"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$windowsSigning.timestampUrl)) {
+        Fail-Stage "Tauri signing config has no RFC3161 timestampUrl"
+    }
+    if ([string]$windowsSigning.digestAlgorithm -ne "sha256") {
+        Fail-Stage "Tauri signing config must use SHA256"
+    }
+    Write-Host "[$Stage] RFC3161 config asserted: tsp=true digest=sha256 url=$($windowsSigning.timestampUrl)"
 }
 
 Write-Stage "Authenticode verification (mode=$Mode)"
@@ -66,19 +95,21 @@ foreach ($raw in $Path) {
 
     $sig = Get-AuthenticodeSignature -LiteralPath $item.FullName
     $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" }
+    $thumbprint = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant() } else { "" }
+    $timestampSubject = if ($sig.TimeStamperCertificate) { $sig.TimeStamperCertificate.Subject } else { "" }
     $status = [string]$sig.Status
     $ok = $false
 
     switch ($Mode) {
         "optional" {
-            # NotSigned is expected until OV/EV is configured. HashMismatch /
+            # PR builds intentionally receive no release secret. HashMismatch /
             # NotTrusted / UnknownError still surface as warnings for visibility.
             if ($status -eq "Valid") {
                 $ok = $true
             }
             elseif ($status -eq "NotSigned") {
                 $ok = $true
-                Write-Host "::warning::[$Stage] unsigned (expected until Authenticode cert is configured): $($item.Name)"
+                Write-Host "::warning::[$Stage] unsigned (expected only for PR/local diagnostics): $($item.Name)"
             }
             else {
                 # Soft-fail in optional mode: report but do not block release.
@@ -95,6 +126,14 @@ foreach ($raw in $Path) {
                 $ok = $false
                 Write-Host "::error::[$Stage] $($item.Name): subject '$subject' does not contain '$ExpectedSubject'"
             }
+            elseif ($ExpectedThumbprint -and ($thumbprint -ne $ExpectedThumbprint.Replace(" ", "").ToUpperInvariant())) {
+                $ok = $false
+                Write-Host "::error::[$Stage] $($item.Name): signer thumbprint '$thumbprint' does not match the release certificate"
+            }
+            elseif ($RequireTimestamp -and -not $sig.TimeStamperCertificate) {
+                $ok = $false
+                Write-Host "::error::[$Stage] $($item.Name): no RFC3161 timestamp countersigner"
+            }
             else {
                 $ok = $true
             }
@@ -107,10 +146,12 @@ foreach ($raw in $Path) {
         Path    = $item.FullName
         Status  = $status
         Subject = $subject
+        Thumbprint = $thumbprint
+        TimestampSubject = $timestampSubject
         Ok      = $ok
     }
 
-    Write-Host ("  {0,-12} {1}  {2}" -f $status, $item.Name, $subject)
+    Write-Host ("  {0,-12} {1}  signer={2} timestamp={3}" -f $status, $item.Name, $subject, $timestampSubject)
 }
 
 $results | Format-Table -AutoSize | Out-String | Write-Host

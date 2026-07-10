@@ -47,19 +47,24 @@ Windows has no light/dark adaptive app icon (`.ico` is static) — the single
 Default icon is used. NSIS installer + updater bundle are produced by `tauri
 build`; no Apple-style finalize step.
 
-Post-build on the Windows matrix (see [`release.yml`](../.github/workflows/release.yml)):
+Windows release builds are signed inside-out (see
+[`release.yml`](../.github/workflows/release.yml)):
 
-1. **PE arch diagnostic** — `scripts/windows-pe-arch.ps1` records x64 vs ARM64
-   machine types. ARM64 is cross-built on x64 runners; this is **not** runtime
-   verification ([`docs/windows-signing.md`](./windows-signing.md)).
-2. **Optional Authenticode** — `scripts/sign-windows-authenticode.ps1` signs the
-   final `-setup.exe` when `WINDOWS_CERTIFICATE` is present; otherwise skips.
-3. **Authenticode verify** — `scripts/verify-windows-authenticode.ps1` in
-   `optional` mode by default; set `AUTHENTICODE_REQUIRED=true` to gate.
-4. **Tauri updater `.sig`** — `npx tauri signer sign` (always required for
-   Windows in-app update entries in `latest.json`).
-5. **Collect final artifacts** — space-stripped names under `dist-artifacts/`,
-   with an explicit check that both `-setup.exe` and `-setup.exe.sig` exist.
+1. **Prepare Authenticode** — import the release PFX and generate a temporary
+   Tauri config with the exact certificate thumbprint, SHA-256, and RFC3161
+   timestamping (`tsp=true`). Missing credentials hard-fail the tag build.
+2. **Build + sign all PE layers** — Tauri signs the main executable, the NSIS
+   uninstaller generated through `!uninstfinalize`, and the outer installer.
+3. **Required verification** — every layer must report
+   `Get-AuthenticodeSignature.Status == Valid`, match the imported thumbprint,
+   and include a timestamp countersigner. x64 runs the full lifecycle; ARM64 is
+   installed on the x64 host to inspect its payload but is not launched there.
+4. **Tauri updater `.sig`** — `npx tauri signer sign` authenticates the final,
+   Authenticode-signed installer bytes used by in-app updates.
+5. **Collect + verify final artifacts** — space-stripped names under
+   `dist-artifacts/`, then another required signature check on the exact setup
+   executable that will be uploaded.
+6. **Always clean up** — remove the temporary PFX directory and imported cert.
 
 PR-time x64 packaged smoke lives in
 [`win-installer-check.yml`](../.github/workflows/win-installer-check.yml)
@@ -80,14 +85,13 @@ Required CI (`ci.yml`) also runs standalone engine crate tests for
 | `AC_API_KEY_BASE64` | base64 of the `AuthKey_XXXX.p8` |
 | `TAURI_SIGNING_PRIVATE_KEY` | updater private key |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | its password (empty if none) |
+| `WINDOWS_CERTIFICATE` | base64 of the OV/EV code-signing **.pfx** (release env) |
+| `WINDOWS_CERTIFICATE_PASSWORD` | password for that .pfx; may be empty only when the PFX has no password |
 
-### Optional Windows Authenticode secrets / vars
+### Optional release variables
 
 | Name | What |
 |---|---|
-| `WINDOWS_CERTIFICATE` | base64 of OV/EV code-signing **.pfx** (release env) |
-| `WINDOWS_CERTIFICATE_PASSWORD` | password for that .pfx |
-| `AUTHENTICODE_REQUIRED` (repo **variable**) | `true` → fail release when PE is not `Valid` |
 | `WINDOWS_TIMESTAMP_URL` (repo **variable**) | optional RFC3161 timestamp URL |
 
 Export your local .p12 / .p8 / .pfx to base64 with `base64 -i file -o -`.
@@ -97,4 +101,6 @@ Export your local .p12 / .p8 / .pfx to base64 with `base64 -i file -o -`.
 > adjust them if your `productName`/bundler config changes the filenames.
 >
 > Keep **updater signature**, **Authenticode**, and **SmartScreen reputation**
-> conceptually separate — see [`docs/windows-signing.md`](./windows-signing.md).
+> conceptually separate. Authenticode is mandatory for new tag builds, but a
+> valid publisher signature does not guarantee instant SmartScreen reputation.
+> See [`docs/windows-signing.md`](./windows-signing.md).

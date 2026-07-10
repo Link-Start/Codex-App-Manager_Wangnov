@@ -137,6 +137,8 @@ pub fn classify(message: &str) -> ErrorKind {
     }
 
     if m.contains("could not resolve")
+        || m.contains("network error")
+        || m.contains("error sending request")
         || m.contains("failed to connect")
         || m.contains("connection refused")
         || m.contains("connection reset")
@@ -194,7 +196,7 @@ impl From<OperationError> for AppError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
     pub code: String,
@@ -252,6 +254,18 @@ mod tests {
         assert_eq!(classify("run Add-AppxPackage: deployment failed"), ErrorKind::Install);
         assert_eq!(classify("capability probe error: sideloading is disabled"), ErrorKind::Incompatible);
         assert_eq!(classify("download cancelled"), ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn manager_updater_transport_errors_are_network_failures() {
+        assert_eq!(
+            classify("check manager update: network error: dns lookup failed"),
+            ErrorKind::Network
+        );
+        assert_eq!(
+            classify("install manager update: error sending request for url"),
+            ErrorKind::Network
+        );
     }
 
     #[test]

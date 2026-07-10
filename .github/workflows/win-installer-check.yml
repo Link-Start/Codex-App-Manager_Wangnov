@@ -6,7 +6,7 @@ name: Windows installer check
 # install → first launch → upgrade → uninstall.
 #
 # Also probes Authenticode on the installer and installed PE files in
-# non-blocking (optional) mode until OV/EV secrets are configured.
+# non-blocking (optional) mode because pull requests never receive the PFX.
 #
 # ARM64 is NOT smoke-tested here: GitHub-hosted runners are x64, and a
 # cross-built ARM64 PE is not runtime verification. See docs/windows-signing.md.
@@ -28,6 +28,7 @@ on:
       - "package-lock.json"
       - "scripts/windows-*.ps1"
       - "scripts/sign-windows-authenticode.ps1"
+      - "scripts/prepare-windows-authenticode.ps1"
       - "scripts/verify-windows-authenticode.ps1"
       - ".github/workflows/win-installer-check.yml"
   workflow_dispatch:
@@ -65,7 +66,7 @@ jobs:
       # pull_request trigger running PR-authored code (config/template/hooks), so
       # exposing TAURI_SIGNING_PRIVATE_KEY / WINDOWS_CERTIFICATE would let a PR
       # exfiltrate keys. createUpdaterArtifacts is off; Authenticode remains a
-      # release-time concern (release.yml) with optional post-build path.
+      # release-time concern (release.yml) with mandatory inside-out signing.
       - name: Build NSIS installer
         id: build
         shell: bash
@@ -101,8 +102,8 @@ jobs:
       - name: Authenticode probe (optional / non-blocking)
         shell: pwsh
         env:
-          # Flip to "required" via repo variable once OV/EV is wired into release.
-          AUTHENTICODE_MODE: ${{ vars.AUTHENTICODE_REQUIRED == 'true' && 'required' || 'optional' }}
+          # Pull requests never receive the release PFX secret.
+          AUTHENTICODE_MODE: optional
         run: |
           & .\scripts\verify-windows-authenticode.ps1 `
             -Path "${{ steps.artifact.outputs.installer }}" `
@@ -112,7 +113,7 @@ jobs:
       - name: Packaged lifecycle smoke (install / launch / upgrade / uninstall)
         shell: pwsh
         env:
-          AUTHENTICODE_MODE: ${{ vars.AUTHENTICODE_REQUIRED == 'true' && 'required' || 'optional' }}
+          AUTHENTICODE_MODE: optional
         run: |
           & .\scripts\windows-packaged-smoke.ps1 `
             -Installer "${{ steps.artifact.outputs.installer }}" `

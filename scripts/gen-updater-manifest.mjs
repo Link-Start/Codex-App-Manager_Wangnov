@@ -17,6 +17,17 @@ if (!tag || !dir) {
 }
 const version = tag.replace(/^v/, "");
 const REPO = "Wangnov/Codex-App-Manager";
+const releaseNotesPath = join("docs", "releases", `${tag}.md`);
+const updaterNotes = (markdown) => {
+  // Release pages start with a GitHub-only banner and end with the fixed
+  // download/signature table. The in-app sheet needs the reviewed summary and
+  // user-visible changes, not raw HTML or another set of install links.
+  const withoutBanner = markdown.replace(/^\s*<p\s+align="center">[\s\S]*?<\/p>\s*/i, "");
+  return withoutBanner.split(/^##\s+📦\s+/m, 1)[0].trim();
+};
+const notes = existsSync(releaseNotesPath)
+  ? updaterNotes(readFileSync(releaseNotesPath, "utf8")) || `Codex App Manager ${tag}`
+  : `Codex App Manager ${tag}`;
 const downloadUrl = (file) =>
   `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(file)}`;
 
@@ -80,7 +91,9 @@ if (missing.length > 0) {
 
 const manifest = {
   version,
-  notes: `Codex App Manager ${tag}`,
+  // The same reviewed release note shown on GitHub powers the in-app details
+  // view. Older/fallback builds still receive a short non-empty label.
+  notes,
   pub_date: new Date().toISOString(),
   platforms,
 };
