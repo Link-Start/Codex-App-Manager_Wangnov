@@ -1,9 +1,10 @@
 import { useEffect, useId, useState } from "react";
 
-import { errorMessage, managerApi } from "../../services/managerApi";
+import { managerApi } from "../../services/managerApi";
+import { userErrorMessage } from "../errorCopy";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
-import { NavBar, Ring, Toggle } from "../components";
+import { NavBar, Ring, Toggle, StatusBanner } from "../components";
 import { codexHomeDisplay } from "../paths";
 import { currentPlatform } from "../platform";
 import { Sheet } from "../Sheet";
@@ -66,7 +67,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         setDone(r.message);
       }
     } catch (cause) {
-      setError(errorMessage(cause));
+      setError(userErrorMessage(cause, t));
     } finally {
       setBusy(false);
     }
@@ -159,18 +160,10 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
             ) : null}
 
             {managed === false ? (
-              <div className="banner info">
-                <Icon name="info" />
-                <span>{t("uninstall.needAdopt")}</span>
-              </div>
+              <StatusBanner tone="info">{t("uninstall.needAdopt")}</StatusBanner>
             ) : null}
 
-            {error ? (
-              <div className="banner err">
-                <Icon name="alert" />
-                <span>{error}</span>
-              </div>
-            ) : null}
+            {error ? <StatusBanner tone="err">{error}</StatusBanner> : null}
 
             <div className="actions">
               <button
@@ -203,7 +196,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
             ? t("uninstall.confirm1.bodyKeep", { path: codexHome })
             : t("uninstall.confirm1.bodyPurge")}
         </p>
-        <div className="row2">
+        <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={() => setConfirmStep(0)}>
             {t("uninstall.cancel")}
           </button>
@@ -223,7 +216,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         <Ring icon="alert" variant="danger" />
         <h3 id={confirm2TitleId}>{t("uninstall.confirm2.title")}</h3>
         <p id={confirm2BodyId}>{t("uninstall.confirm2.body", { path: codexHome })}</p>
-        <div className="row2">
+        <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={() => setConfirmStep(0)}>
             {t("uninstall.cancel")}
           </button>
