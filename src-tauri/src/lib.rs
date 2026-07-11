@@ -470,6 +470,7 @@ pub fn run() {
             commands::arm_destructive,
             commands::end_operation,
             commands::get_operation_snapshot,
+            commands::get_operation_completion,
             commands::confirm_quit,
             commands::win_default_install_root,
             commands::win_pick_install_dir,

@@ -16,6 +16,7 @@ import type {
   MacUpdateReport,
   OperationKind,
   OperationSnapshot,
+  OperationCompletion,
   OperationToken,
   WinInstallStatus,
   WinPerformReport,
@@ -506,6 +507,13 @@ export const managerApi = {
     }
     return invoke<OperationSnapshot | null>("get_operation_snapshot");
   },
+  /** Token-keyed terminal evidence retained after a renderer loses its invoke. */
+  getOperationCompletion(token: OperationToken): Promise<OperationCompletion | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<OperationCompletion | null>("get_operation_completion", { token });
+  },
   macPlanUpdate(simulatedBuild?: number): Promise<MacUpdateReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({ ...FALLBACK_PLAN, simulatedBuild: simulatedBuild ?? null });
@@ -880,6 +888,7 @@ export const managerApi = {
       route: string;
     },
     installRoot?: string,
+    operationToken?: OperationToken,
   ): Promise<WinPerformReport> {
     if (!hasTauriRuntime()) {
       return confirm
@@ -889,7 +898,7 @@ export const managerApi = {
     if (!confirm) {
       return Promise.reject(new Error("explicit confirmation is required"));
     }
-    const token = await managerApi.armDestructive("update");
+    const token = operationToken ?? (await managerApi.armDestructive("update"));
     return invoke<WinPerformReport>("win_perform_update", {
       confirm,
       token,

@@ -3,8 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { managerApi } from "../../services/managerApi";
-import { DEFAULT_SETTINGS, type AppSettings } from "../../shared/types";
-import { I18nProvider } from "../i18n";
+import { DEFAULT_SETTINGS, type AppSettings, type ConfigHealth } from "../../shared/types";
+import { CATALOG, I18nProvider, type Lang } from "../i18n";
 import { ThemeProvider } from "../theme";
 import { Settings } from "./Settings";
 
@@ -17,6 +17,9 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       setSettings: vi.fn(),
       getAutostart: vi.fn(),
       setAutostart: vi.fn(),
+      getConfigHealth: vi.fn(),
+      restoreConfigBackup: vi.fn(),
+      resetConfig: vi.fn(),
       winDefaultInstallRoot: vi.fn(),
       winPickInstallDir: vi.fn(),
       winSetInstallRoot: vi.fn(),
@@ -26,6 +29,26 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
 });
 
 const api = vi.mocked(managerApi);
+
+const HEALTHY_CONFIG: ConfigHealth = {
+  settingsStatus: "ok",
+  provenanceStatus: "ok",
+  unknownSource: null,
+  detail: null,
+  settingsBackupAvailable: false,
+  provenanceBackupAvailable: false,
+};
+
+const BROKEN_CONFIG: ConfigHealth = {
+  settingsStatus: "corrupt",
+  provenanceStatus: "corrupt",
+  unknownSource: null,
+  detail: "invalid JSON",
+  settingsBackupAvailable: true,
+  provenanceBackupAvailable: true,
+};
+
+const SAFETY_FLOW_LANGS = ["fr", "ar", "es", "zh-TW"] as const satisfies readonly Lang[];
 
 function settings(overrides: Partial<AppSettings> = {}): AppSettings {
   return { ...DEFAULT_SETTINGS, ...overrides };
@@ -63,8 +86,14 @@ describe("Settings runtime contract", () => {
     api.setSettings.mockReset();
     api.getAutostart.mockReset();
     api.setAutostart.mockReset();
+    api.getConfigHealth.mockReset();
+    api.restoreConfigBackup.mockReset();
+    api.resetConfig.mockReset();
     api.getAutostart.mockResolvedValue(false);
     api.setSettings.mockImplementation(async (next) => next);
+    api.getConfigHealth.mockResolvedValue(HEALTHY_CONFIG);
+    api.restoreConfigBackup.mockResolvedValue(HEALTHY_CONFIG);
+    api.resetConfig.mockResolvedValue(HEALTHY_CONFIG);
   });
 
   it("keeps the form non-editable until settings hydrate", async () => {
@@ -225,4 +254,44 @@ describe("Settings runtime contract", () => {
     );
     expect(screen.getByRole("radio", { name: /镜像/ })).toHaveAttribute("aria-checked", "true");
   });
+
+  it.each(SAFETY_FLOW_LANGS)(
+    "shows and completes the managed-record reset consequence flow in %s",
+    async (lang) => {
+      const user = userEvent.setup();
+      localStorage.setItem("cam.lang", lang);
+      api.getSettings.mockResolvedValue(settings());
+      api.getConfigHealth
+        .mockResolvedValueOnce(BROKEN_CONFIG)
+        .mockResolvedValue(HEALTHY_CONFIG);
+
+      renderSettings();
+
+      expect(await screen.findByText(CATALOG[lang]["settings.health.banner"])).toBeInTheDocument();
+      const resetLabel = CATALOG[lang]["settings.health.clearProvenance"];
+      expect(
+        screen.getByRole("button", { name: CATALOG[lang]["settings.health.reset"] }),
+      ).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: resetLabel }));
+
+      const title = CATALOG[lang]["settings.health.resetConfirm.title"].replace(
+        "{which}",
+        CATALOG[lang]["settings.health.provenance"],
+      );
+      const dialog = screen.getByRole("dialog", { name: title });
+      const provenanceBody = CATALOG[lang]["settings.health.resetConfirm.body.provenance"].replace(
+        "{action}",
+        CATALOG[lang]["home.external.cta"],
+      );
+      expect(
+        within(dialog).getByText(provenanceBody),
+      ).toBeInTheDocument();
+
+      await user.click(within(dialog).getByRole("button", { name: resetLabel }));
+
+      await waitFor(() => expect(api.resetConfig).toHaveBeenCalledWith("provenance"));
+      expect(await screen.findByText(CATALOG[lang]["settings.health.verified"])).toBeInTheDocument();
+      expect(document.documentElement.dir).toBe(lang === "ar" ? "rtl" : "ltr");
+    },
+  );
 });
