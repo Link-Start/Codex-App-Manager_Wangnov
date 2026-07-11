@@ -32,6 +32,8 @@ name: Release
 # round trips; promotion never relies on its ignored conditional headers.
 # GitHub Immutable Releases must be enabled before any release starts; the
 # workflow verifies the repository setting with IMMUTABLE_RELEASES_READ_TOKEN.
+# An active repository tag ruleset must also forbid update and deletion for
+# refs/tags/v*; the same read-only token verifies the policy and live peeled SHA.
 # Every reused asset is also pinned to the API-provided sha256 digest.
 # The old MANAGER_*_ACCESS_KEY_ID / SECRET_ACCESS_KEY names must stay deleted;
 # otherwise a historical workflow revision could still perform unconditional writes.
@@ -135,18 +137,18 @@ jobs:
       release_reusable: ${{ steps.lookup.outputs.release_reusable }}
       release_asset_digests: ${{ steps.lookup.outputs.release_asset_digests }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 20
 
       # Verify the release source rather than the workflow source. For a
       # target_tag recovery the workflow itself comes from the protected default
       # branch, while the six application version declarations come from the tag.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.RELEASE_TAG }}
           path: release-source
@@ -162,6 +164,12 @@ jobs:
             echo "::error::release tag $RELEASE_TAG moved away from triggering commit $GITHUB_SHA"
             exit 1
           fi
+          echo "RELEASE_SOURCE_SHA=$release_source_sha" >> "$GITHUB_ENV"
+
+      - name: Require protected immutable release tag
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"
 
       - name: Require GitHub Immutable Releases
         env:
@@ -213,24 +221,32 @@ jobs:
           # Intel build on GitHub's current x86_64 image — macos-13 retired
           # 2025-12; macos-15-intel is the last Intel image (until ~2027-08).
           - { platform: macos-15-intel, target: x86_64-apple-darwin, os: macos }
-          - { platform: windows-latest, target: x86_64-pc-windows-msvc, os: windows }
-          - { platform: windows-latest, target: aarch64-pc-windows-msvc, os: windows }
+          - {
+              platform: windows-latest,
+              target: x86_64-pc-windows-msvc,
+              os: windows,
+            }
+          - {
+              platform: windows-latest,
+              target: aarch64-pc-windows-msvc,
+              os: windows,
+            }
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 20
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri -> target
 
@@ -446,7 +462,7 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: bundle-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist-artifacts/*
@@ -527,7 +543,7 @@ jobs:
       attestations: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -548,14 +564,14 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 20
 
       # Re-run this gate inside every release-job attempt. GitHub's "Re-run
       # failed jobs" does not re-run prepare, and no immutable publication may
       # rely only on a previous attempt's version decision.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.RELEASE_TAG }}
           path: release-source
@@ -791,7 +807,7 @@ jobs:
       - name: Attest fresh build provenance
         id: attest_fresh
         if: ${{ steps.release_source.outputs.existing != 'true' }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
             dist/*
@@ -928,7 +944,7 @@ jobs:
           fi
           cat SHA256SUMS
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Generate SBOMs
         id: sbom
@@ -960,13 +976,22 @@ jobs:
 
           exit "$status"
 
+      # The repository-level ruleset closes the long validation-to-publication
+      # window by forbidding v* tag updates/deletions. Re-read both the policy and
+      # the peeled commit immediately before creating the canonical draft.
+      - name: Re-check protected release tag before draft upload
+        if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"
+
       # Explicit draft-first publication keeps asset upload ahead of publication
       # for both stable and prerelease tags. This is required when GitHub immutable
       # releases are enabled: a published release can no longer accept assets.
       - name: Upload GitHub Release draft
         id: upload_release_draft
         if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: true
@@ -983,12 +1008,20 @@ jobs:
             SHA256SUMS
             release-assets/*
 
+      # Upload can take long enough for a repository policy regression to matter.
+      # Fence the transition from mutable draft to immutable publication again.
+      - name: Re-check protected release tag before publication
+        if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"
+
       # Omitting `draft` tells action-gh-release v3 to publish the existing draft
       # after all uploads succeeded while retaining its stable/prerelease metadata.
       - name: Publish GitHub Release
         id: publish_release
         if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
 
@@ -1094,7 +1127,7 @@ jobs:
 
       - name: Upload release audit records
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-audit-${{ env.RELEASE_TAG }}-${{ github.run_attempt }}
           path: |
