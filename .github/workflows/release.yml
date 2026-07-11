@@ -338,6 +338,8 @@ jobs:
     steps:
       - name: Authorize credentialed job rerun actor
         shell: bash
+        # Job-level defaults point later build commands at release-source, but
+        # that checkout does not exist until the following actions run.
         working-directory: ${{ github.workspace }}
         env:
           CURRENT_TRIGGERING_ACTOR_LOGIN: ${{ github.triggering_actor }}

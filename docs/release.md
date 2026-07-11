@@ -148,8 +148,11 @@ Stable releases use a stage/verify/promote, dual-backend protocol implemented by
    mirror gate. The same verify-only phase forces separate downloads of the
    run-specific candidate and all four updater payloads through the public
    Worker's R2 and mainland-China IHEP branches. Each response must identify the
-   requested backend, catching bad routes, bucket bindings, Worker secondary
-   credentials, and presigned redirects before immutable publication.
+   requested backend. The IHEP `Location` must also be a complete SigV4 URL whose
+   origin, bucket, prefix, and exact object path match the trusted release
+   configuration; the verifier refuses any follow-on redirect. This catches bad
+   routes, bucket bindings, Worker secondary credentials, and cross-store
+   redirects before immutable publication.
 4. Publish the draft GitHub Release and require GitHub to report that it is
    immutable with canonical asset digests.
 5. Repeat the complete direct-backend and public-route readback immediately before

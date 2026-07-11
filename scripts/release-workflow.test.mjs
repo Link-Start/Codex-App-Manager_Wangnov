@@ -174,6 +174,11 @@ describe("release workflow recovery invariants", () => {
       expect(job.slice(authorization, firstAction)).toContain(
         '[[ "$CURRENT_TRIGGERING_ACTOR_LOGIN" == "$AUTHORIZED_RELEASE_ACTOR_LOGIN" ]]',
       );
+      if (job.includes("working-directory: release-source")) {
+        expect(job.slice(authorization, firstAction)).toContain(
+          "working-directory: ${{ github.workspace }}",
+        );
+      }
     }
 
     const buildAuthorization = credentialedJobs[1].indexOf(
