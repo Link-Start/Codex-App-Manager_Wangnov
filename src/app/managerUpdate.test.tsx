@@ -417,7 +417,9 @@ describe("manager self-update state machine", () => {
     );
     renderManager({ currentVersion: "1.0.0" });
 
-    expect(await screen.findByTestId("manager-status")).toHaveTextContent("installing");
+    await waitFor(() =>
+      expect(screen.getByTestId("manager-status")).toHaveTextContent("installing"),
+    );
     expect(JSON.parse(localStorage.getItem(MANAGER_UPDATE_COMPLETION_KEY) ?? "null")).toEqual(
       expect.objectContaining({ from: "1.0.0", to: "2.0.0", stage: "installing" }),
     );
