@@ -4,12 +4,14 @@
   "description": "Default permissions for the main desktop window.",
   "windows": ["main"],
   "permissions": [
-    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:webview:allow-internal-toggle-devtools",
+    "core:window:allow-internal-toggle-maximize",
     "core:window:allow-start-dragging",
     "core:window:allow-close",
     "core:window:allow-minimize",
     "dialog:allow-open",
-    "updater:default",
-    "process:default"
+    "process:allow-restart"
   ]
 }

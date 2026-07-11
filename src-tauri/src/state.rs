@@ -17,8 +17,41 @@ pub struct ManagerState {
     /// Set once the user confirms quitting (or has the guard off) so the close /
     /// exit handlers stop intercepting and let the process go.
     pub force_quit: AtomicBool,
+    /// Windows release windows stay hidden until WebView2's native browser
+    /// accelerators have been disabled. The single-instance focus path must not
+    /// bypass that startup gate.
+    #[cfg(target_os = "windows")]
+    pub webview_safe_to_show: AtomicBool,
+    /// Failure wins over readiness so startup recovery never begins after the
+    /// release WebView safety gate has failed.
+    #[cfg(target_os = "windows")]
+    pub webview_gate_failed: AtomicBool,
     pub operations: OperationManager,
     pub config_health: Mutex<ConfigHealth>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn initial_webview_safe_to_show(is_dev: bool) -> bool {
+    is_dev
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebviewStartupGate {
+    Wait,
+    Proceed,
+    Abort,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn webview_startup_gate(safe_to_show: bool, failed: bool) -> WebviewStartupGate {
+    if failed {
+        WebviewStartupGate::Abort
+    } else if safe_to_show {
+        WebviewStartupGate::Proceed
+    } else {
+        WebviewStartupGate::Wait
+    }
 }
 
 impl ManagerState {
@@ -47,14 +80,49 @@ impl ManagerState {
             settings,
             endpoints,
             force_quit: AtomicBool::new(false),
+            #[cfg(target_os = "windows")]
+            webview_safe_to_show: AtomicBool::new(initial_webview_safe_to_show(cfg!(dev))),
+            #[cfg(target_os = "windows")]
+            webview_gate_failed: AtomicBool::new(false),
             operations,
             config_health,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn webview_startup_gate(&self) -> WebviewStartupGate {
+        webview_startup_gate(
+            self.webview_safe_to_show
+                .load(std::sync::atomic::Ordering::SeqCst),
+            self.webview_gate_failed
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 }
 
 impl Default for ManagerState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        initial_webview_safe_to_show, webview_startup_gate, WebviewStartupGate,
+    };
+
+    #[test]
+    fn windows_release_starts_with_the_webview_show_gate_closed() {
+        assert!(!initial_webview_safe_to_show(false));
+        assert!(initial_webview_safe_to_show(true));
+    }
+
+    #[test]
+    fn failure_dominates_the_windows_startup_gate_state() {
+        assert_eq!(webview_startup_gate(false, false), WebviewStartupGate::Wait);
+        assert_eq!(webview_startup_gate(true, false), WebviewStartupGate::Proceed);
+        assert_eq!(webview_startup_gate(false, true), WebviewStartupGate::Abort);
+        assert_eq!(webview_startup_gate(true, true), WebviewStartupGate::Abort);
     }
 }
