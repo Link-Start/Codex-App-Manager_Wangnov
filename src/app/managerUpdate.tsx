@@ -67,6 +67,8 @@ type Completion = {
    * `installed` for backwards compatibility.
    */
   stage?: "downloading" | "installing" | "installed";
+  /** Backend-confirmed durable Windows NSIS handoff time. */
+  handoffStartedAt?: number;
 };
 
 type Snooze = {
@@ -139,10 +141,16 @@ function completionStateForVersion(currentVersion: string): {
   // Restoring this state prevents a reopened old build from installing again.
   if (completion.from === currentVersion && completion.to !== currentVersion) {
     if (completion.stage === "installing") {
-      // Do not synchronously discard this marker. A renderer reload keeps the
-      // backend command alive; runtime hydration decides whether this is an
-      // active handoff or a genuinely stale cold-start marker.
-      return { completion: null, awaitingUpdate: null, provisional: completion };
+      const handoffStartedAt = Number(completion.handoffStartedAt);
+      if (Number.isFinite(handoffStartedAt) && handoffStartedAt > 0) {
+        // Only Windows persists a backend-confirmed NSIS handoff across process
+        // exit. A renderer reload on any platform still recovers from the live
+        // runtime below, but a cold start may trust this marker only when the
+        // backend supplied durable evidence.
+        return { completion: null, awaitingUpdate: null, provisional: completion };
+      }
+      removeStored(MANAGER_UPDATE_COMPLETION_KEY);
+      return { completion: null, awaitingUpdate: null, provisional: null };
     }
     if (completion.stage === "downloading") {
       // A process can exit or crash before Update::install reaches its Windows
@@ -335,6 +343,9 @@ export function ManagerUpdateProvider({
           to: snapshot.version,
           installedAt: Date.now(),
           stage: snapshot.phase,
+          ...(snapshot.phase === "installing" && snapshot.handoffStartedAt
+            ? { handoffStartedAt: snapshot.handoffStartedAt }
+            : {}),
         } satisfies Completion);
         setFailure(null);
         setProgress({
@@ -404,7 +415,7 @@ export function ManagerUpdateProvider({
         : null;
     const hasProvisionalMarker = Boolean(provisionalMarker);
     const hydrationStartedAt = Date.now();
-    const markerInstalledAt = Number(provisionalMarker?.installedAt);
+    const markerInstalledAt = Number(provisionalMarker?.handoffStartedAt);
     const markerAgeAtHydration =
       Number.isFinite(markerInstalledAt) && markerInstalledAt > 0
         ? Math.max(0, hydrationStartedAt - markerInstalledAt)

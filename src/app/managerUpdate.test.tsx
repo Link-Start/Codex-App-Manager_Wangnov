@@ -520,6 +520,7 @@ describe("manager self-update state machine", () => {
           to: "2.0.0",
           installedAt: Date.now(),
           stage: "installing",
+          handoffStartedAt: Date.now(),
         }),
       );
       listenMock.mockRejectedValueOnce(new Error("event bus unavailable"));
@@ -586,6 +587,24 @@ describe("manager self-update state machine", () => {
     expect(JSON.parse(localStorage.getItem(MANAGER_UPDATE_COMPLETION_KEY) ?? "null")).toEqual(
       expect.objectContaining({ from: "1.0.0", to: "2.0.0", stage: "installed" }),
     );
+  });
+
+  it("does not fence a cold start for a non-durable macOS installing marker", async () => {
+    localStorage.setItem(
+      MANAGER_UPDATE_COMPLETION_KEY,
+      JSON.stringify({
+        from: "1.0.0",
+        to: "2.0.0",
+        installedAt: Date.now(),
+        stage: "installing",
+      }),
+    );
+    renderManager({ currentVersion: "1.0.0" });
+
+    expect(localStorage.getItem(MANAGER_UPDATE_COMPLETION_KEY)).toBeNull();
+    expect(screen.getByTestId("manager-status")).not.toHaveTextContent("installing");
+    await waitFor(() => expect(api.checkManagerUpdate).toHaveBeenCalledTimes(1));
+    expect(api.installManagerUpdate).not.toHaveBeenCalled();
   });
 
   it("restores a terminal update failure instead of silently starting over", async () => {
@@ -673,6 +692,7 @@ describe("manager self-update state machine", () => {
           to: "2.0.0",
           installedAt: Date.now(),
           stage: "installing",
+          handoffStartedAt: Date.now(),
         }),
       );
       renderManager({ currentVersion: "1.0.0", startupDelayMs: 1 });
