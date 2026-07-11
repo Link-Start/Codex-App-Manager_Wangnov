@@ -1362,6 +1362,84 @@ describe("monotonic mirror promotion", () => {
     expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.1.0");
   });
 
+  it("migrates a strictly older legacy baseline that predates manifest sha256", async () => {
+    const root = await tempRoot("legacy-baseline-forward-migration");
+    const legacy = manifest("1.0.0");
+    delete legacy.platforms["windows-x86_64"].sha256;
+    const candidate = manifest("1.1.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(legacy)}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "legacy-forward-migration",
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).resolves.toEqual(expect.objectContaining({ outcome: "promoted" }));
+
+    expect(JSON.parse(r2.body("latest.json"))).toEqual(candidate);
+    expect(JSON.parse(ihep.body("latest.json"))).toEqual(candidate);
+  });
+
+  it("rejects same-version reuse of a legacy baseline without sha256", async () => {
+    const root = await tempRoot("legacy-baseline-same-version");
+    const legacy = manifest("1.0.0");
+    delete legacy.platforms["windows-x86_64"].sha256;
+    const candidate = manifest("1.0.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const original = Buffer.from(`${JSON.stringify(legacy)}\n`);
+    const backends = [
+      new MemoryBackend("r2", { "latest.json": original }),
+      new MemoryBackend("ihep", { "latest.json": original }),
+    ];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toThrow("sha256 must be a lowercase SHA-256 digest");
+    expect(backends.map((backend) => backend.latestPutAttempts)).toEqual([0, 0]);
+    expect(backends.every((backend) => backend.body("latest.json").equals(original))).toBe(true);
+  });
+
+  it("rejects an invalid legacy digest even for a forward promotion", async () => {
+    const root = await tempRoot("legacy-baseline-invalid-digest");
+    const invalid = manifest("1.0.0");
+    invalid.platforms["windows-x86_64"].sha256 = "A".repeat(64);
+    const candidate = manifest("1.1.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const original = Buffer.from(`${JSON.stringify(invalid)}\n`);
+    const backends = [
+      new MemoryBackend("r2", { "latest.json": original }),
+      new MemoryBackend("ihep", { "latest.json": original }),
+    ];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toThrow("sha256 must be a lowercase SHA-256 digest");
+    expect(backends.map((backend) => backend.latestPutAttempts)).toEqual([0, 0]);
+  });
+
   it("does not let an R2 CAS loser touch condition-ignoring IHEP", async () => {
     const root = await tempRoot("r2-cas-loser");
     const candidate = manifest("1.1.0");

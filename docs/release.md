@@ -61,6 +61,9 @@ verification all fail closed when that field is missing or malformed, or when
 it differs from either the signed release identity or the local artifact bytes.
 Mirror same-version identity comparisons include this digest, so a rerun cannot
 treat a byte-different artifact claim as idempotent.
+The one compatibility exception is a strictly older mirror baseline published
+before this field existed: a fully bound newer candidate may migrate it once.
+Legacy baselines are never accepted for same-version reuse or downgrade.
 
 The client still checks the mainland-friendly mirror first. It bounded-fetches
 and verifies that source's root identity **before** reading unsigned `latest.json`,

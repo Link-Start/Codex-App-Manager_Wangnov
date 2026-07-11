@@ -354,7 +354,7 @@ function manifestReleaseIdentity(manifest) {
   return JSON.stringify({ version: manifest.version, platforms });
 }
 
-function assertManifestShape(manifest, label) {
+function assertManifestShape(manifest, label, { allowMissingSha256 = false } = {}) {
   const version = parseSemver(manifest.version).raw;
   if (!manifest.platforms || typeof manifest.platforms !== "object" || Array.isArray(manifest.platforms)) {
     throw new Error(`${label} has no platforms object`);
@@ -371,7 +371,9 @@ function assertManifestShape(manifest, label) {
     if (!entry.signature.trim()) {
       throw new Error(`${label} platform ${platform} has an empty updater signature`);
     }
-    assertSha256(entry.sha256, `${label} platform ${platform} sha256`);
+    if (!(allowMissingSha256 && entry.sha256 === undefined)) {
+      assertSha256(entry.sha256, `${label} platform ${platform} sha256`);
+    }
   }
   return version;
 }
@@ -1559,16 +1561,28 @@ async function readCurrentState(backend, workDir, candidateManifest) {
     );
   }
   const manifest = await readJson(path, `${backend.name} current latest.json`);
-  const currentVersion = assertManifestShape(manifest, `${backend.name} current latest.json`);
+  const currentLabel = `${backend.name} current latest.json`;
   const candidateVersion = assertManifestShape(candidateManifest, "candidate latest.json");
+  // Releases published before per-platform digests were introduced are valid
+  // only as a one-way migration baseline. Missing digests may be crossed by a
+  // strictly newer, fully bound candidate, but may never participate in
+  // same-version reuse or a downgrade (including an operator override).
+  const currentVersion = assertManifestShape(manifest, currentLabel, {
+    allowMissingSha256: true,
+  });
   const comparison = compareSemver(currentVersion, candidateVersion);
   let decision;
   if (comparison < 0) decision = "promote-forward";
-  else if (comparison > 0) decision = "blocked-downgrade";
-  else if (manifestReleaseIdentity(manifest) === manifestReleaseIdentity(candidateManifest)) {
-    decision = "idempotent";
-  } else {
-    decision = "blocked-same-version-mismatch";
+  else {
+    // At equal or newer versions the baseline itself is part of the claimed
+    // artifact identity, so legacy manifests must fail closed.
+    assertManifestShape(manifest, currentLabel);
+    if (comparison > 0) decision = "blocked-downgrade";
+    else if (manifestReleaseIdentity(manifest) === manifestReleaseIdentity(candidateManifest)) {
+      decision = "idempotent";
+    } else {
+      decision = "blocked-same-version-mismatch";
+    }
   }
   return {
     backend,
