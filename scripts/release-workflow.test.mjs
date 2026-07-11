@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,12 @@ import {
 } from "./check-release-tag-protection.mjs";
 import { requiredReleaseAssetNames } from "./check-release-reuse.mjs";
 import {
+  assertReleaseBindingAttestation,
+  createReleaseBinding,
+  RELEASE_BINDING_PREDICATE_TYPE,
+  verifyReleaseBinding,
+} from "./release-binding.mjs";
+import {
   assertLocalReleaseArtifactNames,
   assertReleaseSourceVersions,
 } from "./check-release-version.mjs";
@@ -24,6 +31,10 @@ import {
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = await readFile(
   join(repoRoot, ".github/workflows/release.yml"),
+  "utf8",
+);
+const signalWorkflow = await readFile(
+  join(repoRoot, ".github/workflows/release-source.yml"),
   "utf8",
 );
 const mirrorRelease = await readFile(
@@ -39,14 +50,10 @@ describe("release workflow recovery invariants", () => {
     );
   });
 
-  it("rejects every manual dispatch outside the full default-branch ref before checkout or secrets", () => {
+  it("separates the unprivileged tag signal from the default-branch credentialed workflow", () => {
     const dispatchInputs = workflow.slice(
       workflow.indexOf("  workflow_dispatch:\n"),
       workflow.indexOf("\npermissions:\n"),
-    );
-    const reject = workflow.slice(
-      workflow.indexOf("  reject_untrusted_target_dispatch:\n"),
-      workflow.indexOf("  preflight:\n"),
     );
     const preflight = workflow.slice(
       workflow.indexOf("  preflight:\n"),
@@ -56,22 +63,49 @@ describe("release workflow recovery invariants", () => {
       workflow.indexOf("  prepare:\n"),
       workflow.indexOf("  build:\n"),
     );
-
-    expect(reject).toContain("github.event_name == 'workflow_dispatch'");
-    expect(reject).toContain(
-      "github.ref != format('refs/heads/{0}', github.event.repository.default_branch)",
+    const build = workflow.slice(
+      workflow.indexOf("  build:\n"),
+      workflow.indexOf("  select_artifacts:\n"),
     );
-    expect(reject).not.toContain("inputs.target_tag != ''");
-    expect(reject).not.toContain("actions/checkout@");
-    expect(reject).not.toContain("environment:");
-    expect(reject).not.toContain("${{ secrets.");
+
+    expect(signalWorkflow).toContain("name: Release source");
+    expect(signalWorkflow).toContain('tags: ["v*"]');
+    expect(signalWorkflow.match(/permissions: \{\}/g)).toHaveLength(2);
+    expect(signalWorkflow).not.toContain("actions/checkout@");
+    expect(signalWorkflow).not.toContain("environment:");
+    expect(signalWorkflow).not.toContain("${{ secrets.");
+    expect(signalWorkflow).not.toMatch(/upload-artifact|download-artifact/);
+
+    const releaseTriggers = workflow.slice(
+      workflow.indexOf("on:\n"),
+      workflow.indexOf("\npermissions:\n"),
+    );
+    expect(releaseTriggers).toContain("workflow_run:");
+    expect(releaseTriggers).toContain('workflows: ["Release source"]');
+    expect(releaseTriggers).toContain("types: [completed]");
+    expect(releaseTriggers).not.toMatch(/\n\s+push:/);
     expect(dispatchInputs).toMatch(
       /target_tag:\n\s+description:.*\n\s+required: true/,
     );
 
     expect(preflight).toContain(
-      "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+      '[[ "$UPSTREAM_EVENT" == "push" && "$UPSTREAM_CONCLUSION" == "success" ]]',
     );
+    expect(preflight).toContain(
+      '[[ "$UPSTREAM_PATH" == ".github/workflows/release-source.yml"',
+    );
+    expect(preflight).toContain('[[ "$UPSTREAM_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]');
+    expect(preflight).toContain("UPSTREAM_ACTOR_LOGIN");
+    expect(preflight).toContain("UPSTREAM_ACTOR_ID");
+    expect(preflight).toContain("UPSTREAM_TRIGGERING_ACTOR_LOGIN");
+    expect(preflight).toContain("UPSTREAM_TRIGGERING_ACTOR_ID");
+    expect(preflight).toContain("CURRENT_TRIGGERING_ACTOR_LOGIN");
+    expect(preflight).toContain("AUTHORIZED_RELEASE_ACTOR_LOGIN");
+    expect(preflight).toContain("AUTHORIZED_RELEASE_ACTOR_ID");
+    expect(preflight).toContain(
+      '[[ "$DISPATCH_REF" == "refs/heads/$DEFAULT_BRANCH" ]]',
+    );
+    expect(preflight).toContain("DISPATCH_ACTOR_ID");
     expect(preflight).toContain(
       "workflow_dispatch requires a non-empty target_tag",
     );
@@ -80,6 +114,287 @@ describe("release workflow recovery invariants", () => {
     expect(preflight).not.toContain("${{ secrets.");
     expect(prepare).toContain("needs: preflight");
     expect(prepare).toContain("needs.preflight.result == 'success'");
+    expect(prepare).toContain(
+      "ref: ${{ steps.tag_source.outputs.release_source_sha }}",
+    );
+    expect(build).toContain(
+      "ref: ${{ needs.prepare.outputs.release_source_sha }}",
+    );
+    expect(build).toContain("path: release-source");
+    expect(build).toContain(
+      "& ..\\scripts\\assert-signpath-foundation-ready.ps1",
+    );
+    expect(
+      build.indexOf("- name: Re-check release source before build"),
+    ).toBeLessThan(
+      build.indexOf(
+        "- name: Assert SignPath Foundation readiness (fail closed)",
+      ),
+    );
+    expect(workflow).not.toContain("github.ref_type == 'tag'");
+    expect(workflow).toContain(
+      "needs.preflight.outputs.trusted_invocation == 'tag-signal'",
+    );
+  });
+
+  it("re-authorizes the current rerun actor before every credentialed job does work", () => {
+    const credentialedJobs = [
+      workflow.slice(
+        workflow.indexOf("  prepare:\n"),
+        workflow.indexOf("  build:\n"),
+      ),
+      workflow.slice(
+        workflow.indexOf("  build:\n"),
+        workflow.indexOf("  select_artifacts:\n"),
+      ),
+      releaseJob,
+    ];
+
+    for (const job of credentialedJobs) {
+      const steps = job.indexOf("    steps:\n");
+      const authorization = job.indexOf(
+        "- name: Authorize credentialed job rerun actor",
+      );
+      const firstAction = job.indexOf("- uses:");
+      const firstSecret = job.indexOf("${{ secrets.");
+      expect(steps).toBeGreaterThan(-1);
+      expect(authorization).toBeGreaterThan(steps);
+      expect(authorization).toBeLessThan(firstAction);
+      expect(authorization).toBeLessThan(firstSecret);
+      expect(job.slice(steps, authorization)).not.toMatch(
+        /\n\s+- (?:name:|uses:)/,
+      );
+      expect(job.slice(authorization, firstAction)).toContain(
+        "CURRENT_TRIGGERING_ACTOR_LOGIN: ${{ github.triggering_actor }}",
+      );
+      expect(job.slice(authorization, firstAction)).toContain(
+        '[[ "$CURRENT_TRIGGERING_ACTOR_LOGIN" == "$AUTHORIZED_RELEASE_ACTOR_LOGIN" ]]',
+      );
+    }
+
+    const buildAuthorization = credentialedJobs[1].indexOf(
+      "- name: Authorize credentialed job rerun actor",
+    );
+    const buildFirstAction = credentialedJobs[1].indexOf("- uses:");
+    expect(
+      credentialedJobs[1].slice(buildAuthorization, buildFirstAction),
+    ).toContain("working-directory: ${{ github.workspace }}");
+  });
+
+  it("requires the exact release commit to remain an ancestor of the live default branch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cam-release-ancestor-"));
+    const origin = join(root, "origin.git");
+    const source = join(root, "source");
+    const gate = join(repoRoot, "scripts/check-release-source-ancestor.sh");
+    const git = (...args) =>
+      execFileSync("git", args, { encoding: "utf8", stdio: "pipe" }).trim();
+    try {
+      await mkdir(source);
+      git("init", "--bare", "--initial-branch=main", origin);
+      git("-C", source, "init", "--initial-branch=main");
+      git("-C", source, "config", "user.name", "Release Test");
+      git("-C", source, "config", "user.email", "release-test@example.com");
+      git("-C", source, "remote", "add", "origin", origin);
+      await writeFile(join(source, "version.txt"), "base\n");
+      git("-C", source, "add", "version.txt");
+      git("-C", source, "commit", "-m", "base");
+      await writeFile(join(source, "version.txt"), "release\n");
+      git("-C", source, "commit", "-am", "release");
+      const releaseSha = git("-C", source, "rev-parse", "HEAD");
+      git("-C", source, "push", "-u", "origin", "main");
+      await writeFile(join(source, "after.txt"), "main advanced\n");
+      git("-C", source, "add", "after.txt");
+      git("-C", source, "commit", "-m", "advance main");
+      git("-C", source, "push", "origin", "main");
+
+      expect(
+        execFileSync("bash", [gate, source, releaseSha, "main"], {
+          encoding: "utf8",
+        }),
+      ).toContain("is merged into origin/main");
+
+      git("-C", source, "checkout", "-b", "unmerged", releaseSha);
+      await writeFile(join(source, "unmerged.txt"), "not reviewed\n");
+      git("-C", source, "add", "unmerged.txt");
+      git("-C", source, "commit", "-m", "unmerged release");
+      const unmergedSha = git("-C", source, "rev-parse", "HEAD");
+      expect(() =>
+        execFileSync("bash", [gate, source, unmergedSha, "main"], {
+          encoding: "utf8",
+          stdio: "pipe",
+        }),
+      ).toThrow(/not an ancestor/);
+
+      const prepare = workflow.slice(
+        workflow.indexOf("  prepare:\n"),
+        workflow.indexOf("  build:\n"),
+      );
+      const build = workflow.slice(
+        workflow.indexOf("  build:\n"),
+        workflow.indexOf("  select_artifacts:\n"),
+      );
+      expect(prepare).toContain("check-release-source-ancestor.sh");
+      expect(build).toContain("check-release-source-ancestor.sh");
+      expect(
+        releaseJob.match(/check-release-source-ancestor\.sh/g).length,
+      ).toBeGreaterThanOrEqual(4);
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it("binds target tag, peeled source, trusted signer digest, and every subject digest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cam-release-binding-"));
+    const artifact = join(root, "artifact.bin");
+    const manifest = join(root, "latest.json");
+    try {
+      await writeFile(artifact, "artifact bytes");
+      await writeFile(manifest, '{"version":"1.2.3"}\n');
+      const releaseSourceSha = "a".repeat(40);
+      const trustedWorkflowSignerSha = "b".repeat(40);
+      const trustedWorkflowSourceSha = "c".repeat(40);
+      const binding = createReleaseBinding({
+        defaultBranch: "main",
+        paths: [artifact, manifest],
+        releaseSourceSha,
+        releaseTag: "v1.2.3",
+        repository: "owner/repo",
+        trustedWorkflowSignerSha,
+        trustedWorkflowSourceSha,
+      });
+      expect(
+        verifyReleaseBinding(binding, {
+          defaultBranch: "main",
+          paths: [artifact, manifest],
+          releaseSourceSha,
+          releaseTag: "v1.2.3",
+          repository: "owner/repo",
+        }),
+      ).toMatchObject({
+        signerSha: trustedWorkflowSignerSha,
+        sourceSha: trustedWorkflowSourceSha,
+      });
+      const statementSubjects = Object.entries(binding.subjectDigests).map(
+        ([name, digest]) => ({
+          name,
+          digest: { sha256: digest.slice("sha256:".length) },
+        }),
+      );
+      expect(
+        assertReleaseBindingAttestation(
+          [
+            {
+              verificationResult: {
+                statement: {
+                  predicateType: RELEASE_BINDING_PREDICATE_TYPE,
+                  predicate: binding,
+                  subject: statementSubjects,
+                },
+              },
+            },
+          ],
+          binding,
+        ),
+      ).toEqual({ matched: true });
+      expect(() =>
+        assertReleaseBindingAttestation(
+          [
+            {
+              verificationResult: {
+                statement: {
+                  predicateType: RELEASE_BINDING_PREDICATE_TYPE,
+                  predicate: binding,
+                  subject: [...statementSubjects, statementSubjects[0]],
+                },
+              },
+            },
+          ],
+          binding,
+        ),
+      ).toThrow("exact release binding and subject set");
+      expect(() =>
+        assertReleaseBindingAttestation(
+          [
+            {
+              verificationResult: {
+                statement: {
+                  predicateType: RELEASE_BINDING_PREDICATE_TYPE,
+                  predicate: binding,
+                  subject: [
+                    ...statementSubjects,
+                    { name: "extra.bin", digest: { sha256: "d".repeat(64) } },
+                  ],
+                },
+              },
+            },
+          ],
+          binding,
+        ),
+      ).toThrow("exact release binding and subject set");
+      expect(() =>
+        assertReleaseBindingAttestation(
+          [
+            {
+              verificationResult: {
+                statement: {
+                  predicateType: RELEASE_BINDING_PREDICATE_TYPE,
+                  predicate: binding,
+                  subject: statementSubjects.map((subject, index) =>
+                    index === 0
+                      ? { ...subject, digest: { sha256: "e".repeat(64) } }
+                      : subject,
+                  ),
+                },
+              },
+            },
+          ],
+          binding,
+        ),
+      ).toThrow("exact release binding and subject set");
+      expect(() =>
+        assertReleaseBindingAttestation(
+          [
+            {
+              verificationResult: {
+                statement: {
+                  predicateType: RELEASE_BINDING_PREDICATE_TYPE,
+                  predicate: binding,
+                  subject: statementSubjects.slice(1),
+                },
+              },
+            },
+          ],
+          binding,
+        ),
+      ).toThrow("exact release binding and subject set");
+      expect(() =>
+        verifyReleaseBinding(
+          { ...binding, targetTag: "v9.9.9" },
+          {
+            defaultBranch: "main",
+            paths: [artifact, manifest],
+            releaseSourceSha,
+            releaseTag: "v1.2.3",
+            repository: "owner/repo",
+          },
+        ),
+      ).toThrow("does not match repository, tag, and source SHA");
+      await writeFile(artifact, "mutated artifact bytes");
+      expect(() =>
+        verifyReleaseBinding(binding, {
+          defaultBranch: "main",
+          paths: [artifact, manifest],
+          releaseSourceSha,
+          releaseTag: "v1.2.3",
+          repository: "owner/repo",
+        }),
+      ).toThrow("subject digests do not match");
+      expect(requiredReleaseAssetNames("v1.2.3")).toContain(
+        "release-binding.json",
+      );
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
   it("binds the release tag to all six source versions and exact local artifact names", async () => {
@@ -98,7 +413,10 @@ describe("release workflow recovery invariants", () => {
     );
     try {
       const expected = requiredReleaseAssetNames(releaseTag).filter(
-        (name) => name !== "latest.json" && !name.startsWith("release-identity.json"),
+        (name) =>
+          name !== "latest.json" &&
+          name !== "release-binding.json" &&
+          !name.startsWith("release-identity.json"),
       );
       await Promise.all(
         expected.map((name) => writeFile(join(artifactsDir, name), "x")),
@@ -122,7 +440,9 @@ describe("release workflow recovery invariants", () => {
       workflow.indexOf("  prepare:\n"),
       workflow.indexOf("  build:\n"),
     );
-    expect(prepare).toContain("ref: ${{ env.RELEASE_TAG }}");
+    expect(prepare).toContain(
+      "ref: ${{ steps.tag_source.outputs.release_source_sha }}",
+    );
     expect(prepare).toContain(
       'node scripts/check-release-version.mjs source "$RELEASE_TAG" release-source',
     );
@@ -200,7 +520,7 @@ describe("release workflow recovery invariants", () => {
     expect(download).toBeGreaterThan(resolveTrust);
     expect(trustStep).toContain("gh api --method GET");
     expect(trustStep).toContain("application/vnd.github.raw+json");
-    expect(trustStep).toContain('-f ref="$RELEASE_TAG"');
+    expect(trustStep).toContain('-f ref="$RELEASE_SOURCE_SHA"');
     expect(trustStep).toContain("RELEASE_TAURI_CONFIG=");
     expect(trustStep).toContain("MIRROR_UPDATER_PUBLIC_KEY=");
     expect(trustStep).toContain('>> "$GITHUB_ENV"');
@@ -341,6 +661,26 @@ describe("release workflow recovery invariants", () => {
       creationRuleset: { id: 2, name: "authorized release tag creation" },
       ruleset: { id: 1, name: "immutable release tags" },
     });
+    expect(
+      verifyReleaseTagProtection({
+        allowResolve: true,
+        expectedSha: "",
+        releaseTag: "v1.2.3",
+        repository: "owner/repo",
+        runner,
+        token: "read-token",
+      }).commit,
+    ).toEqual({ sha: expectedSha });
+    expect(() =>
+      verifyReleaseTagProtection({
+        allowResolve: false,
+        expectedSha: "",
+        releaseTag: "v1.2.3",
+        repository: "owner/repo",
+        runner,
+        token: "read-token",
+      }),
+    ).toThrow("expected release source SHA");
 
     const prepare = workflow.slice(
       workflow.indexOf("  prepare:\n"),
@@ -352,11 +692,11 @@ describe("release workflow recovery invariants", () => {
     const upload = releaseJob.indexOf("- name: Upload GitHub Release draft");
     const publish = releaseJob.indexOf("- name: Publish GitHub Release");
     const beforeUpload = releaseJob.lastIndexOf(
-      "- name: Re-check protected release tag before draft upload",
+      "- name: Re-check protected release source before draft upload",
       upload,
     );
     const beforePublish = releaseJob.lastIndexOf(
-      "- name: Re-check protected release tag before publication",
+      "- name: Re-check protected release source before publication",
       publish,
     );
     expect(beforeUpload).toBeGreaterThan(-1);
@@ -366,8 +706,14 @@ describe("release workflow recovery invariants", () => {
     expect(releaseJob.slice(beforeUpload, upload)).toContain(
       'node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"',
     );
+    expect(releaseJob.slice(beforeUpload, upload)).toContain(
+      "check-release-source-ancestor.sh",
+    );
     expect(releaseJob.slice(beforePublish, publish)).toContain(
       'node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"',
+    );
+    expect(releaseJob.slice(beforePublish, publish)).toContain(
+      "check-release-source-ancestor.sh",
     );
   });
 
@@ -425,6 +771,7 @@ describe("release workflow recovery invariants", () => {
       "prerelease: ${{ contains(env.RELEASE_TAG, '-') }}",
     );
     expect(uploadStep).toContain("files: |");
+    expect(uploadStep).toContain("release-binding.json");
     expect(publishStep).not.toMatch(/^\s+draft:/m);
     expect(publishStep).not.toContain("files: |");
     expect(publishStep).toContain("steps.provenance.outputs.ready == 'true'");
@@ -435,15 +782,34 @@ describe("release workflow recovery invariants", () => {
     expect(verifyStep).toContain(
       "published immutable digest does not match attested local bytes",
     );
+    expect(verifyStep).toContain('gh release verify "$RELEASE_TAG"');
+    expect(verifyStep).toContain('gh release verify-asset "$RELEASE_TAG"');
     expect(attestStep).toContain(
       "steps.release_source.outputs.existing != 'true'",
     );
     expect(attestStep).toContain("actions/attest-build-provenance@");
+    expect(attestStep).toContain("actions/attest@");
+    expect(attestStep).toContain(
+      "https://codexapp.agentsmirror.com/attestations/release-binding/v1",
+    );
+    expect(attestStep).toContain("predicate-path: release-binding.json");
     expect(attestStep).not.toContain("continue-on-error: true");
     expect(existingStep).toContain("gh attestation verify");
+    expect(existingStep).toContain('gh release verify "$RELEASE_TAG"');
+    expect(existingStep).toContain('gh release verify-asset "$RELEASE_TAG"');
     expect(existingStep).toContain('--signer-workflow "$signer_workflow"');
-    expect(existingStep).toContain('--source-ref "refs/tags/$RELEASE_TAG"');
-    expect(existingStep).toContain('--source-digest "$RELEASE_SOURCE_SHA"');
+    expect(existingStep).toContain('--signer-digest "$RELEASE_SIGNER_SHA"');
+    expect(existingStep).toContain('--source-ref "refs/heads/$DEFAULT_BRANCH"');
+    expect(existingStep).toContain(
+      '--source-digest "$RELEASE_WORKFLOW_SOURCE_SHA"',
+    );
+    expect(existingStep).toContain("release-binding.mjs attestation");
+    expect(attestStep).toContain("steps.attest_binding.outputs.bundle-path");
+    expect(attestStep).toContain('--signer-digest "$TRUSTED_WORKFLOW_SHA"');
+    expect(attestStep).toContain(
+      '--source-digest "$TRUSTED_WORKFLOW_SOURCE_SHA"',
+    );
+    expect(attestStep).toContain("release-binding.mjs attestation");
     expect(provenanceStep).toContain('echo "ready=true" >> "$GITHUB_OUTPUT"');
     expect(promoteStep).toContain("steps.provenance.outputs.ready == 'true'");
     expect(promoteStep).not.toContain("steps.attest_fresh.outcome");
@@ -473,6 +839,10 @@ describe("release workflow recovery invariants", () => {
     expect(sourceStep).toContain("gh release download");
     expect(sourceStep).toContain("--pattern 'CodexAppManager*'");
     expect(sourceStep).toContain("--pattern 'latest.json'");
+    expect(sourceStep).toMatch(
+      /--pattern 'release-identity\.json\*' \\\s+--pattern 'release-binding\.json'/,
+    );
+    expect(sourceStep).toContain("--pattern 'release-binding.json'");
     expect(sourceStep).toContain('actual_digest="sha256:$(sha256sum "$file"');
     expect(sourceStep).toContain(
       'if [[ "$actual_digest" != "$expected_digest" ]]',
@@ -488,6 +858,9 @@ describe("release workflow recovery invariants", () => {
     );
     expect(existingStep).toContain("for file in dist/* latest.json");
     expect(existingStep).toContain("gh attestation verify");
+    expect(existingStep).toContain("--signer-digest");
+    expect(existingStep).toContain("--predicate-type");
+    expect(existingStep).toContain("release-binding.mjs attestation");
     expect(existingStep).toContain("--deny-self-hosted-runners");
   });
 });

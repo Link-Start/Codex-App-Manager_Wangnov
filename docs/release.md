@@ -3,11 +3,18 @@
 ## Release notes
 
 每个版本的 release note 写在 `docs/releases/v<X.Y.Z>.md`,随版本号 bump 一起进发版 PR;
-tag 推送后 `release.yml` 按 tag 名取用该文件作为 GitHub Release 正文,并自动追加
+tag 推送后无权限的 `release-source.yml` 发出信号,默认分支的 `release.yml` 按 tag
+名取用该文件作为 GitHub Release 正文,并自动追加
 "What's Changed" 与 Full Changelog。文件缺失时回退到 `docs/releases/FALLBACK.md`
 (安装表 + 升级说明),正文永远不会为空。写法与双语风格见 `docs/releases/TEMPLATE.md`。
 
-Cross-platform release is tag-driven via [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+Cross-platform release starts with the unprivileged
+[`release-source.yml`](../.github/workflows/release-source.yml) tag signal. Its
+successful `workflow_run` invokes the current default-branch
+[`release.yml`](../.github/workflows/release.yml), which builds, signs,
+notarizes, and publishes the GitHub Release with the Tauri updater manifest.
+The signal has no checkout, secrets, environment, write permission, or artifact
+handoff; all credentialed jobs remain in the trusted default-branch workflow.
 The publish job normally consumes the full four-platform build matrix. Windows
 tag jobs currently fail closed while the SignPath Foundation application and
 trusted-build migration are pending, so a new tag cannot publish a partial or
@@ -185,8 +192,19 @@ dedicated fine-grained, read-only token. A missing token, failed query, or
 `enabled: false` response fails closed before draft upload or mirror publication.
 Two separate active tag rulesets restrict `refs/tags/v*` creation to the named
 release publisher and forbid update/deletion for everyone (including that
-publisher). The workflow re-peels the live tag during prepare, immediately
-before draft upload, and again before publication.
+publisher). The workflow also re-peels the live tag before publication. The
+peeled commit must be an ancestor of the freshly fetched live default branch;
+tagging an unmerged release-bump branch fails before build/signing and is checked
+again in each build, release-job attempt, publication boundary, and final mirror
+promotion. Every checkout after resolution uses that exact commit SHA, not the
+tag name.
+
+The `release` environment must allow the protected default branch only. Do not
+allow `v*` deployment refs and do not duplicate release credentials as repository
+or organization secrets: tag-triggered workflow definitions are read from the
+tagged commit, whereas the credentialed `workflow_run` workflow is read from the
+default branch. `release-source.yml` must stay an unprivileged signal and must
+never download or pass artifacts.
 
 Same-tag reruns reuse the artifacts, signed release identity, and `latest.json`
 attached to a complete,
@@ -204,8 +222,19 @@ stages the same signed/notarized bytes. It never creates a second byte sequence 
 an immutable version key. New releases are uploaded as drafts first and published
 only after all assets succeed, including prereleases. Immediately after publish,
 the workflow requires the Release itself to report `immutable: true` and canonical
-digests for every required asset before any mirror pointer can advance. A
-historical Actions run still executes its historical workflow revision, so the
+digests for every required asset before any mirror pointer can advance.
+Each fresh release also publishes `release-binding.json` and a custom GitHub
+attestation. `workflow_run` OIDC identifies `refs/heads/<default>` rather than the
+tag, so verification separately pins the trusted signer workflow digest and the
+default-branch source digest, then requires the signed predicate and attestation
+subject set to match the target tag, peeled source SHA, and every canonical
+subject digest exactly. Fresh bundles are self-verified before draft upload.
+Immutable reuse downloads the API-digest-pinned binding and verifies both SLSA
+provenance and this exact custom predicate. Both fresh publication and reuse also
+require `gh release verify` to accept GitHub's immutable release attestation; an
+old immutable release without the binding is deliberately not reusable.
+
+Historical Actions runs execute their historical workflow revision, so the
 release environment intentionally uses new `*_PROMOTION_*` credential names. The
 four legacy access-key secrets listed below must be deleted; the current workflow
 has a hard gate that rejects them if they are reintroduced.

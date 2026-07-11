@@ -126,6 +126,7 @@ export function verifyReleaseTagProtection({
   releaseTag = process.argv[2] || process.env.RELEASE_TAG || "",
   expectedSha = process.argv[3] || process.env.RELEASE_SOURCE_SHA || "",
   token = process.env.GH_TOKEN || "",
+  allowResolve = process.env.ALLOW_RELEASE_SHA_RESOLUTION === "1",
   runner = spawnSync,
 } = {}) {
   if (!REPOSITORY_PATTERN.test(repository)) {
@@ -134,7 +135,7 @@ export function verifyReleaseTagProtection({
   if (!RELEASE_TAG_PATTERN.test(releaseTag)) {
     throw new Error("release tag must be a semantic vX.Y.Z tag");
   }
-  if (!SHA_PATTERN.test(expectedSha)) {
+  if (!SHA_PATTERN.test(expectedSha) && !(allowResolve && expectedSha === "")) {
     throw new Error(
       "expected release source SHA must be a lowercase 40-character commit SHA",
     );
@@ -184,7 +185,14 @@ export function verifyReleaseTagProtection({
   if (object?.type !== "commit") {
     throw new Error("live release tag did not peel to a commit");
   }
-  const commit = assertReleaseTagCommit(object.sha, expectedSha);
+  const commit = expectedSha
+    ? assertReleaseTagCommit(object.sha, expectedSha)
+    : (() => {
+        if (!SHA_PATTERN.test(object.sha)) {
+          throw new Error("live release tag did not peel to a commit SHA");
+        }
+        return { sha: object.sha };
+      })();
 
   return { commit, creationRuleset, ruleset };
 }
@@ -192,6 +200,13 @@ export function verifyReleaseTagProtection({
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     const result = verifyReleaseTagProtection();
+    if (process.env.GITHUB_OUTPUT) {
+      const { appendFileSync } = await import("node:fs");
+      appendFileSync(
+        process.env.GITHUB_OUTPUT,
+        `release_source_sha=${result.commit.sha}\n`,
+      );
+    }
     console.log(
       `Release tag creation/immutability verified by ${result.creationRuleset.name || result.creationRuleset.id} and ${result.ruleset.name || result.ruleset.id}: ${result.commit.sha}`,
     );

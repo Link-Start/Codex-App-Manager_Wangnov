@@ -13,6 +13,7 @@ export function requiredReleaseAssetNames(releaseTag) {
   const version = tag.slice(1);
   return [
     "latest.json",
+    "release-binding.json",
     "release-identity.json",
     "release-identity.json.sig",
     "CodexAppManager_aarch64.dmg",
@@ -66,6 +67,7 @@ export function inspectReleaseForReuse(release, releaseTag) {
   const selectedAssets = assets.filter(
     (asset) =>
       asset?.name === "latest.json" ||
+      asset?.name === "release-binding.json" ||
       asset?.name === "release-identity.json" ||
       asset?.name === "release-identity.json.sig" ||
       asset?.name?.startsWith("CodexAppManager"),
