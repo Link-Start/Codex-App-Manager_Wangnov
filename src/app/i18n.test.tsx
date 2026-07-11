@@ -2,7 +2,17 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
-import { CATALOG, dirOf, I18nProvider, LANGS, matchTag, pickLang, useI18n } from "./i18n";
+import {
+  CATALOG,
+  dirOf,
+  I18nProvider,
+  LANGS,
+  matchTag,
+  pickLang,
+  useI18n,
+  type Lang,
+  type TKey,
+} from "./i18n";
 
 describe("matchTag", () => {
   it("maps traditional-Chinese regions and scripts to zh-TW", () => {
@@ -81,6 +91,111 @@ describe("catalog placeholders", () => {
         expect(placeholders(CATALOG[lang][key]), `${lang}:${key}`).toEqual(expected);
       }
     }
+  });
+});
+
+const SAFETY_CRITICAL_PREFIXES = [
+  "install.partial.",
+  "settings.health.",
+  "uninstall.status.",
+  "uninstall.partial.",
+] as const;
+
+const SOURCE_LANGS = ["en", "zh-CN"] as const satisfies readonly Lang[];
+const SAFETY_SOURCE_COPY_ALLOWLIST = new Map<string, string>([
+  // Map each exception to the exact source key whose normalized copy may match.
+  ["zh-TW:settings.health.ok", "zh-CN:settings.health.ok"], // 「正常」 is idiomatic in both Chinese variants.
+  ["ja:settings.health.ok", "zh-CN:settings.health.ok"], // 「正常」 is also the native Japanese status label.
+]);
+
+function normalizedCopy(value: string): string {
+  return value.normalize("NFC").replace(/\s+/g, " ").trim();
+}
+
+const safetyCriticalKeys = (Object.keys(CATALOG.en) as TKey[]).filter((key) =>
+  SAFETY_CRITICAL_PREFIXES.some((prefix) => key.startsWith(prefix)),
+);
+
+describe("safety-critical catalog copy", () => {
+  it("does not copy an English or Simplified-Chinese source paragraph into another locale", () => {
+    const translatedLangs = LANGS.map((item) => item.code).filter(
+      (lang) => !SOURCE_LANGS.includes(lang as (typeof SOURCE_LANGS)[number]),
+    );
+    const sourceOwnersByCopy = new Map<string, string[]>();
+    for (const source of SOURCE_LANGS) {
+      for (const key of safetyCriticalKeys) {
+        const copy = normalizedCopy(CATALOG[source][key]);
+        sourceOwnersByCopy.set(copy, [
+          ...(sourceOwnersByCopy.get(copy) ?? []),
+          `${source}:${key}`,
+        ]);
+      }
+    }
+
+    const unapprovedCopies: string[] = [];
+    const usedAllowlistEntries = new Set<string>();
+
+    for (const lang of translatedLangs) {
+      for (const key of safetyCriticalKeys) {
+        const candidate = normalizedCopy(CATALOG[lang][key]);
+        const copiedFrom = sourceOwnersByCopy.get(candidate);
+        const allowlistEntry = `${lang}:${key}`;
+        const approvedSourceOwner = SAFETY_SOURCE_COPY_ALLOWLIST.get(allowlistEntry);
+
+        if (copiedFrom != null) {
+          if (approvedSourceOwner && copiedFrom.includes(approvedSourceOwner)) {
+            usedAllowlistEntries.add(allowlistEntry);
+          } else {
+            unapprovedCopies.push(`${allowlistEntry} duplicates ${copiedFrom.join(", ")}`);
+          }
+        }
+      }
+    }
+
+    expect(unapprovedCopies).toEqual([]);
+    expect(
+      [...SAFETY_SOURCE_COPY_ALLOWLIST.keys()].filter(
+        (entry) => !usedAllowlistEntries.has(entry),
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps partial-uninstall recovery actions distinct in every language", () => {
+    const recoveryKeys = [
+      "uninstall.partial.retryCleanup",
+      "uninstall.partial.retryProvenance",
+      "uninstall.partial.retryPurge",
+      "uninstall.partial.retryRecord",
+    ] as const satisfies readonly TKey[];
+
+    for (const { code } of LANGS) {
+      const labels = recoveryKeys.map((key) => normalizedCopy(CATALOG[code][key]));
+      expect(new Set(labels).size, code).toBe(recoveryKeys.length);
+      expect(CATALOG[code]["settings.health.resetConfirm.body.settings"], code).not.toBe(
+        CATALOG[code]["settings.health.resetConfirm.body.provenance"],
+      );
+      expect(CATALOG[code]["settings.health.reset"], code).not.toBe(
+        CATALOG[code]["settings.health.clearProvenance"],
+      );
+    }
+  });
+
+  it("keeps recovery instructions bound to their rendered action labels", () => {
+    for (const { code } of LANGS) {
+      expect(placeholders(CATALOG[code]["install.partial.note"]), code).toContain("action");
+      expect(placeholders(CATALOG[code]["install.partial.pending"]), code).toContain("action");
+      expect(
+        placeholders(CATALOG[code]["settings.health.resetConfirm.body.provenance"]),
+        code,
+      ).toContain("action");
+    }
+  });
+
+  it("ships native safety-copy sentinels for the required flow locales", () => {
+    expect(CATALOG.fr["install.partial.note"]).toContain("enregistrement de gestion");
+    expect(CATALOG.ar["settings.health.resetConfirm.body.provenance"]).toContain("سجلات التثبيت");
+    expect(CATALOG.es["uninstall.partial.retryPurge"]).toContain("datos de usuario");
+    expect(CATALOG["zh-TW"]["settings.health.restoreConfirm.body"]).toContain("目前損毀");
   });
 });
 

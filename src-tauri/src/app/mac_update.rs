@@ -1663,6 +1663,20 @@ pub fn retry_macos_ancillary(
     path: Option<&str>,
     purge_user_data: bool,
 ) -> Result<crate::app::operation_outcome::AncillaryRetryReport, AppError> {
+    retry_macos_ancillary_with_detector(actions, path, purge_user_data, || {
+        detect_managed_installed().or_else(detect_installed)
+    })
+}
+
+fn retry_macos_ancillary_with_detector<F>(
+    actions: &[String],
+    path: Option<&str>,
+    purge_user_data: bool,
+    detect_install: F,
+) -> Result<crate::app::operation_outcome::AncillaryRetryReport, AppError>
+where
+    F: FnOnce() -> Option<InstalledCodex>,
+{
     use crate::app::operation_outcome::AncillaryRetryReport;
 
     let mut outcome = OperationOutcome {
@@ -1680,7 +1694,7 @@ pub fn retry_macos_ancillary(
     if actions.iter().any(|a| a == recovery::RECORD_PROVENANCE) {
         // Re-record currently detected install as managed — same as adopt, but
         // as an explicit recovery path for "installed, record failed".
-        match detect_managed_installed().or_else(detect_installed) {
+        match detect_install() {
             Some(installed) => {
                 let mut store = ProvenanceStore::load();
                 store.record(
@@ -1708,6 +1722,10 @@ pub fn retry_macos_ancillary(
                 messages.push("未检测到 Codex，无法写入托管记录".to_string());
             }
         }
+        // Every failed record attempt remains retryable, including the
+        // no-install-detected branch above. Keep this invariant outside the
+        // individual match arms so future failure paths cannot omit the CTA.
+        outcome.retain_failed_provenance_recovery(recovery::RECORD_PROVENANCE);
     }
 
     if actions.iter().any(|a| a == recovery::CLEAR_PROVENANCE) {
@@ -1803,6 +1821,24 @@ mod disk_preflight_tests {
 
         assert!(preflight_mac_disk_with_available(&p, |_| Ok(None)).is_ok());
         assert!(preflight_mac_disk_with_available(&p, |_| Ok(Some(mac_space_budget(&p)))).is_ok());
+    }
+
+    #[test]
+    fn retry_record_provenance_without_detected_install_keeps_retry_action() {
+        let report = retry_macos_ancillary_with_detector(
+            &[recovery::RECORD_PROVENANCE.to_string()],
+            None,
+            false,
+            || None,
+        )
+        .expect("a missing install is a retryable ancillary result");
+
+        assert!(report.outcome.provenance.is_failed());
+        assert!(report
+            .outcome
+            .recovery_actions
+            .iter()
+            .any(|action| action == recovery::RECORD_PROVENANCE));
     }
 }
 

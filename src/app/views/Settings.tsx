@@ -394,7 +394,11 @@ export function Settings({
                   >
                     {healthBusy === `reset:${row.which}`
                       ? t("settings.health.working")
-                      : t("settings.health.reset")}
+                      : t(
+                          row.which === "provenance"
+                            ? "settings.health.clearProvenance"
+                            : "settings.health.reset",
+                        )}
                   </button>
                 </div>
               </div>
@@ -921,7 +925,9 @@ export function Settings({
                 ? t("settings.health.restoreConfirm.body")
                 : healthConfirm.which === "settings"
                   ? t("settings.health.resetConfirm.body.settings")
-                  : t("settings.health.resetConfirm.body.provenance")}
+                  : t("settings.health.resetConfirm.body.provenance", {
+                      action: t("home.external.cta"),
+                    })}
             </p>
             <div className="row2">
               <button className="btn ghost" onClick={() => setHealthConfirm(null)}>
@@ -935,7 +941,11 @@ export function Settings({
               >
                 {healthConfirm.kind === "restore"
                   ? t("settings.health.restore")
-                  : t("settings.health.reset")}
+                  : t(
+                      healthConfirm.which === "provenance"
+                        ? "settings.health.clearProvenance"
+                        : "settings.health.reset",
+                    )}
               </button>
             </div>
           </>

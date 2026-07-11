@@ -12,7 +12,7 @@ import type {
   WinPerformReport,
   WinUpdateReport,
 } from "../../shared/types";
-import { DEFAULT_SETTINGS } from "../../shared/types";
+import { DEFAULT_SETTINGS, outcomeIsPartial } from "../../shared/types";
 import { resolveFailure, userErrorMessage, type FailureSurface } from "../errorCopy";
 import { Icon, CodexGlyph } from "../icons";
 import { useI18n, dirOf, type TKey } from "../i18n";
@@ -32,6 +32,40 @@ import { useFocusRecheck, installIdentity } from "./useFocusRecheck";
 import { useOperationReattach } from "./useOperationReattach";
 
 type Kind = "loading" | "error" | "none" | "idle" | "update" | "external" | "uptodate";
+type Busy = "plan" | "perform" | "adopt" | "install" | "launch" | null;
+type ProvenanceRecoveryState = "present" | "unknown";
+interface ProvenanceRecovery {
+  state: ProvenanceRecoveryState;
+  token: string | null;
+}
+
+const WIN_PROVENANCE_RECOVERY_KEY = "cam.win.provenance-recovery";
+
+function readStoredProvenanceRecovery(): ProvenanceRecovery | null {
+  try {
+    const value = window.sessionStorage.getItem(WIN_PROVENANCE_RECOVERY_KEY);
+    if (value === "present" || value === "unknown") {
+      return { state: value, token: null };
+    }
+    const parsed = value ? (JSON.parse(value) as Partial<ProvenanceRecovery>) : null;
+    return parsed &&
+      (parsed.state === "present" || parsed.state === "unknown") &&
+      (typeof parsed.token === "string" || parsed.token === null)
+      ? { state: parsed.state, token: parsed.token }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeProvenanceRecovery(value: ProvenanceRecovery | null) {
+  try {
+    if (value) window.sessionStorage.setItem(WIN_PROVENANCE_RECOVERY_KEY, JSON.stringify(value));
+    else window.sessionStorage.removeItem(WIN_PROVENANCE_RECOVERY_KEY);
+  } catch {
+    // The in-memory guard still protects this renderer when storage is unavailable.
+  }
+}
 
 // Windows counterpart of MacHome — same design system + state machine, driven by
 // the win_* backend (codex-win-engine): MSIX sideload or portable fallback.
@@ -45,12 +79,16 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [updatedVer, setUpdatedVer] = useState<{ from: string; to: string } | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [defaultInstallRoot, setDefaultInstallRoot] = useState(DEFAULT_SETTINGS.installRoot);
-  const [busy, setBusy] = useState<"plan" | "perform" | "adopt" | "install" | "launch" | null>(
-    null,
-  );
+  const [busy, setBusy] = useState<Busy>(null);
   const [checkError, setCheckError] = useState<FailureSurface | null>(null);
   const [actionError, setActionError] = useState<FailureSurface | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // A successful install whose managed record could not be written stays in a
+  // guarded recovery mode until adoption succeeds. Persist the marker for the
+  // lifetime of this app window so a renderer reload cannot expose reinstall.
+  const [provenanceRecovery, setProvenanceRecovery] =
+    useState<ProvenanceRecovery | null>(readStoredProvenanceRecovery);
+  const provenanceRecoveryPending = provenanceRecovery !== null;
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [installDirOpen, setInstallDirOpen] = useState(false);
   const [installDirBusy, setInstallDirBusy] = useState(false);
@@ -69,6 +107,39 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // Synchronous guard for launch double-clicks (state alone can miss a second
   // click before setBusy("launch") re-renders).
   const launchInFlightRef = useRef(false);
+  // A recovery token created by this renderer is reconciled by runPerform
+  // itself. Only a replacement renderer should run the mount-time recovery
+  // probe; otherwise setting the marker would immediately duplicate the
+  // command's own final status/plan probes.
+  const locallyStartedOperationRef = useRef<string | null>(null);
+  // Every async owner of the main action/progress surface gets a monotonically
+  // increasing generation. A late completion may update neither busy nor
+  // transfer state after a newer operation has taken ownership.
+  const operationGenerationRef = useRef(0);
+  const busyRef = useRef<Busy>(null);
+  const reattachGenerationRef = useRef<number | null>(null);
+  const reattachEndedAsOwnerRef = useRef(false);
+  const beginOperation = useCallback((next: Exclude<Busy, null>) => {
+    const generation = operationGenerationRef.current + 1;
+    operationGenerationRef.current = generation;
+    busyRef.current = next;
+    setBusy(next);
+    return generation;
+  }, []);
+  const ownsOperation = useCallback(
+    (generation: number) => operationGenerationRef.current === generation,
+    [],
+  );
+  const setOwnedBusy = useCallback((generation: number, next: Busy) => {
+    if (operationGenerationRef.current !== generation) return false;
+    busyRef.current = next;
+    setBusy(next);
+    return true;
+  }, []);
+  const finishOperation = useCallback(
+    (generation: number) => setOwnedBusy(generation, null),
+    [setOwnedBusy],
+  );
   const confirmTitleId = useId();
   const confirmBodyId = useId();
   const installDirTitleId = useId();
@@ -99,33 +170,121 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     onError: setActionError,
   });
 
-  const check = useCallback(async () => {
-    setBusy("plan");
+  const runCheck = useCallback(async (generation: number) => {
+    if (!ownsOperation(generation)) return false;
     setCheckError(null);
     setActionError(null);
     setNotice(null);
     try {
-      setReport(await managerApi.winPlanUpdate());
+      const next = await managerApi.winPlanUpdate();
+      if (!ownsOperation(generation)) return false;
+      setReport(next);
       return true;
     } catch (cause) {
+      if (!ownsOperation(generation)) return false;
       setReport(null);
       setCheckError(resolveFailure(cause, t));
       return false;
-    } finally {
-      setBusy(null);
     }
-  }, [t]);
+  }, [ownsOperation, t]);
 
-  const refreshStatus = useCallback(async () => {
+  const check = useCallback(async () => {
+    if (busyRef.current !== null) return false;
+    const generation = beginOperation("plan");
     try {
-      setStatus(await managerApi.winStatus());
-      setStatusFailed(false);
-    } catch {
-      setStatusFailed(true);
+      return await runCheck(generation);
     } finally {
-      setStatusLoaded(true);
+      finishOperation(generation);
     }
+  }, [beginOperation, finishOperation, runCheck]);
+
+  const refreshStatus = useCallback(async (generation?: number) => {
+    const canApply = () => generation === undefined || ownsOperation(generation);
+    try {
+      const next = await managerApi.winStatus();
+      if (canApply()) {
+        setStatus(next);
+        setStatusFailed(false);
+      }
+      return next;
+    } catch {
+      if (canApply()) setStatusFailed(true);
+      return null;
+    } finally {
+      if (canApply()) setStatusLoaded(true);
+    }
+  }, [ownsOperation]);
+
+  const clearProvenanceRecovery = useCallback((expectedToken: string | null) => {
+    // Storage is the cross-renderer authority. Re-read it at clear time so an
+    // old reconciliation can never remove a marker written by a newer run.
+    const stored = readStoredProvenanceRecovery();
+    const storedMatches = stored?.token === expectedToken;
+    if (storedMatches) storeProvenanceRecovery(null);
+    if (locallyStartedOperationRef.current === expectedToken) {
+      locallyStartedOperationRef.current = null;
+    }
+    setProvenanceRecovery((current) => {
+      if (current?.token !== expectedToken) return current;
+      // If another renderer/run replaced storage while this probe was pending,
+      // adopt that newer marker into memory instead of clearing the guard.
+      return stored && !storedMatches ? stored : null;
+    });
   }, []);
+
+  const reconcileProvenanceRecovery = useCallback(
+    async (token: string, ownerGeneration?: number) => {
+      const managesBusy = ownerGeneration === undefined;
+      const generation = ownerGeneration ?? beginOperation("plan");
+      try {
+        const returnedCompletion = await managerApi.getOperationCompletion(token).catch(() => null);
+        const completion = returnedCompletion?.id === token ? returnedCompletion : null;
+        if (!ownsOperation(generation)) return completion;
+        if (
+          completion?.state === "failed-before-commit" ||
+          completion?.state === "rolled-back"
+        ) {
+          clearProvenanceRecovery(token);
+        }
+        // A succeeded or mutation-ambiguous rejected command still needs disk truth:
+        // managed clears the guard, external offers adoption, and unknown/none
+        // stays guarded so reinstall is never inferred from an invoke failure.
+        // Neither probe owns busy independently: reconciliation keeps the same
+        // generation until BOTH have settled.
+        const [nextStatus] = await Promise.all([
+          refreshStatus(generation),
+          runCheck(generation),
+        ]);
+        if (
+          ownsOperation(generation) &&
+          nextStatus?.installed &&
+          nextStatus.status === "managed"
+        ) {
+          clearProvenanceRecovery(token);
+        }
+        return completion;
+      } finally {
+        if (managesBusy) finishOperation(generation);
+      }
+    },
+    [
+      beginOperation,
+      clearProvenanceRecovery,
+      finishOperation,
+      ownsOperation,
+      refreshStatus,
+      runCheck,
+    ],
+  );
+
+  const refreshStatusAndPlan = useCallback(async () => {
+    const generation = beginOperation("plan");
+    try {
+      return await Promise.all([refreshStatus(generation), runCheck(generation)]);
+    } finally {
+      finishOperation(generation);
+    }
+  }, [beginOperation, finishOperation, refreshStatus, runCheck]);
 
   useEffect(() => {
     void (async () => {
@@ -161,10 +320,6 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   useEffect(() => {
     reportRef.current = report;
   }, [report]);
-  const busyRef = useRef(busy);
-  useEffect(() => {
-    busyRef.current = busy;
-  }, [busy]);
   const checkRef = useRef(check);
   useEffect(() => {
     checkRef.current = check;
@@ -174,19 +329,61 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // by operation id, and poll until the backend lease ends.
   useOperationReattach({
     startDlListen,
-    applySnapshotProgress,
-    resetStop,
-    setBusy: (next) => setBusy(next),
-    setPaused,
+    applySnapshotProgress: (progress) => {
+      const generation = reattachGenerationRef.current;
+      if (generation !== null && ownsOperation(generation)) {
+        applySnapshotProgress(progress);
+      }
+    },
+    resetStop: () => {
+      const generation = reattachGenerationRef.current;
+      if (generation !== null && ownsOperation(generation)) resetStop();
+    },
+    setBusy: (next) => {
+      const generation = reattachGenerationRef.current;
+      if (next === null) {
+        reattachEndedAsOwnerRef.current =
+          generation !== null && finishOperation(generation);
+        reattachGenerationRef.current = null;
+        return;
+      }
+      if (generation === null) {
+        reattachGenerationRef.current = beginOperation(next);
+      } else {
+        setOwnedBusy(generation, next);
+      }
+    },
+    setPaused: (next) => {
+      const generation = reattachGenerationRef.current;
+      if (
+        (generation !== null && ownsOperation(generation)) ||
+        (generation === null && reattachEndedAsOwnerRef.current)
+      ) {
+        setPaused(next);
+      }
+    },
     onOperationEnded: () => {
-      void checkRef.current();
-      void refreshStatus();
+      if (!reattachEndedAsOwnerRef.current) return;
+      reattachEndedAsOwnerRef.current = false;
+      const token = readStoredProvenanceRecovery()?.token;
+      if (token) void reconcileProvenanceRecovery(token);
+      else void refreshStatusAndPlan();
     },
     isLocallyBusy: () => {
       const b = busyRef.current;
       return b === "perform" || b === "install";
     },
   });
+
+  useEffect(() => {
+    const token = provenanceRecovery?.token;
+    if (!token || locallyStartedOperationRef.current === token) return;
+    void (async () => {
+      const active = await managerApi.getOperationSnapshot().catch(() => null);
+      if (active?.id === token) return;
+      await reconcileProvenanceRecovery(token);
+    })();
+  }, [provenanceRecovery?.token, reconcileProvenanceRecovery]);
 
   // Window focus → silently re-detect the local install and re-check if the
   // install identity (version OR path) drifted out-of-band. Parity with the mac
@@ -230,18 +427,30 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   }, [settings.periodicCheck, settings.periodicCheckIntervalSeconds]);
 
   const adopt = useCallback(async () => {
-    setBusy("adopt");
+    const generation = beginOperation("adopt");
+    const recoveryToken = readStoredProvenanceRecovery()?.token ?? provenanceRecovery?.token ?? null;
     setCheckError(null);
     setActionError(null);
     setNotice(null);
     try {
-      setStatus(await managerApi.winAdopt());
+      const next = await managerApi.winAdopt();
+      if (ownsOperation(generation)) {
+        setStatus(next);
+        clearProvenanceRecovery(recoveryToken);
+      }
     } catch (cause) {
-      setActionError(resolveFailure(cause, t));
+      if (ownsOperation(generation)) setActionError(resolveFailure(cause, t));
     } finally {
-      setBusy(null);
+      finishOperation(generation);
     }
-  }, [t]);
+  }, [
+    beginOperation,
+    clearProvenanceRecovery,
+    finishOperation,
+    ownsOperation,
+    provenanceRecovery?.token,
+    t,
+  ]);
 
   // The probe recommended MSIX, but this PC looks like it's missing the Store /
   // App Installer components — the MSIX can install yet fail to launch (the very
@@ -264,7 +473,14 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // MSIX sideload or portable fallback — is decided by the backend plan).
   const runPerform = useCallback(
     async (mode: "perform" | "install", installRoot?: string) => {
-      setBusy(mode);
+      // React state may not have committed between two discrete clicks yet;
+      // the synchronous ref closes that double-start window.
+      if (busyRef.current !== null) return;
+      const generation = beginOperation(mode);
+      // The new owner starts from a clean transfer state. Any older finally is
+      // generation-guarded and therefore cannot erase progress emitted after
+      // this point.
+      resetStop();
       setActionError(null);
       setNotice(null);
       setPaused(null);
@@ -275,8 +491,15 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       const fromVersion =
         mode === "perform" ? report?.installed?.version ?? status?.installed?.version ?? "" : "";
       const toVersion = report?.plan?.latestVersion ?? "";
-      const unlisten = await startDlListen();
+      let unlisten = () => {};
+      let operationToken: string | null = null;
       try {
+        const attachedUnlisten = await startDlListen();
+        if (!ownsOperation(generation)) {
+          attachedUnlisten();
+          return;
+        }
+        unlisten = attachedUnlisten;
         const expected = report?.plan
           ? {
               currentVersion: report.plan.currentVersion,
@@ -285,26 +508,51 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               route: report.plan.route,
             }
           : undefined;
-        const result = await managerApi.winPerformUpdate(true, expected, installRoot);
-        setPerform(result);
-        setUpdatedVer(
-          mode === "perform" && fromVersion && toVersion
-            ? { from: fromVersion, to: toVersion }
-            : null,
+        operationToken = await managerApi.armDestructive("update");
+        locallyStartedOperationRef.current = operationToken;
+        const armedRecovery: ProvenanceRecovery = { state: "unknown", token: operationToken };
+        storeProvenanceRecovery(armedRecovery);
+        setProvenanceRecovery(armedRecovery);
+        const result = await managerApi.winPerformUpdate(
+          true,
+          expected,
+          installRoot,
+          operationToken,
         );
-        setConfirmOpen(false);
-        setInstallDirOpen(false);
         // Partial success (app installed, provenance failed): keep success path
         // and surface a recovery notice — never treat as hard failure.
-        if (
+        const needsProvenanceRecovery =
           result.success &&
-          result.outcome?.recoveryActions?.includes("record_provenance")
-        ) {
-          setNotice(t("install.partial.note"));
+          result.outcome?.recoveryActions?.includes("record_provenance");
+        if (ownsOperation(generation)) {
+          setPerform(result);
+          setUpdatedVer(
+            mode === "perform" && fromVersion && toVersion
+              ? { from: fromVersion, to: toVersion }
+              : null,
+          );
+          setConfirmOpen(false);
+          setInstallDirOpen(false);
         }
-        await refreshStatus();
-        await check();
+        if (needsProvenanceRecovery && ownsOperation(generation)) {
+          // Guard the action area before either probe can settle; there must be
+          // no render where a completed-but-unrecorded install offers reinstall.
+          const recoveryState: ProvenanceRecoveryState =
+            result.outcome?.appState === "present" || result.installed ? "present" : "unknown";
+          const recovery = { state: recoveryState, token: operationToken };
+          storeProvenanceRecovery(recovery);
+          setProvenanceRecovery(recovery);
+        } else if (!needsProvenanceRecovery) {
+          clearProvenanceRecovery(operationToken);
+        }
+        await refreshStatus(generation);
+        await runCheck(generation);
       } catch (cause) {
+        const code = errorCode(cause);
+        const explicitlyPreMutation = code === "stale_expectation" || isDownloadCancelled(cause);
+        if (operationToken && explicitlyPreMutation) clearProvenanceRecovery(operationToken);
+        else if (operationToken) await reconcileProvenanceRecovery(operationToken, generation);
+        if (!ownsOperation(generation)) return;
         setConfirmOpen(false);
         setInstallDirOpen(false);
         const stop = downloadStopRef.current;
@@ -314,9 +562,9 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           setPaused({ kind: mode, dl: dlRef.current, installRoot });
         } else if (stop && isDownloadCancelled(cause)) {
           setNotice(t("progress.cancelled"));
-        } else if (errorCode(cause) === "stale_expectation") {
-          await refreshStatus();
-          if (await check()) {
+        } else if (code === "stale_expectation") {
+          await refreshStatus(generation);
+          if (await runCheck(generation)) {
             setNotice(t("home.stale.rechecked"));
           }
         } else {
@@ -324,11 +572,25 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         }
       } finally {
         unlisten();
-        setBusy(null);
-        resetStop();
+        if (finishOperation(generation)) resetStop();
       }
     },
-    [status, report, refreshStatus, check, startDlListen, resetStop, dlRef, downloadStopRef, t],
+    [
+      status,
+      report,
+      refreshStatus,
+      runCheck,
+      startDlListen,
+      resetStop,
+      dlRef,
+      downloadStopRef,
+      clearProvenanceRecovery,
+      reconcileProvenanceRecovery,
+      beginOperation,
+      finishOperation,
+      ownsOperation,
+      t,
+    ],
   );
 
   // 〔继续〕from the paused state — re-run the same operation (same install
@@ -363,20 +625,28 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     if (report?.plan?.route === "msix-sideload") {
       return false;
     }
-    setBusy("plan");
+    const generation = beginOperation("plan");
     setCheckError(null);
     setActionError(null);
     try {
       const next = await managerApi.winPlanUpdate();
+      if (!ownsOperation(generation)) return null;
       setReport(next);
       return next.plan?.route === "portable-fallback";
     } catch (cause) {
-      setCheckError(resolveFailure(cause, t));
+      if (ownsOperation(generation)) setCheckError(resolveFailure(cause, t));
       return null;
     } finally {
-      setBusy(null);
+      finishOperation(generation);
     }
-  }, [report?.plan?.route, settings.windowsInstallMode, t]);
+  }, [
+    beginOperation,
+    finishOperation,
+    ownsOperation,
+    report?.plan?.route,
+    settings.windowsInstallMode,
+    t,
+  ]);
 
   const requestInstall = useCallback(async () => {
     const needsLocation = await freshInstallNeedsLocation();
@@ -389,6 +659,16 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     }
     await runPerform("install");
   }, [freshInstallNeedsLocation, runPerform]);
+
+  const recheckProvenanceRecovery = useCallback(async () => {
+    const token = provenanceRecovery?.token;
+    if (token) await reconcileProvenanceRecovery(token);
+    else await refreshStatusAndPlan();
+  }, [
+    provenanceRecovery?.token,
+    reconcileProvenanceRecovery,
+    refreshStatusAndPlan,
+  ]);
 
   const installToCurrentRoot = useCallback(async () => {
     await runPerform("install", settings.installRoot);
@@ -424,6 +704,14 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       installed.version === status.installed.version,
   );
   const isManaged = statusMatchesInstalled && status?.status === "managed";
+  useEffect(() => {
+    // Token-bearing guards are released only by reconcile's fresh backend
+    // status. The currently rendered managed snapshot may predate an in-flight
+    // update and is not authoritative for that token. This effect exists only
+    // for legacy token-less markers written by older renderers.
+    if (!provenanceRecovery || provenanceRecovery.token !== null || !isManaged) return;
+    clearProvenanceRecovery(null);
+  }, [clearProvenanceRecovery, isManaged, provenanceRecovery]);
   const skippedCandidate = useMemo(() => winSkippedUpdateCandidate(plan), [plan]);
   const updateSuppressed = skippedUpdateMatches(settings.skippedCodexUpdate, skippedCandidate);
   const updateAvailable = Boolean(plan) && !plan?.upToDate && !updateSuppressed;
@@ -467,6 +755,9 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const version = installed?.version || plan?.latestVersion || "";
   const sourceLabel = t(`source.${settings.source}` as TKey);
   const installRootIsDefault = samePath(settings.installRoot, defaultInstallRoot);
+  const provenanceRecoveryAction = t(
+    kind === "external" ? "home.external.cta" : "home.recheck",
+  );
 
   // A re-check (or the first auto-check) while an app is already known: the hero
   // morphs to the checking state so the status visibly reacts, then settles back.
@@ -514,6 +805,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   const adoptManualExisting = useCallback(async () => {
     if (!manualExistingCandidate) return;
+    const recoveryToken = readStoredProvenanceRecovery()?.token ?? provenanceRecovery?.token ?? null;
     setManualExistingBusy("adopt");
     setManualExistingError(null);
     try {
@@ -521,6 +813,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       setStatus(next);
       setStatusLoaded(true);
       setStatusFailed(false);
+      clearProvenanceRecovery(recoveryToken);
       setManualExistingOpen(false);
       setManualExistingCandidate(null);
       await check();
@@ -529,7 +822,13 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     } finally {
       setManualExistingBusy(null);
     }
-  }, [check, manualExistingCandidate, t]);
+  }, [
+    check,
+    clearProvenanceRecovery,
+    manualExistingCandidate,
+    provenanceRecovery?.token,
+    t,
+  ]);
 
   const skipCurrentUpdate = useCallback(async () => {
     if (!skippedCandidate) return;
@@ -546,18 +845,20 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     }
   }, [settings, skippedCandidate, t]);
   const onLaunch = () => {
-    if (busy !== null || launchInFlightRef.current) return;
+    if (busyRef.current !== null || launchInFlightRef.current) return;
     // Surface a failed open (PowerShell/AUMID or portable-exe error) via the
     // error banner like every other action, not an unhandled rejection.
     launchInFlightRef.current = true;
     setActionError(null);
-    setBusy("launch");
+    const generation = beginOperation("launch");
     void managerApi
       .winLaunch()
-      .catch((cause) => setActionError(resolveFailure(cause, t)))
+      .catch((cause) => {
+        if (ownsOperation(generation)) setActionError(resolveFailure(cause, t));
+      })
       .finally(() => {
         launchInFlightRef.current = false;
-        setBusy(null);
+        finishOperation(generation);
       });
   };
   const launching = busy === "launch";
@@ -589,12 +890,23 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   const success = !rechecking && kind === "uptodate";
   // A Windows install/update is "clean" only when it actually changed something
   // without a detour — not a stale-plan no-op (stage.upToDate) and not an
-  // MSIX→portable fallback. Non-clean successes keep the backend's explanation
-  // (message + notes) and stay pinned; only clean ones self-dismiss.
+  // MSIX→portable fallback. Non-clean successes stay pinned; only clean ones
+  // self-dismiss. A partial outcome's backend prose is diagnostic evidence, not
+  // localized safety guidance, so it lives behind the disclosure below.
+  const winPartial = Boolean(perform && outcomeIsPartial(perform.outcome));
   const winClean =
-    Boolean(perform?.success) && !perform?.stage?.upToDate && !perform?.fallbackAttempted;
+    Boolean(perform?.success) &&
+    !perform?.stage?.upToDate &&
+    !perform?.fallbackAttempted &&
+    !winPartial;
   const winResultDetail =
-    perform && !winClean ? perform.notes.filter(Boolean).join(" · ") || undefined : undefined;
+    perform && !winClean && !winPartial
+      ? perform.notes.filter(Boolean).join(" · ") || undefined
+      : undefined;
+  const winResultDiagnostics =
+    perform && winPartial
+      ? [perform.message, ...perform.notes].filter(Boolean).join("\n") || undefined
+      : undefined;
   // Char-split only LTR scripts — splitting cursive RTL (Arabic) breaks joining.
   const splitHeadline = !isShimmer && dirOf(lang) === "ltr";
   useHomeMotion(scopeRef, scene, { splitHeadline, success });
@@ -641,25 +953,44 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         inert={confirmOpen || installDirOpen || manualExistingOpen ? true : undefined}
       >
         {perform ? (
-          <ResultBanner
-            tone={perform.success ? "ok" : "err"}
-            // Clean success → the version bump / install line. Anything non-clean
-            // (no-op, fallback, or failure) keeps the backend's message so the
-            // reason is never lost.
-            title={
-              winClean
-                ? updatedVer
-                  ? t("success.flow", { from: updatedVer.from, to: updatedVer.to })
-                  : t("install.done.title")
-                : perform.message
-            }
-            detail={winResultDetail}
-            autoDismissMs={winClean ? 6000 : undefined}
-            onClose={() => {
-              setPerform(null);
-              setUpdatedVer(null);
-            }}
-          />
+          <>
+            <ResultBanner
+              tone={perform.success ? "ok" : "err"}
+              // Partial outcomes use localized product copy. The backend's raw
+              // message remains available only in the collapsed diagnostics.
+              title={
+                winPartial
+                  ? t("install.done.title")
+                  : winClean
+                    ? updatedVer
+                      ? t("success.flow", { from: updatedVer.from, to: updatedVer.to })
+                      : t("install.done.title")
+                    : perform.message
+              }
+              detail={winResultDetail}
+              autoDismissMs={winClean ? 6000 : undefined}
+              onClose={() => {
+                setPerform(null);
+                setUpdatedVer(null);
+              }}
+            />
+            {winResultDiagnostics ? (
+              <details className="manual-existing-meta">
+                <summary>{t("home.error.details")}</summary>
+                <pre className="errdetails">{winResultDiagnostics}</pre>
+              </details>
+            ) : null}
+          </>
+        ) : null}
+        {provenanceRecoveryPending ? (
+          <StatusBanner tone="warn">
+            {t(
+              provenanceRecovery?.state === "unknown" && kind !== "external"
+                ? "install.partial.pending"
+                : "install.partial.note",
+              { action: provenanceRecoveryAction },
+            )}
+          </StatusBanner>
         ) : null}
         {notice ? <StatusBanner tone="info">{notice}</StatusBanner> : null}
         {actionError ? <FailureBanner failure={actionError} /> : null}
@@ -789,7 +1120,13 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           </div>
         ) : null}
 
-        <div className={`actions${!rechecking && kind === "update" ? " update-actions" : ""}`}>
+        <div
+          className={`actions${
+            !rechecking && !provenanceRecoveryPending && kind === "update"
+              ? " update-actions"
+              : ""
+          }`}
+        >
           {/* While a check runs we keep a STABLE pair of buttons so nothing
               reflows under the hero. */}
           {rechecking ? (
@@ -801,7 +1138,17 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               </button>
             </>
           ) : null}
-          {!rechecking && kind === "update" ? (
+          {!rechecking && provenanceRecoveryPending && kind !== "external" ? (
+            <button
+              className="btn primary big"
+              onClick={() => void recheckProvenanceRecovery()}
+              disabled={busy !== null}
+            >
+              <Icon name="refresh" />
+              {t("home.recheck")}
+            </button>
+          ) : null}
+          {!rechecking && !provenanceRecoveryPending && kind === "update" ? (
             <>
               <button className="btn ghost big" onClick={check} disabled={busy !== null}>
                 <Icon name="refresh" />
@@ -817,7 +1164,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               </button>
             </>
           ) : null}
-          {!rechecking && kind === "idle" ? (
+          {!rechecking && !provenanceRecoveryPending && kind === "idle" ? (
             <>
               {launchButton("primary")}
               <button className="btn ghost" onClick={check} disabled={busy !== null}>
@@ -835,13 +1182,13 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
               {launchButton("ghost")}
             </>
           ) : null}
-          {!rechecking && kind === "none" ? (
+          {!rechecking && !provenanceRecoveryPending && kind === "none" ? (
             <button className="btn primary big" onClick={requestInstall} disabled={busy !== null}>
               <Icon name="download" />
               {t("home.none.cta")}
             </button>
           ) : null}
-          {!rechecking && kind === "uptodate" ? (
+          {!rechecking && !provenanceRecoveryPending && kind === "uptodate" ? (
             <>
               {launchButton("primary")}
               <button className="btn ghost" onClick={check} disabled={busy !== null}>
@@ -852,7 +1199,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           ) : null}
           {/* "请稍后重试" must come with a way to retry. When Codex is installed
               the user can still launch it despite the failed check. */}
-          {!rechecking && kind === "error" ? (
+          {!rechecking && !provenanceRecoveryPending && kind === "error" ? (
             installed ? (
               <>
                 {launchButton("primary")}
