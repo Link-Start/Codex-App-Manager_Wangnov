@@ -27,10 +27,34 @@ fn confirm_close_enabled() -> bool {
 }
 
 /// Unified quit/close policy: phase-aware + confirm_close setting.
-fn quit_policy_for(app: &tauri::AppHandle) -> QuitPolicy {
+///
+/// When `confirmed` is true, the operation manager linearizes cancellation and
+/// force-exit preparation with the active phase before allowing the process to
+/// terminate. This is shared by the renderer and native-fallback confirmation
+/// paths so neither can race a worker entering `Committing`.
+fn prepare_quit_policy_for(app: &tauri::AppHandle, confirmed: bool) -> QuitPolicy {
     let state = app.state::<state::ManagerState>();
     let force = state.force_quit.load(Ordering::SeqCst);
-    state.operations.quit_policy(force, confirm_close_enabled())
+    if force {
+        return QuitPolicy::Allow;
+    }
+    state
+        .operations
+        .prepare_quit(confirm_close_enabled(), confirmed, || {
+            // Arm both platform latches while the operation phase mutex is still
+            // held. Only the active platform has work; the other store is harmless.
+            let _ = crate::app::mac_update::cancel_macos_download();
+            let _ = crate::app::win_update::cancel_windows_download();
+            state.force_quit.store(true, Ordering::SeqCst);
+        })
+}
+
+fn quit_policy_for(app: &tauri::AppHandle) -> QuitPolicy {
+    prepare_quit_policy_for(app, false)
+}
+
+fn confirmed_quit_policy_for(app: &tauri::AppHandle) -> QuitPolicy {
+    prepare_quit_policy_for(app, true)
 }
 
 /// Apply a quit policy decision for window/menu/exit paths.
@@ -169,7 +193,7 @@ fn show_native_shell_event(app: tauri::AppHandle, event: ShellEvent) {
             }
             dialog.show(move |confirmed| {
                 if confirmed {
-                    let policy = quit_policy_for(&app);
+                    let policy = confirmed_quit_policy_for(&app);
                     if !native_confirm_allows_exit(&policy) {
                         log::warn!("native quit confirmation recheck blocked policy={policy:?}");
                         dispatch_shell_event(&app, ShellEvent::QuitBlocked(policy));

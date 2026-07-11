@@ -84,6 +84,22 @@ export function messageFailure(
   return { code, message, detail: null, recoverable };
 }
 
+/**
+ * Add action-specific recovery copy without throwing away the backend / bridge
+ * diagnostic. The contextual code is intentionally stable so callers can
+ * alter controls for a known state without parsing localized prose.
+ */
+export function contextualFailure(
+  cause: unknown,
+  t: TFn,
+  message: string,
+  code: string,
+  recoverable = true,
+): FailureSurface {
+  const failure = resolveFailure(cause, t);
+  return { ...failure, code, message, recoverable };
+}
+
 /** True when the failure is a connectivity class (DNS / TLS / timeout). */
 export function isConnectivityFailure(cause: unknown): boolean {
   const code = errorCode(cause);

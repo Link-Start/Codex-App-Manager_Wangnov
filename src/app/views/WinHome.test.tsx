@@ -8,7 +8,9 @@ import { managerApi } from "../../services/managerApi";
 import type {
   AppSettings,
   CapabilityCheck,
+  DownloadProgress,
   InstalledWindowsCodex,
+  OperationSnapshot,
   OperationCompletion,
   WinCapabilityReport,
   WindowsUpdatePlan,
@@ -50,6 +52,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
 });
 
 const api = vi.mocked(managerApi);
+const listenMock = vi.mocked(listen);
 
 const ok: CapabilityCheck = { state: "available", detail: "" };
 const unknown: CapabilityCheck = { state: "unknown", detail: "" };
@@ -109,6 +112,15 @@ function report(overrides: Partial<WinUpdateReport> = {}): WinUpdateReport {
 }
 
 const STATUS_MANAGED: WinInstallStatus = { installed: INSTALLED, status: "managed" };
+const ACTIVE_OPERATION: OperationSnapshot = {
+  id: "op-active",
+  kind: "update",
+  phase: "downloading",
+  progress: { downloaded: 10, total: 100, source: "mirror.example" },
+  paused: false,
+  cancellable: true,
+  interruptible: true,
+};
 
 const PERFORM_OK: WinPerformReport = {
   success: true,
@@ -179,6 +191,10 @@ describe("WinHome state machine", () => {
     api.winStatus.mockResolvedValue(STATUS_MANAGED);
     api.winPlanUpdate.mockResolvedValue(report());
     api.winPerformUpdate.mockResolvedValue(PERFORM_OK);
+    api.winPauseDownload.mockResolvedValue(true);
+    api.winCancelDownload.mockResolvedValue(true);
+    api.winDiscardDownload.mockResolvedValue(undefined);
+    api.getOperationSnapshot.mockResolvedValue(null);
   });
 
   it("offers install when nothing is detected", async () => {
@@ -710,5 +726,100 @@ describe("WinHome state machine", () => {
     // 浏览 buttons could still run install against the vanished snapshot,
     // bypassing the external→adopt boundary.
     await waitFor(() => expect(screen.queryByText("选择安装位置")).not.toBeInTheDocument());
+  });
+
+  it.each([
+    { intent: "pause" as const, outcome: "false" as const },
+    { intent: "pause" as const, outcome: "reject" as const },
+    { intent: "cancel" as const, outcome: "false" as const },
+    { intent: "cancel" as const, outcome: "reject" as const },
+  ])(
+    "keeps the Windows progress flow recoverable when $intent returns $outcome",
+    async ({ intent, outcome }) => {
+      const user = userEvent.setup();
+      api.getSettings.mockResolvedValue(settings({ askBefore: false }));
+      api.winPerformUpdate.mockImplementationOnce(() => new Promise<WinPerformReport>(() => {}));
+
+      let onProgress: ((event: { payload: DownloadProgress }) => void) | undefined;
+      listenMock.mockImplementation((event: string, cb: unknown) => {
+        if (event === "win://download-progress") onProgress = cb as typeof onProgress;
+        return Promise.resolve(() => {});
+      });
+
+      const stop = intent === "pause" ? api.winPauseDownload : api.winCancelDownload;
+      if (outcome === "false") {
+        stop.mockResolvedValue(false);
+      } else {
+        stop.mockRejectedValue(new Error("invoke bridge unavailable"));
+      }
+
+      renderWinHome();
+      await user.click(await screen.findByRole("button", { name: /立即更新/ }));
+      if (intent === "pause") {
+        await waitFor(() => expect(onProgress).toBeDefined());
+        act(() =>
+          onProgress?.({
+            payload: { downloaded: 10, total: 100, source: "mirror.example" },
+          }),
+        );
+      }
+
+      const action = intent === "pause" ? "暂停" : "取消";
+      const button = await screen.findByRole("button", { name: action });
+      await waitFor(() => expect(button).toBeEnabled());
+      api.getOperationSnapshot.mockResolvedValue(ACTIVE_OPERATION);
+      await user.click(button);
+
+      const expected =
+        outcome === "false"
+          ? `${action}请求被后端拒绝。任务仍在继续，可重试。`
+          : `${action}请求未送达。任务仍在继续，可重试。`;
+      expect(await screen.findByRole("alert")).toHaveTextContent(expected);
+      expect(screen.getByText("正在更新…")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: action })).toBeEnabled();
+
+      await user.click(screen.getByRole("button", { name: action }));
+      await waitFor(() => expect(stop).toHaveBeenCalledTimes(2));
+    },
+  );
+
+  it("keeps the Windows paused screen and both recovery actions when discard rejects", async () => {
+    const user = userEvent.setup();
+    api.getSettings.mockResolvedValue(settings({ askBefore: false }));
+    api.winDiscardDownload.mockRejectedValueOnce(new Error("cache locked"));
+
+    let rejectPerform: ((cause: unknown) => void) | undefined;
+    let onProgress: ((event: { payload: DownloadProgress }) => void) | undefined;
+    listenMock.mockImplementation((event: string, cb: unknown) => {
+      if (event === "win://download-progress") onProgress = cb as typeof onProgress;
+      return Promise.resolve(() => {});
+    });
+    api.winPerformUpdate.mockImplementationOnce(
+      () => new Promise<WinPerformReport>((_resolve, reject) => (rejectPerform = reject)),
+    );
+
+    renderWinHome();
+    await user.click(await screen.findByRole("button", { name: /立即更新/ }));
+    await waitFor(() => expect(onProgress).toBeDefined());
+    act(() =>
+      onProgress?.({
+        payload: { downloaded: 10, total: 100, source: "s", operationId: "op-active" },
+      }),
+    );
+    await user.click(await screen.findByRole("button", { name: /^暂停$/ }));
+    act(() => rejectPerform?.(new Error("download cancelled")));
+    await screen.findByText("下载已暂停");
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "取消未完成。下载仍处于暂停状态；你可以继续下载或重试取消。",
+    );
+    expect(screen.getByText("下载已暂停")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "取消" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(api.winDiscardDownload).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("下载已取消。")).toBeInTheDocument();
   });
 });
