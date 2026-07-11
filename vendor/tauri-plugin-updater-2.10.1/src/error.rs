@@ -24,6 +24,9 @@ pub enum Error {
     /// Could not fetch a valid response from the server.
     #[error("Could not fetch a valid release JSON from the remote")]
     ReleaseNotFound,
+    /// The updater JSON parsed, but its schema was not a valid release.
+    #[error("invalid updater manifest schema")]
+    InvalidManifestSchema,
     /// Unsupported app architecture.
     #[error("Unsupported application architecture, expected one of `x86`, `x86_64`, `arm` or `aarch64`.")]
     UnsupportedArch,

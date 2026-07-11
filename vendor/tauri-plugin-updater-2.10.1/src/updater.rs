@@ -272,6 +272,59 @@ mod response_limit_tests {
     }
 
     #[test]
+    fn malformed_manifest_schema_does_not_echo_secret_string_values() {
+        install_test_crypto_provider();
+        let secret_url = "https://secret-host.example/private/latest.json?X-Amz-Credential=private-credential&X-Amz-Signature=private-signature";
+        let manifest = serde_json::json!({
+            "version": "999.0.0",
+            "platforms": secret_url,
+        })
+        .to_string();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            manifest.len()
+        );
+        let (manifest_url, server) = serve_once_at(
+            "/latest.json",
+            vec![headers.into_bytes(), manifest.into_bytes()],
+        );
+        let app = tauri::test::mock_app();
+        let updater = UpdaterBuilder::new(
+            app.handle(),
+            Config {
+                dangerous_insecure_transport_protocol: true,
+                endpoints: vec![url::Url::parse(&manifest_url).unwrap()],
+                ..Default::default()
+            },
+        )
+        .target("test-target")
+        .no_proxy()
+        .build()
+        .unwrap();
+
+        let error = match tauri::async_runtime::block_on(updater.check()) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed manifest schema unexpectedly succeeded"),
+        };
+        server.join().unwrap();
+        let message = error.to_string();
+
+        assert_eq!(message, "invalid updater manifest schema");
+        assert_no_sensitive_url(
+            &message,
+            &[
+                "https://",
+                "secret-host.example",
+                "/private/latest.json",
+                "X-Amz-Credential",
+                "private-credential",
+                "X-Amz-Signature",
+                "private-signature",
+            ],
+        );
+    }
+
+    #[test]
     fn artifact_send_error_does_not_expose_download_url() {
         install_test_crypto_provider();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -887,9 +940,7 @@ impl Updater {
                         let update_response: serde_json::Value = serde_json::from_slice(&manifest)?;
                         log::debug!("received updater response");
                         raw_json = Some(update_response.clone());
-                        match serde_json::from_value::<RemoteRelease>(update_response)
-                            .map_err(Into::into)
-                        {
+                        match serde_json::from_value::<RemoteRelease>(update_response) {
                             Ok(release) => {
                                 log::debug!(
                                     "parsed updater release response version={}",
@@ -900,9 +951,12 @@ impl Updater {
                                 // we found a release, break the loop
                                 break;
                             }
-                            Err(err) => {
-                                log::error!("failed to deserialize update response: {err}");
-                                last_error = Some(err)
+                            Err(_) => {
+                                // Serde type errors can quote the complete offending
+                                // string. An untrusted manifest could place a presigned
+                                // URL there, so expose only a fixed schema category.
+                                log::error!("failed to deserialize update response: invalid updater manifest schema");
+                                last_error = Some(Error::InvalidManifestSchema)
                             }
                         }
                     } else {
