@@ -6,6 +6,7 @@ use crate::app::config_health::ConfigHealth;
 use crate::app::oplock::OperationManager;
 use crate::app::provenance::ProvenanceStore;
 use crate::app::settings_store::AppSettings as PersistedAppSettings;
+use crate::app::shell::FrontendGate;
 use crate::domain::manifest::MirrorEndpoints;
 use crate::domain::settings::AppSettings;
 use crate::domain::target::Target;
@@ -28,6 +29,7 @@ pub struct ManagerState {
     pub webview_gate_failed: AtomicBool,
     pub operations: OperationManager,
     pub config_health: Mutex<ConfigHealth>,
+    pub frontend: FrontendGate,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -86,6 +88,7 @@ impl ManagerState {
             webview_gate_failed: AtomicBool::new(false),
             operations,
             config_health,
+            frontend: FrontendGate::default(),
         }
     }
 
@@ -108,9 +111,7 @@ impl Default for ManagerState {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        initial_webview_safe_to_show, webview_startup_gate, WebviewStartupGate,
-    };
+    use super::{initial_webview_safe_to_show, webview_startup_gate, WebviewStartupGate};
 
     #[test]
     fn windows_release_starts_with_the_webview_show_gate_closed() {
@@ -121,7 +122,10 @@ mod tests {
     #[test]
     fn failure_dominates_the_windows_startup_gate_state() {
         assert_eq!(webview_startup_gate(false, false), WebviewStartupGate::Wait);
-        assert_eq!(webview_startup_gate(true, false), WebviewStartupGate::Proceed);
+        assert_eq!(
+            webview_startup_gate(true, false),
+            WebviewStartupGate::Proceed
+        );
         assert_eq!(webview_startup_gate(false, true), WebviewStartupGate::Abort);
         assert_eq!(webview_startup_gate(true, true), WebviewStartupGate::Abort);
     }

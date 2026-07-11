@@ -694,6 +694,12 @@ export const managerApi = {
       console.error("[frontend]", payload, cause);
     });
   },
+  frontendReady(lang: string, generation: number, token: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("frontend_ready", { lang, generation, token });
+  },
 
   // Settings (update source + general). The backend persists them so the source
   // choice actually drives which appcast the update flow reads.

@@ -20,6 +20,28 @@ type RootTauriInternals = {
   invoke?: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 };
 
+type RootFrontendReadiness = { generation: number; token: string };
+
+const FRONTEND_READY_EVENT = "cam:frontend-readiness";
+
+function hasRootBackend(): boolean {
+  const internals = (
+    window as typeof window & { __TAURI_INTERNALS__?: RootTauriInternals }
+  ).__TAURI_INTERNALS__;
+  return typeof internals?.invoke === "function";
+}
+
+function rootFrontendReadiness(): RootFrontendReadiness | null {
+  const readiness = (
+    window as typeof window & { __CAM_FRONTEND_READY__?: unknown }
+  ).__CAM_FRONTEND_READY__;
+  if (!readiness || typeof readiness !== "object") return null;
+  const { generation, token } = readiness as Partial<RootFrontendReadiness>;
+  if (!Number.isSafeInteger(generation) || (generation ?? 0) <= 0) return null;
+  if (typeof token !== "string" || !token.trim()) return null;
+  return { generation: generation as number, token };
+}
+
 function rootErrorMessage(value: unknown): string {
   if (value instanceof Error) return value.message;
   if (value && typeof value === "object" && "message" in value) {
@@ -44,7 +66,32 @@ export function invokeRootBackend<T>(
   if (typeof internals?.invoke !== "function") {
     return Promise.reject(new Error("Desktop backend unavailable."));
   }
-  return internals.invoke<T>(command, args);
+  try {
+    return Promise.resolve(internals.invoke<T>(command, args));
+  } catch (cause) {
+    return Promise.reject(cause);
+  }
+}
+
+/**
+ * Tell the backend that the current renderer no longer owns native quit-event
+ * delivery. If Tauri injects the per-document token after React fails, wait for
+ * that event instead of sending an unauthenticated or stale state transition.
+ */
+export function notifyRootFrontendFailure(): void {
+  if (!hasRootBackend()) return;
+  const notify = () => {
+    const readiness = rootFrontendReadiness();
+    if (!readiness) return false;
+    void invokeRootBackend<void>("frontend_failed", readiness).catch(() => undefined);
+    return true;
+  };
+  if (notify()) return;
+  const onReadiness = () => {
+    if (!notify()) return;
+    window.removeEventListener(FRONTEND_READY_EVENT, onReadiness);
+  };
+  window.addEventListener(FRONTEND_READY_EVENT, onReadiness);
 }
 
 const COPY = {
@@ -146,6 +193,7 @@ export class RootCrashBoundary extends Component<{ children: ReactNode }, State>
       stack: normalized.stack ?? null,
       componentStack: info.componentStack ?? null,
     };
+    notifyRootFrontendFailure();
     void import("../services/managerApi")
       .then(async ({ managerApi }) => {
         await managerApi

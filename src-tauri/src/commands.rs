@@ -1263,10 +1263,13 @@ pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Re
             phase.as_str(),
             kind
         );
-        let _ = app.emit("app://quit-blocked", &policy);
+        crate::dispatch_shell_event(
+            &app,
+            crate::app::shell::ShellEvent::QuitBlocked(policy.clone()),
+        );
         return Err(AppError::Busy(reason.clone()).into());
     }
-    app.exit(0);
+    crate::exit_after_confirm(&app);
     Ok(())
 }
 

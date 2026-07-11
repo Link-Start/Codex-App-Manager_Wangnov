@@ -39,9 +39,7 @@ pub struct CleanupSummary {
 }
 
 pub fn staging_root() -> PathBuf {
-    std::env::temp_dir()
-        .join("codex-app-manager")
-        .join("staging")
+    crate::app::paths::staging_root()
 }
 
 pub fn create_unique_staging(prefix: &str) -> Result<StagingDir, AppError> {
