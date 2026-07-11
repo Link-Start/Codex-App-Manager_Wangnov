@@ -70,6 +70,8 @@ signature, and 64 MiB for updater artifacts. For comparison, v0.3.1's largest
 updater artifact is about 10.9 MiB. The exact vendored
 `tauri-plugin-updater` 2.10.1 patch and its upgrade checklist live in
 [`vendor/tauri-plugin-updater-2.10.1/VENDORED.md`](../vendor/tauri-plugin-updater-2.10.1/VENDORED.md).
+Manifest/identity checks have a 30-second request deadline; artifact downloads
+also have 15-second connect, 30-second read-stall, and 15-minute total bounds.
 
 Because Tauri's minisign trusted comment contains a timestamp, a rerun would
 normally create a byte-different identity `.sig`. The workflow first reuses and

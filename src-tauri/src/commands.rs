@@ -179,6 +179,7 @@ const MANAGER_UPDATE_STATE_EVENT: &str = "manager://update-state";
 const MANAGER_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGER_UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGER_UPDATE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MANAGER_UPDATE_ARTIFACT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MANAGER_UPDATE_MANIFEST_MAX_BYTES: u64 = 256 * 1024;
 const MANAGER_UPDATE_IDENTITY_MAX_BYTES: u64 = 256 * 1024;
 const MANAGER_UPDATE_IDENTITY_SIGNATURE_MAX_BYTES: u64 = 16 * 1024;
@@ -285,6 +286,9 @@ fn manager_updater_builder_for_endpoints(
             client
                 .connect_timeout(MANAGER_UPDATE_CONNECT_TIMEOUT)
                 .read_timeout(MANAGER_UPDATE_READ_TIMEOUT)
+                // The plugin's per-check timeout does not cover artifact
+                // downloads. Bound slow-drip responses as well as byte size.
+                .timeout(MANAGER_UPDATE_ARTIFACT_TIMEOUT)
         }))
 }
 
