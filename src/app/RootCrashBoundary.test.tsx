@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { managerApi } from "../services/managerApi";
 import {
   invokeRootBackend,
+  notifyRootFrontendFailure,
   operationRiskForSnapshot,
   RootCrashBoundary,
 } from "./RootCrashBoundary";
@@ -33,6 +34,13 @@ function StringBoom(): never {
 }
 
 beforeEach(() => {
+  delete (
+    window as typeof window & {
+      __CAM_FRONTEND_READY__?: unknown;
+      __TAURI_INTERNALS__?: unknown;
+    }
+  ).__CAM_FRONTEND_READY__;
+  delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   localStorage.setItem("cam.lang", "en");
   vi.mocked(managerApi.reportFrontendError).mockResolvedValue(undefined);
   vi.mocked(managerApi.getOperationSnapshot).mockResolvedValue(null);
@@ -94,6 +102,31 @@ describe("RootCrashBoundary", () => {
     consoleError.mockRestore();
   });
 
+  it("authenticates the crashed document before switching native quit delivery", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const host = window as typeof window & {
+      __CAM_FRONTEND_READY__?: { generation: number; token: string };
+      __TAURI_INTERNALS__?: { invoke: typeof invoke };
+    };
+    host.__CAM_FRONTEND_READY__ = { generation: 7, token: "document-token" };
+    host.__TAURI_INTERNALS__ = { invoke };
+
+    render(
+      <RootCrashBoundary>
+        <Boom />
+      </RootCrashBoundary>,
+    );
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("frontend_failed", {
+        generation: 7,
+        token: "document-token",
+      }),
+    );
+    consoleError.mockRestore();
+  });
+
   it("still renders recovery controls when local storage is unavailable", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const getItem = vi.spyOn(localStorage, "getItem").mockImplementation(() => {
@@ -146,5 +179,30 @@ describe("invokeRootBackend", () => {
       if (previous === undefined) delete host.__TAURI_INTERNALS__;
       else host.__TAURI_INTERNALS__ = previous;
     }
+  });
+
+  it("waits for a late document token and normalizes synchronous bridge errors", async () => {
+    const host = window as typeof window & {
+      __CAM_FRONTEND_READY__?: { generation: number; token: string };
+      __TAURI_INTERNALS__?: { invoke: ReturnType<typeof vi.fn> };
+    };
+    const invoke = vi.fn((_command: string, _args?: Record<string, unknown>): Promise<unknown> => {
+      throw new Error("bridge threw");
+    });
+    host.__TAURI_INTERNALS__ = { invoke };
+
+    await expect(invokeRootBackend("frontend_failed", {})).rejects.toThrow("bridge threw");
+    invoke.mockResolvedValue(undefined);
+    notifyRootFrontendFailure();
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    host.__CAM_FRONTEND_READY__ = { generation: 9, token: "late-token" };
+    window.dispatchEvent(new Event("cam:frontend-readiness"));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenLastCalledWith("frontend_failed", {
+        generation: 9,
+        token: "late-token",
+      }),
+    );
   });
 });

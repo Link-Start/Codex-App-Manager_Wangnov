@@ -14,7 +14,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 use crate::app::op_phase::QuitPolicy;
 use crate::app::shell::{
-    FrontendReadyResult, FrontendToken, NativeLocale, ShellDispatch, ShellEvent, PRODUCT_NAME,
+    FrontendFailureResult, FrontendReadyResult, FrontendToken, NativeLocale, ShellDispatch,
+    ShellEvent, PRODUCT_NAME,
 };
 
 const FRONTEND_READY_GLOBAL: &str = "__CAM_FRONTEND_READY__";
@@ -584,6 +585,40 @@ fn frontend_ready(
     Ok(())
 }
 
+/// The dependency-light root crash surface calls this as soon as it replaces
+/// the normal React tree. The document token keeps a delayed report from an old
+/// renderer from forcing a newly loaded interface into native fallback mode.
+#[tauri::command]
+fn frontend_failed(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, state::ManagerState>,
+    generation: u64,
+    token: String,
+) -> Result<(), String> {
+    let degraded = match state.frontend.mark_failed(generation, &token) {
+        FrontendFailureResult::Accepted(degraded) => degraded,
+        FrontendFailureResult::Stale { current_generation } => {
+            log::warn!(
+                "stale frontend failure rejected generation={generation} current_generation={current_generation}"
+            );
+            return Err("stale frontend failure token".to_string());
+        }
+    };
+    log::error!(
+        "frontend root failed; native shell fallback enabled generation={generation} activation_pending={} native_event_pending={}",
+        degraded.activation_pending,
+        degraded.next_native_event.is_some()
+    );
+    restore_main_window(&app, "frontend-root-failed");
+    if degraded.activation_pending {
+        restore_main_window(&app, "frontend-root-failed-single-instance");
+    }
+    if let Some(event) = degraded.next_native_event {
+        show_native_shell_event(app, event);
+    }
+    Ok(())
+}
+
 fn frontend_token_script(readiness: &FrontendToken) -> String {
     let encoded = serde_json::to_string(&serde_json::json!({
         "generation": readiness.generation,
@@ -699,6 +734,7 @@ pub fn run() {
         .manage(state::ManagerState::new())
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
+            frontend_failed,
             commands::mac_plan_update,
             commands::mac_stage_update,
             commands::mac_perform_update,

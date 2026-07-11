@@ -330,6 +330,12 @@ pub struct FrontendDegraded {
     pub next_native_event: Option<ShellEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontendFailureResult {
+    Accepted(FrontendDegraded),
+    Stale { current_generation: u64 },
+}
+
 #[derive(Debug, Default)]
 struct FrontendGateInner {
     ready: bool,
@@ -370,6 +376,17 @@ impl FrontendGate {
         }
         inner.native_dialog_active = true;
         Some(inner.pending.remove(0))
+    }
+
+    fn enter_degraded(inner: &mut FrontendGateInner) -> FrontendDegraded {
+        inner.ready = false;
+        inner.degraded = true;
+        let activation_pending = std::mem::take(&mut inner.activation_pending);
+        let next_native_event = Self::take_next_native(inner);
+        FrontendDegraded {
+            activation_pending,
+            next_native_event,
+        }
     }
 
     pub fn route(&self, event: ShellEvent) -> ShellDispatch {
@@ -483,13 +500,30 @@ impl FrontendGate {
         if inner.generation != generation || inner.ready || inner.degraded {
             return None;
         }
-        inner.degraded = true;
-        let activation_pending = std::mem::take(&mut inner.activation_pending);
-        let next_native_event = Self::take_next_native(&mut inner);
-        Some(FrontendDegraded {
-            activation_pending,
-            next_native_event,
-        })
+        Some(Self::enter_degraded(&mut inner))
+    }
+
+    /// A renderer that previously completed the ready handshake can still lose
+    /// its quit listeners when the root React boundary replaces the app tree.
+    /// Authenticate that exact document before latching native delivery; a
+    /// delayed failure report from an older document must not degrade a reload.
+    pub fn mark_failed(&self, generation: u64, token: &str) -> FrontendFailureResult {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if inner.generation != generation || inner.token.as_deref() != Some(token) {
+            return FrontendFailureResult::Stale {
+                current_generation: inner.generation,
+            };
+        }
+        if inner.degraded {
+            return FrontendFailureResult::Accepted(FrontendDegraded {
+                activation_pending: false,
+                next_native_event: None,
+            });
+        }
+        FrontendFailureResult::Accepted(Self::enter_degraded(&mut inner))
     }
 
     pub fn native_dialog_finished(&self) -> Option<ShellEvent> {
@@ -512,7 +546,10 @@ impl FrontendGate {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrontendGate, FrontendReadyResult, NativeLocale, ShellDispatch, ShellEvent};
+    use super::{
+        FrontendFailureResult, FrontendGate, FrontendReadyResult, NativeLocale, ShellDispatch,
+        ShellEvent,
+    };
     use crate::app::op_phase::{OperationPhase, QuitPolicy};
 
     fn blocked(reason: &str) -> ShellEvent {
@@ -620,6 +657,46 @@ mod tests {
             gate.route(ShellEvent::ConfirmQuit),
             ShellDispatch::Emit(ShellEvent::ConfirmQuit)
         );
+    }
+
+    #[test]
+    fn authenticated_root_failure_switches_ready_delivery_to_native_fallback() {
+        let gate = FrontendGate::default();
+        let (generation, token) = start_load(&gate);
+        assert!(matches!(
+            gate.mark_ready(generation, &token),
+            FrontendReadyResult::Accepted(ref ready) if ready.first_ready
+        ));
+        assert_eq!(
+            gate.route(ShellEvent::ConfirmQuit),
+            ShellDispatch::Emit(ShellEvent::ConfirmQuit)
+        );
+
+        assert_eq!(
+            gate.mark_failed(generation, "wrong-token"),
+            FrontendFailureResult::Stale {
+                current_generation: generation
+            }
+        );
+        assert_eq!(
+            gate.route(ShellEvent::ConfirmQuit),
+            ShellDispatch::Emit(ShellEvent::ConfirmQuit)
+        );
+
+        assert!(matches!(
+            gate.mark_failed(generation, &token),
+            FrontendFailureResult::Accepted(ref degraded)
+                if !degraded.activation_pending && degraded.next_native_event.is_none()
+        ));
+        assert_eq!(
+            gate.route(ShellEvent::ConfirmQuit),
+            ShellDispatch::Native(ShellEvent::ConfirmQuit)
+        );
+        assert!(gate.can_present_window());
+        assert!(matches!(
+            gate.mark_ready(generation, &token),
+            FrontendReadyResult::Accepted(ref ready) if ready.degraded && !ready.first_ready
+        ));
     }
 
     #[test]
