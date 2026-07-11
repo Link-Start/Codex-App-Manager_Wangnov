@@ -6,7 +6,8 @@ name: Windows installer check
 # install → first launch → upgrade → uninstall.
 #
 # Also probes Authenticode on the installer and installed PE files in
-# non-blocking (optional) mode because pull requests never receive the PFX.
+# non-blocking (optional) mode. Pull requests intentionally build unsigned;
+# production signing remains blocked pending the SignPath Foundation migration.
 #
 # ARM64 is NOT smoke-tested here: GitHub-hosted runners are x64, and a
 # cross-built ARM64 PE is not runtime verification. See docs/windows-signing.md.
@@ -27,8 +28,6 @@ on:
       - "package.json"
       - "package-lock.json"
       - "scripts/windows-*.ps1"
-      - "scripts/sign-windows-authenticode.ps1"
-      - "scripts/prepare-windows-authenticode.ps1"
       - "scripts/verify-windows-authenticode.ps1"
       - ".github/workflows/win-installer-check.yml"
   workflow_dispatch:
@@ -64,9 +63,9 @@ jobs:
       # NSIS only — just needs to compile the template, resolve the brand images,
       # and link all languages. NO signing secrets here on purpose: this is a
       # pull_request trigger running PR-authored code (config/template/hooks), so
-      # exposing TAURI_SIGNING_PRIVATE_KEY / WINDOWS_CERTIFICATE would let a PR
-      # exfiltrate keys. createUpdaterArtifacts is off; Authenticode remains a
-      # release-time concern (release.yml) with mandatory inside-out signing.
+      # exposing TAURI_SIGNING_PRIVATE_KEY or any future SignPath credential
+      # would let a PR exfiltrate it. createUpdaterArtifacts is off;
+      # Authenticode remains a release-time concern (release.yml).
       - name: Build NSIS installer
         id: build
         shell: bash
@@ -102,7 +101,7 @@ jobs:
       - name: Authenticode probe (optional / non-blocking)
         shell: pwsh
         env:
-          # Pull requests never receive the release PFX secret.
+          # Pull requests do not receive release-signing credentials.
           AUTHENTICODE_MODE: optional
         run: |
           & .\scripts\verify-windows-authenticode.ps1 `

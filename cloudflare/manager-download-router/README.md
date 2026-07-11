@@ -12,8 +12,13 @@ the manager's **own** bucket so the two never mix:
   a presigned **IHEP S3** URL, once the `SECONDARY_S3_*` secrets are set. Until
   then CN also falls back to R2 (still far better than GitHub).
 
-The updater (`src-tauri/tauri.conf.json`) already checks
-`…/manager/latest.json` first, GitHub second — no app change needed.
+The updater (`src-tauri/tauri.conf.json`) checks `…/manager/latest.json` first
+and GitHub second. A mirror manifest is accepted only after its version,
+platform, artifact basename, release-note hash, updater signature, and SHA-256
+match the pinned-key-signed `<version>/release-identity.json(.sig)` from the same
+source. This keeps mainland-China discovery/download on the mirror without
+letting the URL-rewritten (and therefore unsigned) `latest.json` invent a
+candidate or replay an older signed package as a higher version.
 
 ## Why a separate latest.json on the mirror
 `latest.json`'s embedded signatures sign the artifact **bytes**, not the URL, so
@@ -28,6 +33,11 @@ segment every release would reuse one URL and the worker's long installer cache
 could serve a previous version's bytes against the new signature. (The seeded
 v0.1.8 predates this and lives at flat `…/manager/<file>` keys — still
 self-consistent; v0.1.9+ use the versioned layout.)
+
+`release-identity.json` and `release-identity.json.sig` are also immutable
+per-version objects. Release reruns reuse a previously verified signature, and
+the sync script rejects a byte-different overwrite (the minisign trusted-comment
+timestamp otherwise makes a freshly generated signature differ on every run).
 
 > ⚠️ The mirror's `latest.json` MUST be refreshed on every stable release, or the
 > first endpoint serves a stale version and **blocks** updates. That's why the

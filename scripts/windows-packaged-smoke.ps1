@@ -26,9 +26,8 @@ param(
     [int]$LaunchSeconds = 12,
     [ValidateSet("optional", "required", "skip")]
     [string]$AuthenticodeMode = "optional",
-    [string]$ExpectedThumbprint = "",
+    [string]$ExpectedSubject = "",
     [switch]$RequireTimestamp,
-    [string]$SigningConfigPath = "",
     [switch]$SkipLaunch
 )
 
@@ -105,9 +104,8 @@ try {
         & $verifyScript `
             -Path $installerItem.FullName `
             -Mode $AuthenticodeMode `
-            -ExpectedThumbprint $ExpectedThumbprint `
+            -ExpectedSubject $ExpectedSubject `
             -RequireTimestamp:$RequireTimestamp `
-            -SigningConfigPath $SigningConfigPath `
             -Stage "sign-verify"
         Close-Stage
     }
@@ -143,9 +141,8 @@ try {
         & $verifyScript `
             -Path @($mainExe, $uninstaller) `
             -Mode $AuthenticodeMode `
-            -ExpectedThumbprint $ExpectedThumbprint `
+            -ExpectedSubject $ExpectedSubject `
             -RequireTimestamp:$RequireTimestamp `
-            -SigningConfigPath $SigningConfigPath `
             -Stage "sign-verify"
         Close-Stage
     }
@@ -202,9 +199,8 @@ try {
         & $verifyScript `
             -Path @($mainExe, $uninstaller) `
             -Mode $AuthenticodeMode `
-            -ExpectedThumbprint $ExpectedThumbprint `
+            -ExpectedSubject $ExpectedSubject `
             -RequireTimestamp:$RequireTimestamp `
-            -SigningConfigPath $SigningConfigPath `
             -Stage "sign-verify"
         Close-Stage
     }

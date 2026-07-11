@@ -23,14 +23,6 @@ ManifestDPIAwareness PerMonitorV2
   SetCompressor /SOLID "{{compression}}"
 !endif
 
-; Keep above !include to stay ahead of any plugin command. Tauri signs a private
-; plugin copy when Windows code signing is configured; using the system plugin
-; directory here would silently embed unsigned DLLs in an otherwise signed setup.
-; https://github.com/tauri-apps/tauri/pull/15422
-{{#if signed_plugins_path}}
-!addplugindir "{{signed_plugins_path}}"
-{{/if}}
-
 !include MUI2.nsh
 !include FileFunc.nsh
 !include x64.nsh

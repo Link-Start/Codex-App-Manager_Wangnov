@@ -65,6 +65,10 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
       - name: Test (src-tauri)
         run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
+      # The updater is a path-patched dependency, so its response-limit tests
+      # are not included in the application workspace test command above.
+      - name: Test vendored tauri updater bounds
+        run: cargo test --locked --manifest-path vendor/tauri-plugin-updater-2.10.1/Cargo.toml --lib
       # Path deps are not workspace members, so their unit/integration tests are
       # not covered by the step above. Run each engine crate explicitly so
       # mac/win pure-logic regressions fail required CI on every PR.

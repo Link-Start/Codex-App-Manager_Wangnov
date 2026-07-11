@@ -103,6 +103,29 @@ if (missing.length > 0) {
 }
 
 writeFileSync("latest.json", JSON.stringify(manifest, null, 2));
+
+// `latest.json` remains URL-rewritten on the CN mirror for compatibility with
+// already-shipped clients, so it cannot itself have one cross-provider
+// signature. Sign this deterministic URL-free identity instead. New clients
+// require the identity before trusting any mirror's version/signature claim.
+// Deliberately exclude pub_date/build time so a rerun for the same release
+// produces byte-identical identity JSON.
+const releaseIdentity = {
+  schema: 1,
+  version,
+  notes_sha256: createHash("sha256").update(notes, "utf8").digest("hex"),
+  platforms: Object.fromEntries(
+    resolved.map(({ platform, artifact, sha256 }) => [
+      platform,
+      {
+        artifact,
+        signature: platforms[platform].signature,
+        sha256,
+      },
+    ]),
+  ),
+};
+writeFileSync("release-identity.json", JSON.stringify(releaseIdentity, null, 2) + "\n");
 writeFileSync(
   "manifest-summary.json",
   JSON.stringify(
@@ -124,3 +147,4 @@ writeFileSync(
   ) + "\n",
 );
 console.log("wrote latest.json:\n" + JSON.stringify(manifest, null, 2));
+console.log("wrote release-identity.json:\n" + JSON.stringify(releaseIdentity, null, 2));

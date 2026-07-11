@@ -75,6 +75,51 @@ content_type() {
   esac
 }
 
+upload_immutable_identity_asset() { # endpoint bucket region access_key secret_key file key content_type
+  local endpoint="$1" bucket="$2" region="$3" ak="$4" sk="$5" file="$6" key="$7" type="$8"
+  local head_output head_status existing
+  set +e
+  head_output="$(AWS_ACCESS_KEY_ID="$ak" \
+    AWS_SECRET_ACCESS_KEY="$sk" \
+    AWS_DEFAULT_REGION="$region" \
+    aws s3api head-object --bucket "$bucket" --key "$key" \
+      --endpoint-url "$endpoint" 2>&1)"
+  head_status=$?
+  set -e
+
+  if [ "$head_status" -eq 0 ]; then
+    existing="$(mktemp)"
+    AWS_ACCESS_KEY_ID="$ak" \
+    AWS_SECRET_ACCESS_KEY="$sk" \
+    AWS_DEFAULT_REGION="$region" \
+      aws s3 cp "s3://$bucket/$key" "$existing" \
+        --endpoint-url "$endpoint" --only-show-errors
+    if cmp -s "$file" "$existing"; then
+      rm -f "$existing"
+      echo "  = $key (identical immutable object already staged)"
+      return 0
+    fi
+    rm -f "$existing"
+    echo "::error::refusing to overwrite byte-different immutable identity object: $key" >&2
+    return 1
+  fi
+
+  if ! grep -Eqi '(404|NoSuchKey|Not Found|not found)' <<<"$head_output"; then
+    echo "::error::could not determine whether immutable identity object exists: $key" >&2
+    echo "$head_output" >&2
+    return "$head_status"
+  fi
+
+  AWS_ACCESS_KEY_ID="$ak" \
+  AWS_SECRET_ACCESS_KEY="$sk" \
+  AWS_DEFAULT_REGION="$region" \
+    aws s3 cp "$file" "s3://$bucket/$key" \
+      --endpoint-url "$endpoint" \
+      --content-type "$type" \
+      --only-show-errors
+  echo "  ↑ $key"
+}
+
 candidate_key="latest.candidate.json"
 latest_key="latest.json"
 
@@ -96,14 +141,22 @@ upload_assets() { # endpoint bucket region access_key secret_key phase [prefix]
       key="$version/$name"                           # immutable, per-version object
     fi
     [ -n "$prefix" ] && key="${prefix%/}/$key"
-    AWS_ACCESS_KEY_ID="$ak" \
-    AWS_SECRET_ACCESS_KEY="$sk" \
-    AWS_DEFAULT_REGION="$region" \
-      aws s3 cp "$f" "s3://$bucket/$key" \
-        --endpoint-url "$endpoint" \
-        --content-type "$(content_type "$name")" \
-        --only-show-errors
-    echo "  ↑ $key"
+    if [ "$name" = "release-identity.json" ] || [ "$name" = "release-identity.json.sig" ]; then
+      # Tauri's trusted-comment timestamp makes a freshly generated `.sig`
+      # byte-different on rerun. These versioned identity objects are immutable:
+      # reuse identical prior bytes or fail instead of silently replacing them.
+      upload_immutable_identity_asset "$endpoint" "$bucket" "$region" "$ak" "$sk" \
+        "$f" "$key" "$(content_type "$name")"
+    else
+      AWS_ACCESS_KEY_ID="$ak" \
+      AWS_SECRET_ACCESS_KEY="$sk" \
+      AWS_DEFAULT_REGION="$region" \
+        aws s3 cp "$f" "s3://$bucket/$key" \
+          --endpoint-url "$endpoint" \
+          --content-type "$(content_type "$name")" \
+          --only-show-errors
+      echo "  ↑ $key"
+    fi
   done
 }
 

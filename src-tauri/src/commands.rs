@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -6,7 +7,10 @@ use std::{
 };
 
 use codex_win_engine::InstalledWindowsCodex;
+use futures_util::StreamExt;
+use reqwest::header::CONTENT_LENGTH;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
@@ -28,8 +32,7 @@ use crate::app::mac_update::{
 use crate::app::manager_update_handoff::clear_for_platform as clear_manager_update_handoff;
 #[cfg(target_os = "windows")]
 use crate::app::manager_update_handoff::{
-    now_unix_ms, persist_for_platform as persist_manager_update_handoff,
-    ManagerUpdateHandoff,
+    now_unix_ms, persist_for_platform as persist_manager_update_handoff, ManagerUpdateHandoff,
 };
 use crate::app::manager_update_handoff::{
     status_for_platform as manager_update_handoff_status, ManagerUpdateHandoffStatus,
@@ -51,10 +54,9 @@ use crate::app::win_update::{
     detect_existing_windows_install_at_path as detect_windows_install_at_path,
     discard_windows_download, pause_windows_download,
     perform_windows_update_with_install_mode_network_and_phase,
-    plan_windows_update_with_install_mode_and_network,
-    retry_windows_ancillary, stage_windows_update_with_install_mode_and_network,
-    uninstall_windows_codex, win_adopt as adopt_windows_install,
-    win_adopt_path as adopt_windows_path, win_install_status,
+    plan_windows_update_with_install_mode_and_network, retry_windows_ancillary,
+    stage_windows_update_with_install_mode_and_network, uninstall_windows_codex,
+    win_adopt as adopt_windows_install, win_adopt_path as adopt_windows_path, win_install_status,
     DownloadProgress as WinDownloadProgress, WinAutoStageReport, WinInstallStatus,
     WinPerformExpectation, WinPerformReport, WinStageReport, WinUninstallReport, WinUpdateReport,
 };
@@ -177,6 +179,33 @@ const MANAGER_UPDATE_STATE_EVENT: &str = "manager://update-state";
 const MANAGER_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGER_UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGER_UPDATE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MANAGER_UPDATE_MANIFEST_MAX_BYTES: u64 = 256 * 1024;
+const MANAGER_UPDATE_IDENTITY_MAX_BYTES: u64 = 256 * 1024;
+const MANAGER_UPDATE_IDENTITY_SIGNATURE_MAX_BYTES: u64 = 16 * 1024;
+const MANAGER_UPDATE_ARTIFACT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MANAGER_UPDATE_IDENTITY_SCHEMA: u32 = 1;
+const MANAGER_UPDATE_IDENTITY_FILE: &str = "release-identity.json";
+const MANAGER_UPDATE_IDENTITY_SIGNATURE_FILE: &str = "release-identity.json.sig";
+
+#[derive(Debug, Deserialize)]
+struct ManagerReleaseIdentity {
+    schema: u32,
+    version: String,
+    notes_sha256: String,
+    platforms: HashMap<String, ManagerReleaseIdentityPlatform>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagerReleaseIdentityPlatform {
+    artifact: String,
+    signature: String,
+    sha256: String,
+}
+
+struct AuthenticatedManagerUpdate {
+    update: tauri_plugin_updater::Update,
+    artifact_sha256: String,
+}
 
 fn emit_manager_update_state(app: &AppHandle, snapshot: ManagerUpdateRuntimeSnapshot) {
     let _ = app.emit(MANAGER_UPDATE_STATE_EVENT, snapshot);
@@ -236,12 +265,13 @@ fn manager_updater_builder_for_endpoints(
             .endpoints(endpoints)
             .map_err(|e| AppError::Engine(format!("configure manager updater endpoints: {e}")))?;
     }
-    // `UpdaterBuilder::timeout` only reaches manifest checks. The updater
-    // deliberately creates downloads without that total timeout, so keep
-    // downloads unbounded while data is flowing and enforce a read-stall
-    // timeout through the shared reqwest client configuration instead.
+    // `UpdaterBuilder::timeout` only reaches manifest checks. Artifact transfer
+    // remains allowed to run while bytes keep flowing, but the patched plugin
+    // enforces a hard byte cap and this client still aborts read stalls.
     Ok(builder
         .timeout(MANAGER_UPDATE_CHECK_TIMEOUT)
+        .max_manifest_size(MANAGER_UPDATE_MANIFEST_MAX_BYTES)
+        .max_download_size(MANAGER_UPDATE_ARTIFACT_MAX_BYTES)
         .configure_client(|client| {
             client
                 .connect_timeout(MANAGER_UPDATE_CONNECT_TIMEOUT)
@@ -249,7 +279,9 @@ fn manager_updater_builder_for_endpoints(
         }))
 }
 
-fn configured_manager_update_endpoints(app: &AppHandle) -> Result<Vec<url::Url>, AppError> {
+fn configured_manager_update_config(
+    app: &AppHandle,
+) -> Result<tauri_plugin_updater::Config, AppError> {
     let raw = app
         .config()
         .plugins
@@ -257,14 +289,250 @@ fn configured_manager_update_endpoints(app: &AppHandle) -> Result<Vec<url::Url>,
         .get("updater")
         .cloned()
         .ok_or_else(|| AppError::Internal("missing updater plugin configuration".to_string()))?;
-    let config: tauri_plugin_updater::Config = serde_json::from_value(raw)
-        .map_err(|e| AppError::Internal(format!("read updater plugin configuration: {e}")))?;
-    if config.endpoints.is_empty() {
-        return Err(AppError::Internal(
-            "updater plugin has no configured endpoints".to_string(),
+    serde_json::from_value(raw)
+        .map_err(|e| AppError::Internal(format!("read updater plugin configuration: {e}")))
+}
+
+fn manager_update_identity_client() -> Result<reqwest::Client, AppError> {
+    let saved = PersistedAppSettings::load();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(MANAGER_UPDATE_CONNECT_TIMEOUT)
+        .read_timeout(MANAGER_UPDATE_READ_TIMEOUT)
+        .timeout(MANAGER_UPDATE_CHECK_TIMEOUT);
+    match saved.proxy_mode {
+        ProxyMode::System => {}
+        ProxyMode::Direct => builder = builder.no_proxy(),
+        ProxyMode::Custom => {
+            let normalized =
+                validated_custom_proxy_for_settings(&saved.custom_proxy_url, "manager updater")?;
+            let proxy = reqwest::Proxy::all(&normalized)
+                .map_err(|e| AppError::Engine(format!("configure manager updater proxy: {e}")))?;
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| AppError::Engine(format!("build manager updater identity client: {e}")))
+}
+
+async fn fetch_manager_update_file_limited(
+    client: &reqwest::Client,
+    url: url::Url,
+    max_bytes: u64,
+    resource: &'static str,
+) -> Result<Vec<u8>, AppError> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| AppError::Engine(format!("fetch {resource}: {e}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Engine(format!(
+            "fetch {resource}: HTTP {}",
+            response.status()
+        )));
+    }
+
+    let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(announced) = content_length.filter(|length| *length > max_bytes) {
+        return Err(AppError::Engine(format!(
+            "{resource} exceeds {max_bytes}-byte limit (announced {announced} bytes)"
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    let mut observed = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AppError::Engine(format!("read {resource}: {e}")))?;
+        observed = observed.checked_add(chunk.len() as u64).ok_or_else(|| {
+            AppError::Engine(format!("{resource} exceeds {max_bytes}-byte limit"))
+        })?;
+        if observed > max_bytes {
+            return Err(AppError::Engine(format!(
+                "{resource} exceeds {max_bytes}-byte limit (observed {observed} bytes)"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn manager_update_versioned_url(
+    manifest_endpoint: &url::Url,
+    version: &str,
+    filename: &str,
+) -> Result<url::Url, AppError> {
+    let safe_filename = !filename.is_empty()
+        && filename != "."
+        && filename != ".."
+        && filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !safe_filename {
+        return Err(AppError::Engine(
+            "signed manager update identity contains an unsafe artifact name".to_string(),
         ));
     }
-    Ok(config.endpoints)
+
+    let mut url = manifest_endpoint.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let is_github = url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.path() == "/Wangnov/Codex-App-Manager/releases/latest/download/latest.json";
+    url.set_path("");
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            AppError::Engine("manager updater endpoint cannot be a base URL".to_string())
+        })?;
+        if is_github {
+            for segment in ["Wangnov", "Codex-App-Manager", "releases", "download"] {
+                segments.push(segment);
+            }
+            segments.push(&format!("v{version}"));
+        } else {
+            let base_segments = manifest_endpoint
+                .path_segments()
+                .ok_or_else(|| {
+                    AppError::Engine("manager updater endpoint has no path".to_string())
+                })?
+                .collect::<Vec<_>>();
+            let Some((manifest_name, directories)) = base_segments.split_last() else {
+                return Err(AppError::Engine(
+                    "manager updater endpoint has no manifest filename".to_string(),
+                ));
+            };
+            if *manifest_name != "latest.json" {
+                return Err(AppError::Engine(
+                    "manager updater endpoint must end in latest.json".to_string(),
+                ));
+            }
+            for segment in directories {
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+            }
+            segments.push(version);
+        }
+        segments.push(filename);
+    }
+    Ok(url)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn validate_manager_update_identity_claim(
+    version: &str,
+    notes: Option<&str>,
+    platform_key: &str,
+    manifest_artifact: &str,
+    manifest_signature: &str,
+    identity: &ManagerReleaseIdentity,
+) -> Result<String, AppError> {
+    if identity.schema != MANAGER_UPDATE_IDENTITY_SCHEMA || identity.version != version {
+        return Err(AppError::Engine(
+            "manager update manifest does not match the signed release identity".to_string(),
+        ));
+    }
+    if identity.notes_sha256 != sha256_hex(notes.unwrap_or_default().as_bytes()) {
+        return Err(AppError::Engine(
+            "manager update notes do not match the signed release identity".to_string(),
+        ));
+    }
+    let platform = identity.platforms.get(platform_key).ok_or_else(|| {
+        AppError::Engine(
+            "signed manager update identity has no entry for this platform".to_string(),
+        )
+    })?;
+    if platform.artifact != manifest_artifact || platform.signature != manifest_signature {
+        return Err(AppError::Engine(
+            "manager update artifact does not match the signed release identity".to_string(),
+        ));
+    }
+    let valid_sha256 = platform.sha256.len() == 64
+        && platform
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !valid_sha256 {
+        return Err(AppError::Engine(
+            "signed manager update identity has an invalid artifact digest".to_string(),
+        ));
+    }
+    Ok(platform.sha256.clone())
+}
+
+async fn authenticate_manager_update(
+    client: &reqwest::Client,
+    manifest_endpoint: &url::Url,
+    pubkey: &str,
+    mut update: tauri_plugin_updater::Update,
+) -> Result<AuthenticatedManagerUpdate, AppError> {
+    let identity_url = manager_update_versioned_url(
+        manifest_endpoint,
+        &update.version,
+        MANAGER_UPDATE_IDENTITY_FILE,
+    )?;
+    let signature_url = manager_update_versioned_url(
+        manifest_endpoint,
+        &update.version,
+        MANAGER_UPDATE_IDENTITY_SIGNATURE_FILE,
+    )?;
+    let identity_bytes = fetch_manager_update_file_limited(
+        client,
+        identity_url,
+        MANAGER_UPDATE_IDENTITY_MAX_BYTES,
+        "manager release identity",
+    )
+    .await?;
+    let signature_bytes = fetch_manager_update_file_limited(
+        client,
+        signature_url,
+        MANAGER_UPDATE_IDENTITY_SIGNATURE_MAX_BYTES,
+        "manager release identity signature",
+    )
+    .await?;
+    let signature = std::str::from_utf8(&signature_bytes)
+        .map(str::trim)
+        .map_err(|_| {
+            AppError::Engine("manager release identity signature is not UTF-8".to_string())
+        })?;
+    tauri_plugin_updater::verify_signature(&identity_bytes, signature, pubkey)
+        .map_err(|e| AppError::Engine(format!("verify manager release identity: {e}")))?;
+    let identity: ManagerReleaseIdentity = serde_json::from_slice(&identity_bytes)
+        .map_err(|e| AppError::Engine(format!("parse manager release identity: {e}")))?;
+    let manifest_artifact = update
+        .download_url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default();
+    let artifact_sha256 = validate_manager_update_identity_claim(
+        &update.version,
+        update.body.as_deref(),
+        &update.platform,
+        manifest_artifact,
+        &update.signature,
+        &identity,
+    )?;
+    let artifact = identity
+        .platforms
+        .get(&update.platform)
+        .expect("validated identity platform")
+        .artifact
+        .clone();
+    update.download_url =
+        manager_update_versioned_url(manifest_endpoint, &update.version, &artifact)?;
+    Ok(AuthenticatedManagerUpdate {
+        update,
+        artifact_sha256,
+    })
 }
 
 async fn download_with_manager_fallback<T, Attempt, AttemptFuture>(
@@ -385,24 +653,46 @@ fn manager_update_matches_confirmation(
 pub async fn manager_check_update(
     app: AppHandle,
 ) -> Result<Option<ManagerUpdateMetadata>, CommandError> {
-    let endpoints = configured_manager_update_endpoints(&app)?;
+    let config = configured_manager_update_config(&app)?;
+    if config.endpoints.is_empty() {
+        return Err(
+            AppError::Internal("updater plugin has no configured endpoints".to_string()).into(),
+        );
+    }
+    let endpoints = config.endpoints.clone();
+    let pubkey = Arc::new(config.pubkey);
+    let identity_client = manager_update_identity_client()?;
     let update = check_with_manager_fallback(endpoints, |endpoint| {
         let app = app.clone();
+        let pubkey = Arc::clone(&pubkey);
+        let identity_client = identity_client.clone();
         async move {
-            let updater = manager_updater_builder_for_endpoints(&app, Some(vec![endpoint]))?
-                .build()
-                .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
-            updater
+            let updater =
+                manager_updater_builder_for_endpoints(&app, Some(vec![endpoint.clone()]))?
+                    .build()
+                    .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
+            let update = updater
                 .check()
                 .await
-                .map_err(|e| AppError::Engine(format!("check manager update: {e}")))
+                .map_err(|e| AppError::Engine(format!("check manager update: {e}")))?;
+            match update {
+                Some(update) => authenticate_manager_update(
+                    &identity_client,
+                    &endpoint,
+                    pubkey.as_str(),
+                    update,
+                )
+                .await
+                .map(Some),
+                None => Ok(None),
+            }
         }
     })
     .await?;
-    Ok(update.map(|update| ManagerUpdateMetadata {
-        version: update.version,
-        current_version: update.current_version,
-        body: update.body,
+    Ok(update.map(|authenticated| ManagerUpdateMetadata {
+        version: authenticated.update.version,
+        current_version: authenticated.update.current_version,
+        body: authenticated.update.body,
     }))
 }
 
@@ -475,7 +765,15 @@ pub async fn manager_install_update(
             .operations
             .set_phase(op.token(), OperationPhase::Downloading)
             .map_err(AppError::from)?;
-        let endpoints = configured_manager_update_endpoints(&app)?;
+        let config = configured_manager_update_config(&app)?;
+        if config.endpoints.is_empty() {
+            return Err(AppError::Internal(
+                "updater plugin has no configured endpoints".to_string(),
+            ));
+        }
+        let endpoints = config.endpoints.clone();
+        let pubkey = Arc::new(config.pubkey);
+        let identity_client = manager_update_identity_client()?;
         let runtime_for_attempts = state.manager_update.clone();
         let operations_for_attempts = state.operations.clone();
         let token_for_attempts = op.token().clone();
@@ -492,6 +790,8 @@ pub async fn manager_install_update(
                 let app = app_for_attempts.clone();
                 let expected_version = Arc::clone(&expected_version);
                 let expected_current_version = Arc::clone(&expected_current_version);
+                let pubkey = Arc::clone(&pubkey);
+                let identity_client = identity_client.clone();
                 async move {
                     operations
                         .set_phase(&token, OperationPhase::Downloading)
@@ -515,6 +815,14 @@ pub async fn manager_install_update(
                                 "管理器更新内容已变化，请重新检查后再确认。".to_string(),
                             )
                         })?;
+                    let authenticated = authenticate_manager_update(
+                        &identity_client,
+                        &endpoint,
+                        pubkey.as_str(),
+                        update,
+                    )
+                    .await?;
+                    let update = authenticated.update;
                     if !manager_update_matches_confirmation(
                         &update.version,
                         &update.current_version,
@@ -561,6 +869,13 @@ pub async fn manager_install_update(
                         )
                         .await
                         .map_err(|e| AppError::Engine(format!("download manager update: {e}")))?;
+                    let actual_sha256 = sha256_hex(&bytes);
+                    if actual_sha256 != authenticated.artifact_sha256 {
+                        return Err(AppError::Engine(
+                            "downloaded manager update does not match the signed release identity digest"
+                                .to_string(),
+                        ));
+                    }
                     Ok(DownloadedManagerUpdate { update, bytes })
                 }
             },
@@ -768,7 +1083,8 @@ fn destructive_token_error(err: OperationError) -> CommandError {
 fn refresh_config_health(state: &ManagerState) -> ConfigHealth {
     let (_, settings_health) = PersistedAppSettings::load_with_health();
     let (_, provenance_health) = ProvenanceStore::load_with_health();
-    let health = ConfigHealth::from_parts(settings_health, provenance_health).with_live_backup_flags();
+    let health =
+        ConfigHealth::from_parts(settings_health, provenance_health).with_live_backup_flags();
     let mut slot = state
         .config_health
         .lock()
@@ -1216,9 +1532,7 @@ pub fn mac_pause_download(state: State<'_, ManagerState>) -> Result<bool, Comman
         return Err(AppError::UnsupportedPlatform.into());
     }
     if let Some(snap) = state.operations.snapshot() {
-        let _ = state
-            .operations
-            .set_paused(&OperationToken(snap.id), true);
+        let _ = state.operations.set_paused(&OperationToken(snap.id), true);
     }
     Ok(pause_macos_download())
 }
@@ -1389,10 +1703,9 @@ pub fn restore_config_backup(
         _ => "ok",
     };
     if status == "corrupt" {
-        return Err(AppError::Internal(format!(
-            "已从 .bak 还原 {which}，但重新读取仍判定为损坏"
-        ))
-        .into());
+        return Err(
+            AppError::Internal(format!("已从 .bak 还原 {which}，但重新读取仍判定为损坏")).into(),
+        );
     }
     Ok(health)
 }
@@ -1427,10 +1740,7 @@ pub fn reset_config(
         _ => "ok",
     };
     if status == "corrupt" {
-        return Err(AppError::Internal(format!(
-            "已重置 {which}，但重新读取仍判定为损坏"
-        ))
-        .into());
+        return Err(AppError::Internal(format!("已重置 {which}，但重新读取仍判定为损坏")).into());
     }
     Ok(health)
 }
@@ -1463,10 +1773,9 @@ pub fn retry_ancillary(
     }
     let _guard: RetryGuard = if purge {
         if confirm != Some(true) {
-            return Err(AppError::Internal(
-                "清除用户数据需要二次确认（confirm=true）".to_string(),
-            )
-            .into());
+            return Err(
+                AppError::Internal("清除用户数据需要二次确认（confirm=true）".to_string()).into(),
+            );
         }
         let token = token.ok_or_else(|| {
             AppError::Internal(
@@ -1478,9 +1787,7 @@ pub fn retry_ancillary(
         RetryGuard::Scoped(begin_guard(&state, OperationKind::Adopt)?)
     };
     match state.target.os {
-        OperatingSystem::Macos => {
-            retry_macos_ancillary(actions, path, purge).map_err(Into::into)
-        }
+        OperatingSystem::Macos => retry_macos_ancillary(actions, path, purge).map_err(Into::into),
         OperatingSystem::Windows => {
             let settings = windows_domain_settings_for_persisted(&state);
             retry_windows_ancillary(&settings, actions, path, purge).map_err(Into::into)
@@ -1555,7 +1862,10 @@ pub fn get_operation_snapshot(
 /// CloseRequested / ExitRequested guards stop intercepting and let it go.
 /// Still refuses when the backend is in a non-interruptible install phase.
 #[tauri::command]
-pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Result<(), CommandError> {
+pub fn confirm_quit(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<(), CommandError> {
     let confirm_close = crate::app::settings_store::AppSettings::load().confirm_close;
     // Evaluate as if force_quit is not yet set so a point-of-no-return phase
     // still blocks even after the user clicks the confirm dialog.
@@ -1783,9 +2093,7 @@ pub fn win_pause_download(state: State<'_, ManagerState>) -> Result<bool, Comman
         return Err(AppError::UnsupportedPlatform.into());
     }
     if let Some(snap) = state.operations.snapshot() {
-        let _ = state
-            .operations
-            .set_paused(&OperationToken(snap.id), true);
+        let _ = state.operations.set_paused(&OperationToken(snap.id), true);
     }
     Ok(pause_windows_download())
 }
@@ -2203,10 +2511,13 @@ mod tests {
     use super::{
         check_with_manager_fallback, download_then_install_manager_update,
         install_root_from_picked_dir, manager_update_matches_confirmation,
-        normalize_windows_source_base, validate_install_root_path,
-        validated_custom_proxy_for_settings,
+        manager_update_versioned_url, normalize_windows_source_base, sha256_hex,
+        validate_install_root_path, validate_manager_update_identity_claim,
+        validated_custom_proxy_for_settings, ManagerReleaseIdentity,
+        ManagerReleaseIdentityPlatform,
     };
     use crate::errors::AppError;
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
 
@@ -2268,6 +2579,111 @@ mod tests {
             url::Url::parse("https://github.com/example/releases/latest/download/latest.json")
                 .unwrap(),
         ]
+    }
+
+    fn manager_release_identity(
+        version: &str,
+        notes: &str,
+        signature: &str,
+    ) -> ManagerReleaseIdentity {
+        ManagerReleaseIdentity {
+            schema: 1,
+            version: version.to_string(),
+            notes_sha256: sha256_hex(notes.as_bytes()),
+            platforms: HashMap::from([(
+                "windows-x86_64".to_string(),
+                ManagerReleaseIdentityPlatform {
+                    artifact: "CodexAppManager_0.3.1_x64-setup.exe".to_string(),
+                    signature: signature.to_string(),
+                    sha256: "a".repeat(64),
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn manager_update_rejects_forged_v999_with_replayed_old_signature() {
+        let identity = manager_release_identity("0.3.1", "reviewed notes", "old-valid-signature");
+        let error = validate_manager_update_identity_claim(
+            "999.0.0",
+            Some("reviewed notes"),
+            "windows-x86_64",
+            "CodexAppManager_0.3.1_x64-setup.exe",
+            "old-valid-signature",
+            &identity,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match the signed release identity"));
+    }
+
+    #[test]
+    fn manager_update_accepts_mirror_claim_bound_to_signed_identity() {
+        let identity = manager_release_identity("0.3.1", "reviewed notes", "current-signature");
+        let digest = validate_manager_update_identity_claim(
+            "0.3.1",
+            Some("reviewed notes"),
+            "windows-x86_64",
+            "CodexAppManager_0.3.1_x64-setup.exe",
+            "current-signature",
+            &identity,
+        )
+        .unwrap();
+
+        assert_eq!(digest, "a".repeat(64));
+    }
+
+    #[test]
+    fn manager_update_derives_versioned_identity_and_artifact_urls_per_source() {
+        let mirror =
+            url::Url::parse("https://codexapp.agentsmirror.com/manager/latest.json?ignored=1")
+                .unwrap();
+        assert_eq!(
+            manager_update_versioned_url(&mirror, "0.3.2", "release-identity.json")
+                .unwrap()
+                .as_str(),
+            "https://codexapp.agentsmirror.com/manager/0.3.2/release-identity.json"
+        );
+
+        let github = url::Url::parse(
+            "https://github.com/Wangnov/Codex-App-Manager/releases/latest/download/latest.json",
+        )
+        .unwrap();
+        assert_eq!(
+            manager_update_versioned_url(
+                &github,
+                "0.3.2",
+                "CodexAppManager_0.3.2_x64-setup.exe"
+            )
+            .unwrap()
+            .as_str(),
+            "https://github.com/Wangnov/Codex-App-Manager/releases/download/v0.3.2/CodexAppManager_0.3.2_x64-setup.exe"
+        );
+        assert!(manager_update_versioned_url(&mirror, "0.3.2", "../escape").is_err());
+    }
+
+    #[test]
+    fn manager_update_cn_path_accepts_authenticated_mirror_first() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_check = Arc::clone(&attempts);
+        let result = tauri::async_runtime::block_on(check_with_manager_fallback(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_check);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    Ok(Some("authenticated-mirror-update"))
+                }
+            },
+        ));
+
+        assert_eq!(result.unwrap(), Some("authenticated-mirror-update"));
+        assert_eq!(*attempts.lock().unwrap(), vec!["mirror.example"]);
     }
 
     #[test]
@@ -2403,6 +2819,39 @@ mod tests {
             vec!["mirror.example", "github.com"]
         );
         assert_eq!(*installed.lock().unwrap(), vec!["github-verified-package"]);
+    }
+
+    #[test]
+    fn manager_update_falls_back_when_mirror_serves_old_bytes_for_current_signature() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_download = Arc::clone(&attempts);
+        let result = tauri::async_runtime::block_on(download_then_install_manager_update(
+            manager_update_test_endpoints(),
+            move |endpoint| {
+                let attempts = Arc::clone(&attempts_for_download);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(endpoint.host_str().unwrap().to_string());
+                    if endpoint.host_str() == Some("mirror.example") {
+                        Err(AppError::Engine(
+                            "download manager update: minisign verification failed for old bytes"
+                                .to_string(),
+                        ))
+                    } else {
+                        Ok("github-current-signed-bytes")
+                    }
+                }
+            },
+            |_| Ok(()),
+        ));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["mirror.example", "github.com"]
+        );
     }
 
     #[test]

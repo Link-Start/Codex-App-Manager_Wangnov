@@ -4,7 +4,7 @@
 #   optional  — PR/local diagnostic for builds that intentionally receive no
 #               release certificate. Reports unsigned files without blocking.
 #   required  — release gate: every path must have Status -eq Valid. Can also
-#               pin the imported thumbprint and require RFC3161 evidence.
+#               pin the SignPath subject and require timestamp evidence.
 #
 # Usage:
 #   pwsh scripts/verify-windows-authenticode.ps1 -Path a.exe,b.exe -Mode optional
@@ -24,17 +24,10 @@ param(
     # When set (required mode), SignerCertificate.Subject must contain this.
     [string]$ExpectedSubject = "",
 
-    # When set (required mode), the signer must be the exact certificate that
-    # the release job imported, not merely any locally trusted publisher.
-    [string]$ExpectedThumbprint = "",
-
-    # Tauri is configured with tsp=true (/tr + /td SHA256). Requiring a
-    # countersigner here ensures the RFC3161 timestamp was actually embedded.
+    # Requires a timestamp countersigner on the artifact. This property alone
+    # does not distinguish RFC3161 from every legacy timestamp form; the future
+    # SignPath pilot must also validate its policy and verbose signtool output.
     [switch]$RequireTimestamp,
-
-    # Required together with -RequireTimestamp. The generated Tauri config is
-    # the build-time proof that signing used RFC3161 (/tr), not legacy /t.
-    [string]$SigningConfigPath = "",
 
     [string]$Stage = "sign-verify"
 )
@@ -53,24 +46,6 @@ function Close-Stage {
 function Fail-Stage([string]$Message) {
     Write-Host "::error::[$Stage] $Message"
     throw "[$Stage] $Message"
-}
-
-if ($RequireTimestamp) {
-    if ([string]::IsNullOrWhiteSpace($SigningConfigPath) -or -not (Test-Path -LiteralPath $SigningConfigPath)) {
-        Fail-Stage "-RequireTimestamp also requires the generated Tauri signing config"
-    }
-    $signingConfig = Get-Content -LiteralPath $SigningConfigPath -Raw | ConvertFrom-Json
-    $windowsSigning = $signingConfig.bundle.windows
-    if ($windowsSigning.tsp -ne $true) {
-        Fail-Stage "Tauri signing config must set bundle.windows.tsp=true (RFC3161 /tr)"
-    }
-    if ([string]::IsNullOrWhiteSpace([string]$windowsSigning.timestampUrl)) {
-        Fail-Stage "Tauri signing config has no RFC3161 timestampUrl"
-    }
-    if ([string]$windowsSigning.digestAlgorithm -ne "sha256") {
-        Fail-Stage "Tauri signing config must use SHA256"
-    }
-    Write-Host "[$Stage] RFC3161 config asserted: tsp=true digest=sha256 url=$($windowsSigning.timestampUrl)"
 }
 
 Write-Stage "Authenticode verification (mode=$Mode)"
@@ -125,10 +100,6 @@ foreach ($raw in $Path) {
             elseif ($ExpectedSubject -and ($subject -notlike "*$ExpectedSubject*")) {
                 $ok = $false
                 Write-Host "::error::[$Stage] $($item.Name): subject '$subject' does not contain '$ExpectedSubject'"
-            }
-            elseif ($ExpectedThumbprint -and ($thumbprint -ne $ExpectedThumbprint.Replace(" ", "").ToUpperInvariant())) {
-                $ok = $false
-                Write-Host "::error::[$Stage] $($item.Name): signer thumbprint '$thumbprint' does not match the release certificate"
             }
             elseif ($RequireTimestamp -and -not $sig.TimeStamperCertificate) {
                 $ok = $false
