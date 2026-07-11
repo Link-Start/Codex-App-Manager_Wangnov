@@ -176,7 +176,8 @@ rows.push(`| Mirror pre-publish verify | ${env.MIRROR_VERIFY_OUTCOME || "skipped
 rows.push(`| Mirror promote | ${env.MIRROR_PROMOTE_OUTCOME || "skipped"} |`);
 rows.push(`| winget dispatch | ${env.WINGET_OUTCOME || "skipped"} |`);
 rows.push(`| SBOM | ${env.SBOM_OUTCOME || "skipped"} |`);
-rows.push(`| provenance attestation | ${env.ATTESTATION_OUTCOME || "skipped"} |`);
+rows.push(`| fresh provenance attestation | ${env.ATTESTATION_OUTCOME || "skipped"} |`);
+rows.push(`| provenance mode | ${env.PROVENANCE_MODE || "blocked"} |`);
 rows.push("");
 rows.push(
   "winget dispatch only starts the downstream submission workflow; until the first package is accepted in microsoft/winget-pkgs, downstream failures are expected noise.",

@@ -49,8 +49,7 @@ on:
     inputs:
       target_tag:
         description: "Existing vX.Y.Z release to republish through the current protected workflow"
-        required: false
-        default: ""
+        required: true
         type: string
       allow_mirror_downgrade:
         description: "Emergency only: allow this tag to replace a newer mirror latest.json"
@@ -79,8 +78,55 @@ concurrency:
   queue: max
 
 jobs:
+  # A manual dispatch may execute only from the protected default branch and
+  # must name an existing target_tag. This also rejects an empty-input dispatch
+  # from an attacker-controlled branch named like a release tag.
+  # Keep the rejecting path free of checkout, environments, permissions, and
+  # secrets so an untrusted ref cannot reach any credential-bearing job. Compare
+  # the complete ref, not ref_name: a tag named like the default branch must fail.
+  reject_untrusted_target_dispatch:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject manual dispatch outside the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          echo "::error::target_tag must be dispatched from refs/heads/$DEFAULT_BRANCH, not $DISPATCH_REF"
+          exit 1
+
+  preflight:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Validate release invocation without secrets
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DISPATCH_REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TARGET_TAG: ${{ inputs.target_tag || '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "::error::workflow_dispatch must run from refs/heads/$DEFAULT_BRANCH, not $DISPATCH_REF"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && -z "$REQUESTED_TARGET_TAG" ]]; then
+            echo "::error::workflow_dispatch requires a non-empty target_tag"
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag must be a semantic vX.Y.Z tag: $RELEASE_TAG"
+            exit 1
+          fi
+
   prepare:
-    if: ${{ startsWith(inputs.target_tag || github.ref_name, 'v') }}
+    needs: preflight
+    if: ${{ needs.preflight.result == 'success' }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -97,6 +143,26 @@ jobs:
         with:
           node-version: 20
 
+      # Verify the release source rather than the workflow source. For a
+      # target_tag recovery the workflow itself comes from the protected default
+      # branch, while the six application version declarations come from the tag.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Match release tag to every application version declaration
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-release-version.mjs source "$RELEASE_TAG" release-source
+          release_source_sha="$(git -C release-source rev-parse HEAD)"
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$release_source_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::release tag $RELEASE_TAG moved away from triggering commit $GITHUB_SHA"
+            exit 1
+          fi
+
       - name: Require GitHub Immutable Releases
         env:
           GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
@@ -106,16 +172,10 @@ jobs:
         id: lookup
         shell: bash
         env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          DISPATCH_REF_NAME: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TARGET_TAG: ${{ inputs.target_tag || '' }}
         run: |
           set -euo pipefail
-          if [[ -n "$REQUESTED_TARGET_TAG" && "$DISPATCH_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
-            echo "::error::target_tag must be dispatched from the default branch ($DEFAULT_BRANCH), not $DISPATCH_REF_NAME"
-            exit 1
-          fi
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::release tag must be a semantic vX.Y.Z tag: $RELEASE_TAG"
             exit 1
@@ -492,6 +552,27 @@ jobs:
         with:
           node-version: 20
 
+      # Re-run this gate inside every release-job attempt. GitHub's "Re-run
+      # failed jobs" does not re-run prepare, and no immutable publication may
+      # rely only on a previous attempt's version decision.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Re-check release tag against application versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-release-version.mjs source "$RELEASE_TAG" release-source
+          release_source_sha="$(git -C release-source rev-parse HEAD)"
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$release_source_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::release tag $RELEASE_TAG moved away from triggering commit $GITHUB_SHA"
+            exit 1
+          fi
+          echo "RELEASE_SOURCE_SHA=$release_source_sha" >> "$GITHUB_ENV"
+
       # Re-check on every release-job attempt. `prepare` is not rerun by
       # "Re-run failed jobs", and publishing a resumed draft while the setting is
       # disabled would create a mutable canonical source.
@@ -640,6 +721,7 @@ jobs:
         run: |
           echo "::group::[build] validate final publishable artifacts"
           set -euo pipefail
+          node scripts/check-release-version.mjs artifacts "$RELEASE_TAG" dist
           ls -la dist
           missing=0
           require() {
@@ -686,12 +768,10 @@ jobs:
           if [[ "${{ steps.release_source.outputs.existing }}" == "true" ]]; then
             cp "$RUNNER_TEMP/published-latest.json" latest.json
           fi
-          if [[ "$RELEASE_TAG" != *-* ]]; then
-            node scripts/validate-release-manifest.mjs \
-              "$RELEASE_TAG" \
-              latest.json \
-              "$RUNNER_TEMP/artifact-derived-latest.json"
-          fi
+          node scripts/validate-release-manifest.mjs \
+            "$RELEASE_TAG" \
+            latest.json \
+            "$RUNNER_TEMP/artifact-derived-latest.json"
 
       # A wrong private/public updater-key pairing cannot be repaired after an
       # immutable GitHub Release is published. Verify the exact local payloads
@@ -704,12 +784,68 @@ jobs:
             dist \
             "$RELEASE_TAURI_CONFIG"
 
+      # Create provenance only for bytes produced by this release run, before a
+      # draft can become immutable. A later failed-job rerun must never mint a
+      # new statement that falsely attributes already-published bytes to the
+      # rerun's OIDC identity.
+      - name: Attest fresh build provenance
+        id: attest_fresh
+        if: ${{ steps.release_source.outputs.existing != 'true' }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        with:
+          subject-path: |
+            dist/*
+            latest.json
+
+      # Existing immutable releases are accepted only when their downloaded,
+      # API-digest-pinned bytes already carry provenance from this repository's
+      # release workflow and exact tag ref. This is verification, not a new OIDC
+      # statement; missing historical provenance fails closed.
+      - name: Verify existing immutable release provenance
+        id: verify_existing_provenance
+        if: ${{ steps.release_source.outputs.existing == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          signer_workflow="$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          for file in dist/* latest.json; do
+            gh attestation verify "$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$signer_workflow" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --source-digest "$RELEASE_SOURCE_SHA" \
+              --deny-self-hosted-runners >/dev/null
+            echo "Verified existing provenance: $(basename "$file")"
+          done
+
+      - name: Resolve provenance gate
+        id: provenance
+        shell: bash
+        env:
+          FRESH_ATTESTATION_OUTCOME: ${{ steps.attest_fresh.outcome }}
+          EXISTING_PROVENANCE_OUTCOME: ${{ steps.verify_existing_provenance.outcome }}
+          RELEASE_REUSED: ${{ steps.release_source.outputs.existing }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_REUSED" == "true" ]]; then
+            [[ "$FRESH_ATTESTATION_OUTCOME" == "skipped" ]]
+            [[ "$EXISTING_PROVENANCE_OUTCOME" == "success" ]]
+            echo "mode=verified-existing-immutable-release" >> "$GITHUB_OUTPUT"
+          else
+            [[ "$FRESH_ATTESTATION_OUTCOME" == "success" ]]
+            [[ "$EXISTING_PROVENANCE_OUTCOME" == "skipped" ]]
+            echo "mode=fresh-build-attested-before-publication" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
       # Stable releases stage immutable versioned assets before GitHub Release
       # publication, verify them separately, then promote latest.json only after
       # the GitHub Release succeeds. Pre-releases still skip the mirror entirely.
       - name: Stage CDN mirror candidate (R2 + IHEP S3)
         id: mirror_stage
-        if: ${{ !contains(env.RELEASE_TAG, '-') }}
+        if: ${{ steps.provenance.outputs.ready == 'true' && !contains(env.RELEASE_TAG, '-') }}
         env:
           MIRROR_PHASE: stage
           MIRROR_REQUIRED_BACKENDS: r2,ihep
@@ -742,7 +878,7 @@ jobs:
       # branches must pass before GitHub publication becomes immutable.
       - name: Verify staged CDN mirror before immutable publication
         id: mirror_verify
-        if: ${{ !contains(env.RELEASE_TAG, '-') }}
+        if: ${{ steps.provenance.outputs.ready == 'true' && !contains(env.RELEASE_TAG, '-') }}
         env:
           MIRROR_PHASE: verify
           MIRROR_REQUIRED_BACKENDS: r2,ihep
@@ -829,7 +965,7 @@ jobs:
       # releases are enabled: a published release can no longer accept assets.
       - name: Upload GitHub Release draft
         id: upload_release_draft
-        if: ${{ steps.release_source.outputs.existing != 'true' }}
+        if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -851,7 +987,7 @@ jobs:
       # after all uploads succeeded while retaining its stable/prerelease metadata.
       - name: Publish GitHub Release
         id: publish_release
-        if: ${{ steps.release_source.outputs.existing != 'true' }}
+        if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -884,27 +1020,25 @@ jobs:
             exit 1
           fi
           cat "$verification_log"
-
-      # Attest immediately after GitHub confirms the canonical immutable bytes,
-      # before mirror promotion can fail the job. Keep the subjects limited to
-      # updater payloads and latest.json: on a failed-job rerun those are fetched
-      # from the immutable Release and checked against GitHub's canonical SHA-256
-      # digests. SHA256SUMS and SBOMs are intentionally excluded because they are
-      # regenerated locally and are not necessarily the bytes already published.
-      # A failed attestation must fail the job so the release stays retryable and
-      # neither mirror promotion nor winget dispatch can proceed without proof.
-      - name: Attest build provenance
-        id: attest
-        if: ${{ steps.publish_release.outcome == 'success' || steps.release_source.outputs.existing == 'true' }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
-        with:
-          subject-path: |
-            dist/*
-            latest.json
+          release_asset_digests="$(sed -n 's/^release_asset_digests=//p' "$verification_output")"
+          jq -e 'type == "object" and length > 0' <<<"$release_asset_digests" >/dev/null || {
+            echo "::error::published immutable digest evidence is missing"
+            exit 1
+          }
+          for file in dist/* latest.json; do
+            name="$(basename "$file")"
+            expected_digest="$(jq -er --arg name "$name" '.[$name]' <<<"$release_asset_digests")"
+            actual_digest="sha256:$(sha256sum "$file" | cut -d' ' -f1)"
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "::error::published immutable digest does not match attested local bytes: $name"
+              exit 1
+            fi
+            echo "Verified published attested digest: $name"
+          done
 
       - name: Promote CDN mirror latest (R2 + IHEP S3)
         id: mirror_promote
-        if: ${{ success() && steps.attest.outcome == 'success' && !contains(env.RELEASE_TAG, '-') }}
+        if: ${{ success() && steps.provenance.outputs.ready == 'true' && !contains(env.RELEASE_TAG, '-') }}
         env:
           MIRROR_PHASE: promote
           MIRROR_REQUIRED_BACKENDS: r2,ihep
@@ -934,7 +1068,7 @@ jobs:
       # so a re-run is harmless.
       - name: Trigger winget submission
         id: winget
-        if: ${{ success() && steps.attest.outcome == 'success' && !contains(env.RELEASE_TAG, '-') }}
+        if: ${{ success() && steps.provenance.outputs.ready == 'true' && !contains(env.RELEASE_TAG, '-') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -954,7 +1088,8 @@ jobs:
           MIRROR_PROMOTE_OUTCOME: ${{ steps.mirror_promote.outcome }}
           WINGET_OUTCOME: ${{ steps.winget.outputs.status || steps.winget.outcome }}
           SBOM_OUTCOME: ${{ steps.sbom.outcome }}
-          ATTESTATION_OUTCOME: ${{ steps.attest.outcome }}
+          ATTESTATION_OUTCOME: ${{ steps.attest_fresh.outcome }}
+          PROVENANCE_MODE: ${{ steps.provenance.outputs.mode }}
         run: node scripts/write-release-summary.mjs
 
       - name: Upload release audit records
