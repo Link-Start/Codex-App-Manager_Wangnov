@@ -16,6 +16,22 @@ const TAURI_PUBLIC_KEY = Buffer.from(
 ).toString("base64");
 const TAURI_SIGNATURE = Buffer.from(`${RAW_SIGNATURE}\n`).toString("base64");
 
+const encodePublicKeyEnvelope = (packet) =>
+  Buffer.from(`untrusted comment: minisign public key\n${packet}\n`).toString("base64");
+
+const encodeSignatureEnvelope = ({ packet, globalSignature }) =>
+  Buffer.from(
+    `untrusted comment: signature from minisign secret key\n${packet}\n` +
+      `trusted comment: timestamp:1633700835\tfile:test\tprehashed\n${globalSignature}\n`,
+  ).toString("base64");
+
+const SIGNATURE_LINES = RAW_SIGNATURE.split("\n");
+const RAW_SIGNATURE_PACKET = SIGNATURE_LINES[1];
+const RAW_GLOBAL_SIGNATURE = SIGNATURE_LINES[3];
+
+const replaceLastDataCharacter = (value, replacement) =>
+  value.replace(/([A-Za-z0-9+/])=+$/, `${replacement}${value.match(/=+$/)?.[0] ?? ""}`);
+
 const response = (body, status = 200) =>
   new Response(body, {
     status,
@@ -28,6 +44,75 @@ describe("release identity minisign", () => {
     expect(() =>
       verifyTauriMinisign(Buffer.from("tampered"), TAURI_SIGNATURE, TAURI_PUBLIC_KEY),
     ).toThrow(/content signature verification failed/);
+  });
+
+  it.each([
+    ["public-key prefix", `!${TAURI_PUBLIC_KEY}`, TAURI_SIGNATURE],
+    [
+      "public-key whitespace",
+      `${TAURI_PUBLIC_KEY.slice(0, 12)} ${TAURI_PUBLIC_KEY.slice(12)}`,
+      TAURI_SIGNATURE,
+    ],
+    ["public-key trailing garbage", `${TAURI_PUBLIC_KEY}!`, TAURI_SIGNATURE],
+    ["public-key leading whitespace", ` ${TAURI_PUBLIC_KEY}`, TAURI_SIGNATURE],
+    ["signature prefix", TAURI_PUBLIC_KEY, `!${TAURI_SIGNATURE}`],
+    [
+      "signature whitespace",
+      TAURI_PUBLIC_KEY,
+      `${TAURI_SIGNATURE.slice(0, 12)} ${TAURI_SIGNATURE.slice(12)}`,
+    ],
+    ["signature trailing garbage", TAURI_PUBLIC_KEY, `${TAURI_SIGNATURE}!`],
+    ["signature trailing whitespace", TAURI_PUBLIC_KEY, `${TAURI_SIGNATURE}\n`],
+    ["signature missing padding", TAURI_PUBLIC_KEY, TAURI_SIGNATURE.slice(0, -1)],
+    [
+      "signature non-zero pad bits",
+      TAURI_PUBLIC_KEY,
+      replaceLastDataCharacter(TAURI_SIGNATURE, "p"),
+    ],
+  ])("rejects non-canonical outer Tauri base64: %s", (_label, publicKey, signature) => {
+    expect(() => verifyTauriMinisign(Buffer.from("test"), signature, publicKey)).toThrow(
+      /not canonical base64/,
+    );
+  });
+
+  it.each([
+    ["prefix", `!${RAW_PUBLIC_KEY}`],
+    ["whitespace", `${RAW_PUBLIC_KEY.slice(0, 12)} ${RAW_PUBLIC_KEY.slice(12)}`],
+    ["trailing garbage", `${RAW_PUBLIC_KEY}!`],
+  ])("rejects non-canonical minisign public-key packet base64: %s", (_label, packet) => {
+    expect(() =>
+      verifyTauriMinisign(Buffer.from("test"), TAURI_SIGNATURE, encodePublicKeyEnvelope(packet)),
+    ).toThrow(/minisign public key packet is not canonical base64/);
+  });
+
+  it.each([
+    ["prefix", `!${RAW_SIGNATURE_PACKET}`],
+    ["whitespace", `${RAW_SIGNATURE_PACKET.slice(0, 12)} ${RAW_SIGNATURE_PACKET.slice(12)}`],
+    ["trailing garbage", `${RAW_SIGNATURE_PACKET}!`],
+    ["non-zero pad bits", replaceLastDataCharacter(RAW_SIGNATURE_PACKET, "p")],
+  ])("rejects non-canonical minisign signature-packet base64: %s", (_label, packet) => {
+    const signature = encodeSignatureEnvelope({
+      packet,
+      globalSignature: RAW_GLOBAL_SIGNATURE,
+    });
+    expect(() => verifyTauriMinisign(Buffer.from("test"), signature, TAURI_PUBLIC_KEY)).toThrow(
+      /minisign signature packet is not canonical base64/,
+    );
+  });
+
+  it.each([
+    ["prefix", `!${RAW_GLOBAL_SIGNATURE}`],
+    ["whitespace", `${RAW_GLOBAL_SIGNATURE.slice(0, 12)} ${RAW_GLOBAL_SIGNATURE.slice(12)}`],
+    ["trailing garbage", `${RAW_GLOBAL_SIGNATURE}!`],
+    ["non-zero pad bits", replaceLastDataCharacter(RAW_GLOBAL_SIGNATURE, "R")],
+  ])("rejects non-canonical minisign global-signature base64: %s", (_label, globalSignature) => {
+    const signature = encodeSignatureEnvelope({
+      packet: RAW_SIGNATURE_PACKET,
+      globalSignature,
+    });
+    expect(() => verifyTauriMinisign(Buffer.from("test"), signature, TAURI_PUBLIC_KEY)).toThrow(
+      /minisign global signature is not canonical base64/,
+    );
   });
 
   it("reuses the exact first-stage signature on a release rerun", async () => {

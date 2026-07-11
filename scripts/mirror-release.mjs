@@ -27,6 +27,9 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 const DEFAULT_MIRROR_BASE = "https://codexapp.agentsmirror.com/manager";
 const LATEST_KEY = "latest.json";
+const ROOT_IDENTITY_KEY = "release-identity.json";
+const ROOT_IDENTITY_SIGNATURE_KEY = "release-identity.json.sig";
+const RELEASE_IDENTITY_SCHEMA_VERSION = 1;
 const SUMMARY_SCHEMA_VERSION = 1;
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 export const REQUIRED_UPDATER_PLATFORMS = [
@@ -365,6 +368,192 @@ function assertRequiredUpdaterPlatforms(manifest, label) {
   }
 }
 
+function assertSha256(value, label) {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest`);
+  }
+  return value;
+}
+
+export async function verifyLocalReleaseIdentity({
+  candidateManifest,
+  distDir,
+  expectedChannel,
+  publicKey,
+}) {
+  if (!["stable", "prerelease"].includes(expectedChannel)) {
+    throw new Error(
+      "release identity verification requires expectedChannel=stable or prerelease",
+    );
+  }
+  const parsedCandidateVersion = parseSemver(
+    assertManifestShape(candidateManifest, "release identity candidate"),
+  );
+  const candidateVersion = parsedCandidateVersion.raw;
+  const semanticChannel =
+    parsedCandidateVersion.prerelease.length > 0 ? "prerelease" : "stable";
+  if (semanticChannel !== expectedChannel) {
+    throw new Error(
+      `release identity expected channel=${expectedChannel} but version ${candidateVersion} is ${semanticChannel}`,
+    );
+  }
+  if (candidateManifest.channel !== expectedChannel) {
+    throw new Error(
+      `release identity candidate channel must be ${expectedChannel}, got ${candidateManifest.channel || "missing"}`,
+    );
+  }
+  if (typeof candidateManifest.notes !== "string") {
+    throw new Error("release identity candidate must contain release notes");
+  }
+
+  const identityPath = join(resolve(distDir), ROOT_IDENTITY_KEY);
+  const signaturePath = join(resolve(distDir), ROOT_IDENTITY_SIGNATURE_KEY);
+  const identity = await readJson(identityPath, ROOT_IDENTITY_KEY);
+  if (identity.schema !== RELEASE_IDENTITY_SCHEMA_VERSION) {
+    throw new Error(
+      `${ROOT_IDENTITY_KEY} schema must be ${RELEASE_IDENTITY_SCHEMA_VERSION}`,
+    );
+  }
+  if (identity.channel !== expectedChannel) {
+    throw new Error(
+      `${ROOT_IDENTITY_KEY} channel must be ${expectedChannel}, got ${identity.channel || "missing"}`,
+    );
+  }
+  if (parseSemver(identity.version).raw !== candidateVersion) {
+    throw new Error(
+      `${ROOT_IDENTITY_KEY} version ${identity.version} does not match candidate ${candidateVersion}`,
+    );
+  }
+  const expectedNotesSha256 = createHash("sha256")
+    .update(candidateManifest.notes, "utf8")
+    .digest("hex");
+  if (
+    assertSha256(identity.notes_sha256, `${ROOT_IDENTITY_KEY} notes_sha256`) !==
+    expectedNotesSha256
+  ) {
+    throw new Error(`${ROOT_IDENTITY_KEY} notes_sha256 does not match candidate notes`);
+  }
+  if (
+    !identity.platforms ||
+    typeof identity.platforms !== "object" ||
+    Array.isArray(identity.platforms)
+  ) {
+    throw new Error(`${ROOT_IDENTITY_KEY} has no platforms object`);
+  }
+
+  const candidatePlatforms = Object.keys(candidateManifest.platforms).sort();
+  const identityPlatforms = Object.keys(identity.platforms).sort();
+  if (JSON.stringify(identityPlatforms) !== JSON.stringify(candidatePlatforms)) {
+    throw new Error(
+      `${ROOT_IDENTITY_KEY} platforms do not exactly match the stable mirror candidate`,
+    );
+  }
+  const seenArtifacts = new Set();
+  for (const platform of candidatePlatforms) {
+    const manifestEntry = candidateManifest.platforms[platform];
+    const identityEntry = identity.platforms[platform];
+    if (
+      !identityEntry ||
+      typeof identityEntry !== "object" ||
+      Array.isArray(identityEntry)
+    ) {
+      throw new Error(`${ROOT_IDENTITY_KEY} platform ${platform} is invalid`);
+    }
+    if (typeof identityEntry.artifact !== "string") {
+      throw new Error(
+        `${ROOT_IDENTITY_KEY} platform ${platform} is missing artifact`,
+      );
+    }
+    const artifact = assertSafeSegment(
+      identityEntry.artifact,
+      `${ROOT_IDENTITY_KEY} platform ${platform} artifact`,
+    );
+    if (seenArtifacts.has(artifact)) {
+      throw new Error(`${ROOT_IDENTITY_KEY} reuses artifact ${artifact}`);
+    }
+    seenArtifacts.add(artifact);
+    const manifestArtifact = decodeURIComponent(
+      new URL(manifestEntry.url).pathname.split("/").filter(Boolean).at(-1) || "",
+    );
+    if (artifact !== manifestArtifact) {
+      throw new Error(
+        `${ROOT_IDENTITY_KEY} platform ${platform} artifact does not match candidate URL`,
+      );
+    }
+    const artifactPath = join(resolve(distDir), artifact);
+    const artifactMetadata = await stat(artifactPath).catch((error) => {
+      throw new Error(
+        `${ROOT_IDENTITY_KEY} platform ${platform} artifact is missing: ${errorText(error)}`,
+      );
+    });
+    if (!artifactMetadata.isFile() || artifactMetadata.size <= 0) {
+      throw new Error(`${ROOT_IDENTITY_KEY} platform ${platform} artifact is empty`);
+    }
+    const expectedArtifactSha256 = assertSha256(
+      identityEntry.sha256,
+      `${ROOT_IDENTITY_KEY} platform ${platform} sha256`,
+    );
+    const localArtifactSha256 = await sha256File(artifactPath);
+    if (localArtifactSha256 !== expectedArtifactSha256) {
+      throw new Error(
+        `${ROOT_IDENTITY_KEY} platform ${platform} sha256 does not match local artifact`,
+      );
+    }
+    if (
+      manifestEntry.sha256 !== undefined &&
+      manifestEntry.sha256 !== expectedArtifactSha256
+    ) {
+      throw new Error(
+        `${ROOT_IDENTITY_KEY} platform ${platform} sha256 does not match candidate manifest`,
+      );
+    }
+  }
+
+  let signature;
+  try {
+    signature = (await readFile(signaturePath, "utf8")).trim();
+  } catch (error) {
+    throw new Error(
+      `${ROOT_IDENTITY_SIGNATURE_KEY} is missing: ${errorText(error)}`,
+    );
+  }
+  if (!signature) throw new Error(`${ROOT_IDENTITY_SIGNATURE_KEY} is empty`);
+  await verifyTauriUpdaterSignature(identityPath, signature, publicKey);
+  const [identitySha256, signatureSha256, identityMetadata, signatureMetadata] =
+    await Promise.all([
+      sha256File(identityPath),
+      sha256File(signaturePath),
+      stat(identityPath),
+      stat(signaturePath),
+    ]);
+  return {
+    identity,
+    identityPath,
+    identitySha256,
+    identitySize: identityMetadata.size,
+    signature,
+    signaturePath,
+    signatureSha256,
+    signatureSize: signatureMetadata.size,
+  };
+}
+
+async function loadStableReleaseIdentity(options) {
+  if (options.candidateManifest.channel !== "stable") {
+    throw new Error(
+      `root release identity accepts only channel=stable, got ${options.candidateManifest.channel || "missing"}`,
+    );
+  }
+  assertRequiredUpdaterPlatforms(
+    options.candidateManifest,
+    "stable mirror candidate",
+  );
+  return await verifyLocalReleaseIdentity({
+    ...options,
+    expectedChannel: "stable",
+  });
+}
+
 export function assertCandidateMatchesRelease(candidateManifest, artifactManifest, releaseTag) {
   const tag = String(releaseTag);
   if (!tag.startsWith("v")) {
@@ -683,6 +872,112 @@ export async function verifyPublicMirrorRoute({
   };
 }
 
+async function verifyPublicRootIdentityBackend({
+  backend,
+  bundle,
+  candidateKey,
+  fetchImpl,
+  mirrorBase,
+  publicDir,
+  publicKey,
+}) {
+  const base = normalizeMirrorBase(mirrorBase);
+  const backendDir = join(publicDir, backend);
+  const publicIdentityPath = join(backendDir, ROOT_IDENTITY_KEY);
+  const publicSignaturePath = join(backendDir, ROOT_IDENTITY_SIGNATURE_KEY);
+  const identityResponse = await downloadPublicObject(
+    fetchImpl,
+    publicProbeUrl(`${base}/${ROOT_IDENTITY_KEY}`, candidateKey, backend),
+    publicIdentityPath,
+    "root release identity",
+    backend,
+  );
+  const signatureResponse = await downloadPublicObject(
+    fetchImpl,
+    publicProbeUrl(
+      `${base}/${ROOT_IDENTITY_SIGNATURE_KEY}`,
+      candidateKey,
+      backend,
+    ),
+    publicSignaturePath,
+    "root release identity signature",
+    backend,
+  );
+  const [identitySha256, signatureSha256] = await Promise.all([
+    sha256File(publicIdentityPath),
+    sha256File(publicSignaturePath),
+  ]);
+  if (
+    identityResponse.size !== bundle.identitySize ||
+    identitySha256 !== bundle.identitySha256
+  ) {
+    throw new Error(
+      `public mirror ${backend} root release identity does not match this release run`,
+    );
+  }
+  if (
+    signatureResponse.size !== bundle.signatureSize ||
+    signatureSha256 !== bundle.signatureSha256
+  ) {
+    throw new Error(
+      `public mirror ${backend} root release identity signature does not match this release run`,
+    );
+  }
+  const signature = (await readFile(publicSignaturePath, "utf8")).trim();
+  await verifyTauriUpdaterSignature(publicIdentityPath, signature, publicKey);
+  const publicIdentity = await readJson(
+    publicIdentityPath,
+    `public mirror ${backend} root release identity`,
+  );
+  if (
+    publicIdentity.schema !== RELEASE_IDENTITY_SCHEMA_VERSION ||
+    publicIdentity.channel !== "stable" ||
+    publicIdentity.version !== bundle.identity.version
+  ) {
+    throw new Error(
+      `public mirror ${backend} root release identity has an unexpected schema/channel/version`,
+    );
+  }
+  return {
+    backend,
+    channel: publicIdentity.channel,
+    identitySha256,
+    identitySize: identityResponse.size,
+    signatureSha256,
+    signatureSize: signatureResponse.size,
+    verified: true,
+    version: publicIdentity.version,
+  };
+}
+
+export async function verifyPublicRootIdentityPointers({
+  bundle,
+  candidateKey,
+  fetchImpl = fetch,
+  mirrorBase,
+  publicKey,
+  workDir,
+}) {
+  const backends = {};
+  for (const backend of ["r2", "ihep"]) {
+    backends[backend] = await verifyPublicRootIdentityBackend({
+      backend,
+      bundle,
+      candidateKey,
+      fetchImpl,
+      mirrorBase,
+      publicDir: join(workDir, "root-identity"),
+      publicKey,
+    });
+  }
+  return {
+    backendCount: Object.keys(backends).length,
+    backends,
+    verified: Object.values(backends).every((report) => report.verified),
+    version: bundle.identity.version,
+  };
+}
+
 function isNotFound(text) {
   return /(?:\b404\b|NoSuchKey|Not Found|does not exist)/i.test(text);
 }
@@ -918,6 +1213,19 @@ export class AwsObjectStore {
   async putLatestUnconditional(localPath, promotionToken = "") {
     return await this.putObject(localPath, LATEST_KEY, {
       contentType: "application/json",
+      ...(promotionToken
+        ? { metadata: { "cam-promotion-token": promotionToken } }
+        : {}),
+      singleAttempt: true,
+    });
+  }
+
+  async putRootIdentityPointer(localPath, key, promotionToken = "") {
+    if (![ROOT_IDENTITY_KEY, ROOT_IDENTITY_SIGNATURE_KEY].includes(key)) {
+      throw new Error(`unsupported root identity pointer key: ${key}`);
+    }
+    return await this.putObject(localPath, key, {
+      contentType: contentType(key),
       ...(promotionToken
         ? { metadata: { "cam-promotion-token": promotionToken } }
         : {}),
@@ -1892,6 +2200,230 @@ export async function promoteCandidateTransaction({
   }
 }
 
+async function assertBackendLatestIsStableCandidate({
+  backend,
+  candidateManifest,
+  destination,
+}) {
+  const snapshot = await backend.snapshot(LATEST_KEY, destination);
+  if (!snapshot.exists) {
+    throw new Error(`${backend.name}: latest.json disappeared before root identity promotion`);
+  }
+  const latest = await readJson(
+    snapshot.path,
+    `${backend.name} latest.json before root identity promotion`,
+  );
+  if (
+    latest.channel !== "stable" ||
+    latest.version !== candidateManifest.version ||
+    manifestReleaseIdentity(latest) !== manifestReleaseIdentity(candidateManifest)
+  ) {
+    throw new ConditionalWriteError(
+      `${backend.name}: latest.json no longer exposes the stable candidate before root identity promotion`,
+    );
+  }
+  return snapshot;
+}
+
+async function assertRootPointerSnapshot({
+  backend,
+  destination,
+  expectedPath,
+  key,
+  promotionToken,
+}) {
+  const snapshot = await backend.snapshot(key, destination);
+  if (!snapshot.exists || !(await snapshotMatchesFile(snapshot, expectedPath))) {
+    throw new Error(`${backend.name}: root identity pointer readback mismatch for ${key}`);
+  }
+  if (snapshot.metadata?.["cam-promotion-token"] !== promotionToken) {
+    throw new Error(`${backend.name}: root identity pointer lost promotion metadata for ${key}`);
+  }
+  return snapshot;
+}
+
+async function verifyBackendRootIdentityPointer({
+  backend,
+  bundle,
+  candidateManifest,
+  promotionToken,
+  publicKey,
+  workDir,
+}) {
+  const backendDir = join(workDir, backend.name);
+  await mkdir(backendDir, { recursive: true });
+  await assertBackendLatestIsStableCandidate({
+    backend,
+    candidateManifest,
+    destination: join(backendDir, "latest.json"),
+  });
+  const identitySnapshot = await assertRootPointerSnapshot({
+    backend,
+    destination: join(backendDir, ROOT_IDENTITY_KEY),
+    expectedPath: bundle.identityPath,
+    key: ROOT_IDENTITY_KEY,
+    promotionToken,
+  });
+  const signatureSnapshot = await assertRootPointerSnapshot({
+    backend,
+    destination: join(backendDir, ROOT_IDENTITY_SIGNATURE_KEY),
+    expectedPath: bundle.signaturePath,
+    key: ROOT_IDENTITY_SIGNATURE_KEY,
+    promotionToken,
+  });
+  const signature = (await readFile(signatureSnapshot.path, "utf8")).trim();
+  await verifyTauriUpdaterSignature(identitySnapshot.path, signature, publicKey);
+  const remoteIdentity = await readJson(
+    identitySnapshot.path,
+    `${backend.name} root release identity`,
+  );
+  if (
+    remoteIdentity.schema !== RELEASE_IDENTITY_SCHEMA_VERSION ||
+    remoteIdentity.channel !== "stable" ||
+    remoteIdentity.version !== candidateManifest.version
+  ) {
+    throw new Error(
+      `${backend.name}: root release identity has an unexpected schema/channel/version`,
+    );
+  }
+  return {
+    channel: remoteIdentity.channel,
+    identityEtag: identitySnapshot.etag,
+    identitySha256: bundle.identitySha256,
+    signatureEtag: signatureSnapshot.etag,
+    signatureSha256: bundle.signatureSha256,
+    verified: true,
+    version: remoteIdentity.version,
+  };
+}
+
+export async function promoteStableIdentityPointers({
+  backends,
+  bundle,
+  candidateKey,
+  candidateManifest,
+  fetchImpl = fetch,
+  mirrorBase,
+  promotionToken,
+  publicKey,
+  summary,
+  workDir,
+}) {
+  const summaryByName = new Map(summary.backends.map((entry) => [entry.name, entry]));
+  for (const backend of backends) {
+    const backendSummary = summaryByName.get(backend.name);
+    if (!backendSummary) throw new Error(`missing summary row for ${backend.name}`);
+    backendSummary.rootIdentity = {
+      directVerification: "not-started",
+      jsonWrite: "not-started",
+      publicVerification: "not-started",
+      signatureWrite: "not-started",
+    };
+    if (typeof backend.putRootIdentityPointer !== "function") {
+      throw new Error(`${backend.name}: backend cannot write root identity pointers`);
+    }
+  }
+
+  const directRoot = join(workDir, "direct");
+  for (const backend of backends) {
+    await assertBackendLatestIsStableCandidate({
+      backend,
+      candidateManifest,
+      destination: join(directRoot, backend.name, "pre-signature-latest.json"),
+    });
+  }
+
+  // Write both signatures first. Until the matching JSON lands, clients either
+  // still verify the old pair or reject the mismatched pair and fall back to
+  // GitHub. Never roll these mutable pointers back: a retry safely rewrites the
+  // same signed pair after latest.json has already committed monotonically.
+  for (const backend of backends) {
+    const pointerSummary = summaryByName.get(backend.name).rootIdentity;
+    try {
+      await backend.putRootIdentityPointer(
+        bundle.signaturePath,
+        ROOT_IDENTITY_SIGNATURE_KEY,
+        promotionToken,
+      );
+      await assertRootPointerSnapshot({
+        backend,
+        destination: join(
+          directRoot,
+          backend.name,
+          `signature-phase-${ROOT_IDENTITY_SIGNATURE_KEY}`,
+        ),
+        expectedPath: bundle.signaturePath,
+        key: ROOT_IDENTITY_SIGNATURE_KEY,
+        promotionToken,
+      });
+      pointerSummary.signatureWrite = "written-and-verified";
+    } catch (error) {
+      pointerSummary.signatureWrite = "failed";
+      pointerSummary.error = safeSummaryError(error);
+      throw error;
+    }
+  }
+
+  for (const backend of backends) {
+    const pointerSummary = summaryByName.get(backend.name).rootIdentity;
+    try {
+      await assertBackendLatestIsStableCandidate({
+        backend,
+        candidateManifest,
+        destination: join(directRoot, backend.name, "pre-json-latest.json"),
+      });
+      await backend.putRootIdentityPointer(
+        bundle.identityPath,
+        ROOT_IDENTITY_KEY,
+        promotionToken,
+      );
+      pointerSummary.jsonWrite = "written";
+      pointerSummary.directVerification = "running";
+      pointerSummary.direct = await verifyBackendRootIdentityPointer({
+        backend,
+        bundle,
+        candidateManifest,
+        promotionToken,
+        publicKey,
+        workDir: directRoot,
+      });
+      pointerSummary.directVerification = "passed";
+      pointerSummary.jsonWrite = "written-and-verified";
+    } catch (error) {
+      if (pointerSummary.jsonWrite === "not-started") {
+        pointerSummary.jsonWrite = "failed";
+      }
+      pointerSummary.directVerification = "failed";
+      pointerSummary.error = safeSummaryError(error);
+      throw error;
+    }
+  }
+
+  summary.rootIdentity.publicRouteVerification = "running";
+  try {
+    summary.rootIdentity.publicRoute = await verifyPublicRootIdentityPointers({
+      bundle,
+      candidateKey,
+      fetchImpl,
+      mirrorBase,
+      publicKey,
+      workDir: join(workDir, "public"),
+    });
+    summary.rootIdentity.publicRouteVerification = "passed";
+    for (const backend of backends) {
+      const pointerSummary = summaryByName.get(backend.name).rootIdentity;
+      pointerSummary.publicVerification = "passed";
+      pointerSummary.public =
+        summary.rootIdentity.publicRoute.backends[backend.name];
+    }
+  } catch (error) {
+    summary.rootIdentity.publicRouteVerification = "failed";
+    summary.rootIdentity.publicRouteError = safeSummaryError(error);
+    throw error;
+  }
+  return summary.rootIdentity;
+}
+
 function mirrorVerificationRows(backends, includeTransaction = false) {
   return backends.map((backend) => ({
     name: backend.name,
@@ -2037,7 +2569,23 @@ export async function promoteMirrors({
   const summary = initialSummary("promote", version, candidateKey, override);
   summary.backends = mirrorVerificationRows(backends, true);
   summary.publicRouteVerification = "not-started";
+  summary.rootIdentity = {
+    channel: "stable",
+    localVerification: "not-started",
+    publicRouteVerification: "not-started",
+    version,
+  };
   try {
+    summary.rootIdentity.localVerification = "running";
+    const identityBundle = await loadStableReleaseIdentity({
+      candidateManifest,
+      distDir,
+      publicKey,
+    });
+    summary.rootIdentity.localVerification = "passed";
+    summary.rootIdentity.identitySha256 = identityBundle.identitySha256;
+    summary.rootIdentity.signatureSha256 = identityBundle.signatureSha256;
+
     const { promotionToken } = await verifyMirrorCandidates({
       backends,
       candidateKey,
@@ -2061,9 +2609,26 @@ export async function promoteMirrors({
       hooks,
       promotionToken,
     });
+    summary.rootIdentity.latestTransactionOutcome = transaction.outcome;
+    await promoteStableIdentityPointers({
+      backends,
+      bundle: identityBundle,
+      candidateKey,
+      candidateManifest,
+      fetchImpl,
+      mirrorBase,
+      promotionToken,
+      publicKey,
+      summary,
+      workDir: join(tempRoot, "root-identity"),
+    });
     await finishSummary(summaryPath, summary, transaction.outcome);
     return summary;
   } catch (error) {
+    if (summary.rootIdentity.localVerification === "running") {
+      summary.rootIdentity.localVerification = "failed";
+      summary.rootIdentity.error = safeSummaryError(error);
+    }
     const outcome =
       error instanceof DowngradeBlockedError
         ? "blocked-downgrade"

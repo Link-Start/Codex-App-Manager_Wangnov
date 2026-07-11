@@ -48,18 +48,22 @@ Omit the `AC_API_*` vars to skip notarization for a quick local dev finalize.
 `latest.json` contains provider-specific download URLs, so the R2/IHEP copy is
 intentionally not byte-identical to GitHub's copy and is not itself a trust
 anchor. `gen-updater-manifest.mjs` also emits a deterministic, URL-free
-`release-identity.json` containing the version, release-note hash, exact target
-artifact name, Tauri minisign signature, and SHA-256. The release workflow signs
-that identity with the existing Tauri updater key and publishes the identity and
-`.sig` as immutable `<version>/` assets on GitHub, R2, and IHEP.
+`release-identity.json` containing the channel, version, release-note hash, exact
+target artifact names, and SHA-256 values. The release workflow signs that
+identity with the existing Tauri updater key, publishes it as a GitHub Release
+asset, stages immutable `<version>/` copies on R2/IHEP, and promotes a root
+`release-identity.json(.sig)` pair only after the immutable GitHub Release and
+mirror `latest.json` pointer are committed.
 
-The client still checks the mainland-friendly mirror first. Before displaying or
-installing a candidate, it bounded-fetches the same source's versioned identity
-and signature, verifies them with the pinned updater public key, and binds every
-security-relevant manifest field to that identity. Artifact bytes then pass both
-the normal Tauri minisign check and the signed SHA-256 before `Update::install`.
-Any missing, oversized, invalid, or mismatched mirror response falls through to
-the GitHub endpoint; installation still occurs at most once.
+The client still checks the mainland-friendly mirror first. It bounded-fetches
+and verifies that source's root identity **before** reading unsigned `latest.json`,
+accepts only a signed `stable` channel, then requires the manifest version,
+channel, notes, platform set, artifact basenames, and SHA-256 values to match.
+This prevents an unsigned manifest from selecting an old/prerelease signed
+identity. Artifact bytes then pass both the normal Tauri minisign check and the
+signed SHA-256 before `Update::install`. Any missing, oversized, invalid, or
+mismatched mirror response falls through to GitHub; installation still occurs at
+most once.
 
 Hard in-memory limits are 256 KiB for manifests/identity, 16 KiB for the identity
 signature, and 64 MiB for updater artifacts. For comparison, v0.3.1's largest
@@ -167,8 +171,12 @@ Before `prepare` permits any build, and again at the start of every release-job
 attempt, the workflow queries the repository Immutable Releases setting with a
 dedicated fine-grained, read-only token. A missing token, failed query, or
 `enabled: false` response fails closed before draft upload or mirror publication.
+The same token verifies an active repository ruleset that forbids update and
+deletion of `refs/tags/v*`; the workflow re-peels the live tag during prepare,
+immediately before draft upload, and again before publication.
 
-Same-tag reruns reuse the artifacts and `latest.json` attached to a complete,
+Same-tag reruns reuse the artifacts, signed release identity, and `latest.json`
+attached to a complete,
 published GitHub Release only when GitHub reports `immutable: true` and a canonical
 `sha256:` digest for every required asset. The workflow re-hashes every downloaded
 asset against those API digests, and rejects a mutable release instead of calling
@@ -188,6 +196,11 @@ historical Actions run still executes its historical workflow revision, so the
 release environment intentionally uses new `*_PROMOTION_*` credential names. The
 four legacy access-key secrets listed below must be deleted; the current workflow
 has a hard gate that rejects them if they are reintroduced.
+
+Stable mirror promotion commits `latest.json` first, then writes the root
+identity signature followed by its JSON. Any interrupted or mixed generation
+fails verification and makes the client fall back to GitHub; a rerun repairs the
+root pair and verifies both direct storage backends and both public Worker routes.
 
 ### Emergency mirror downgrade
 

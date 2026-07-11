@@ -7,12 +7,18 @@ const SIGNATURE_PACKET_BYTES = 74;
 const ED25519_SIGNATURE_BYTES = 64;
 const TRUSTED_COMMENT_PREFIX = "trusted comment: ";
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 const decodeBase64 = (value, label) => {
-  const compact = String(value).trim();
-  if (!compact) throw new Error(`${label} is empty`);
-  const decoded = Buffer.from(compact, "base64");
-  if (decoded.length === 0) throw new Error(`${label} is not valid base64`);
+  const encoded = String(value);
+  if (!encoded) throw new Error(`${label} is empty`);
+  if (!CANONICAL_BASE64.test(encoded)) {
+    throw new Error(`${label} is not canonical base64`);
+  }
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.toString("base64") !== encoded) {
+    throw new Error(`${label} is not canonical base64`);
+  }
   return decoded;
 };
 

@@ -110,7 +110,12 @@ export function assertReleaseSourceVersions(releaseTag, sourceRoot) {
 
 export function assertLocalReleaseArtifactNames(releaseTag, artifactsDir) {
   const version = releaseVersionFromTag(releaseTag);
-  const expected = requiredReleaseAssetNames(releaseTag).filter((name) => name !== "latest.json");
+  // latest.json and its signed channel identity are derived only after the
+  // platform matrix has been collected. This gate validates the exact build
+  // artifact set that those files will authorize.
+  const expected = requiredReleaseAssetNames(releaseTag).filter(
+    (name) => name !== "latest.json" && !name.startsWith("release-identity.json"),
+  );
   const dir = resolve(artifactsDir);
   const files = readdirSync(dir, { withFileTypes: true })
     .filter((entry) => entry.isFile())

@@ -15,25 +15,60 @@ if (!tag || !dir) {
   console.error("usage: gen-updater-manifest.mjs <tag> <artifacts-dir>");
   process.exit(2);
 }
-const version = tag.replace(/^v/, "");
+
+const parseReleaseTag = (rawTag) => {
+  const match =
+    /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(
+      rawTag,
+    );
+  if (!match) return null;
+  const prerelease = match[4];
+  if (
+    prerelease
+      ?.split(".")
+      .some(
+        (identifier) => /^\d+$/.test(identifier) && /^0\d+/.test(identifier),
+      )
+  ) {
+    return null;
+  }
+  return {
+    version: rawTag.slice(1),
+    channel: prerelease ? "prerelease" : "stable",
+  };
+};
+
+const release = parseReleaseTag(tag);
+if (!release) {
+  console.error(
+    `[manifest] tag must be a canonical SemVer tag prefixed with v: ${tag}`,
+  );
+  process.exit(1);
+}
+const { version, channel } = release;
 const REPO = "Wangnov/Codex-App-Manager";
 const releaseNotesPath = join("docs", "releases", `${tag}.md`);
 const updaterNotes = (markdown) => {
   // Release pages start with a GitHub-only banner and end with the fixed
   // download/signature table. The in-app sheet needs the reviewed summary and
   // user-visible changes, not raw HTML or another set of install links.
-  const withoutBanner = markdown.replace(/^\s*<p\s+align="center">[\s\S]*?<\/p>\s*/i, "");
+  const withoutBanner = markdown.replace(
+    /^\s*<p\s+align="center">[\s\S]*?<\/p>\s*/i,
+    "",
+  );
   return withoutBanner.split(/^##\s+📦\s+/m, 1)[0].trim();
 };
 const notes = existsSync(releaseNotesPath)
-  ? updaterNotes(readFileSync(releaseNotesPath, "utf8")) || `Codex App Manager ${tag}`
+  ? updaterNotes(readFileSync(releaseNotesPath, "utf8")) ||
+    `Codex App Manager ${tag}`
   : `Codex App Manager ${tag}`;
 const downloadUrl = (file) =>
   `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(file)}`;
 
 const files = readdirSync(dir);
 const findSig = (re) => files.find((f) => re.test(f) && f.endsWith(".sig"));
-const sha256File = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+const sha256File = (path) =>
+  createHash("sha256").update(readFileSync(path)).digest("hex");
 
 // Tauri updater platform keys → how to spot that platform's signed bundle.
 const MATCHERS = [
@@ -56,19 +91,23 @@ for (const [key, re] of MATCHERS) {
   const bundle = sig.replace(/\.sig$/, "");
   const bundlePath = join(dir, bundle);
   if (!existsSync(bundlePath)) {
-    console.error(`[manifest] signature ${sig} resolved ${bundle}, but the bundle is missing`);
+    console.error(
+      `[manifest] signature ${sig} resolved ${bundle}, but the bundle is missing`,
+    );
     process.exit(1);
   }
   const url = downloadUrl(bundle);
+  const sha256 = sha256File(bundlePath);
   platforms[key] = {
     signature: readFileSync(join(dir, sig), "utf8").trim(),
+    sha256,
     url,
   };
   resolved.push({
     platform: key,
     artifact: bundle,
     signature_file: sig,
-    sha256: sha256File(bundlePath),
+    sha256,
     url,
   });
 }
@@ -83,14 +122,19 @@ if (missing.length > 0) {
   const message = `[manifest] missing required platform artifacts: ${missing.join(", ")}`;
   if (!allowPartialRelease) {
     console.error(message);
-    console.error("[manifest] set ALLOW_PARTIAL_RELEASE=1 only for an intentional one-off partial release");
+    console.error(
+      "[manifest] set ALLOW_PARTIAL_RELEASE=1 only for an intentional one-off partial release",
+    );
     process.exit(1);
   }
-  console.warn(`::warning::partial release allowed: missing ${missing.join(", ")}`);
+  console.warn(
+    `::warning::partial release allowed: missing ${missing.join(", ")}`,
+  );
 }
 
 const manifest = {
   version,
+  channel,
   // The same reviewed release note shown on GitHub powers the in-app details
   // view. Older/fallback builds still receive a short non-empty label.
   notes,
@@ -107,25 +151,30 @@ writeFileSync("latest.json", JSON.stringify(manifest, null, 2));
 // `latest.json` remains URL-rewritten on the CN mirror for compatibility with
 // already-shipped clients, so it cannot itself have one cross-provider
 // signature. Sign this deterministic URL-free identity instead. New clients
-// require the identity before trusting any mirror's version/signature claim.
+// require the identity before trusting any mirror's version/artifact claim.
 // Deliberately exclude pub_date/build time so a rerun for the same release
 // produces byte-identical identity JSON.
 const releaseIdentity = {
   schema: 1,
   version,
+  channel,
   notes_sha256: createHash("sha256").update(notes, "utf8").digest("hex"),
+  // The updater verifies the manifest's Minisign signature independently;
+  // this authority binds the exact artifact bytes without duplicating it.
   platforms: Object.fromEntries(
     resolved.map(({ platform, artifact, sha256 }) => [
       platform,
       {
         artifact,
-        signature: platforms[platform].signature,
         sha256,
       },
     ]),
   ),
 };
-writeFileSync("release-identity.json", JSON.stringify(releaseIdentity, null, 2) + "\n");
+writeFileSync(
+  "release-identity.json",
+  JSON.stringify(releaseIdentity, null, 2) + "\n",
+);
 writeFileSync(
   "manifest-summary.json",
   JSON.stringify(
@@ -147,4 +196,6 @@ writeFileSync(
   ) + "\n",
 );
 console.log("wrote latest.json:\n" + JSON.stringify(manifest, null, 2));
-console.log("wrote release-identity.json:\n" + JSON.stringify(releaseIdentity, null, 2));
+console.log(
+  "wrote release-identity.json:\n" + JSON.stringify(releaseIdentity, null, 2),
+);

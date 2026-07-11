@@ -191,14 +191,23 @@ const MANAGER_UPDATE_IDENTITY_SIGNATURE_FILE: &str = "release-identity.json.sig"
 struct ManagerReleaseIdentity {
     schema: u32,
     version: String,
+    channel: ManagerReleaseChannel,
     notes_sha256: String,
     platforms: HashMap<String, ManagerReleaseIdentityPlatform>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ManagerReleaseChannel {
+    Stable,
+    Prerelease,
 }
 
 #[derive(Debug, Deserialize)]
 struct ManagerReleaseIdentityPlatform {
     artifact: String,
-    signature: String,
+    // The patched updater verifies the manifest-provided Minisign signature;
+    // the signed authority independently binds the exact artifact bytes.
     sha256: String,
 }
 
@@ -362,18 +371,63 @@ async fn fetch_manager_update_file_limited(
     Ok(bytes)
 }
 
+fn is_safe_manager_update_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename != "."
+        && filename != ".."
+        && filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn manager_update_root_url(
+    manifest_endpoint: &url::Url,
+    filename: &str,
+) -> Result<url::Url, AppError> {
+    if !is_safe_manager_update_filename(filename) {
+        return Err(AppError::Engine(
+            "signed manager update identity contains an unsafe artifact name".to_string(),
+        ));
+    }
+
+    let mut url = manifest_endpoint.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let base_segments = manifest_endpoint
+        .path_segments()
+        .ok_or_else(|| AppError::Engine("manager updater endpoint has no path".to_string()))?
+        .collect::<Vec<_>>();
+    let Some((manifest_name, directories)) = base_segments.split_last() else {
+        return Err(AppError::Engine(
+            "manager updater endpoint has no manifest filename".to_string(),
+        ));
+    };
+    if *manifest_name != "latest.json" {
+        return Err(AppError::Engine(
+            "manager updater endpoint must end in latest.json".to_string(),
+        ));
+    }
+    url.set_path("");
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            AppError::Engine("manager updater endpoint cannot be a base URL".to_string())
+        })?;
+        for segment in directories {
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
+        segments.push(filename);
+    }
+    Ok(url)
+}
+
 fn manager_update_versioned_url(
     manifest_endpoint: &url::Url,
     version: &str,
     filename: &str,
 ) -> Result<url::Url, AppError> {
-    let safe_filename = !filename.is_empty()
-        && filename != "."
-        && filename != ".."
-        && filename
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    if !safe_filename {
+    if !is_safe_manager_update_filename(filename) {
         return Err(AppError::Engine(
             "signed manager update identity contains an unsafe artifact name".to_string(),
         ));
@@ -428,15 +482,39 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn validate_manager_release_identity_authority(
+    identity: &ManagerReleaseIdentity,
+) -> Result<(), AppError> {
+    if identity.schema != MANAGER_UPDATE_IDENTITY_SCHEMA {
+        return Err(AppError::Engine(
+            "signed manager update identity has an unsupported schema".to_string(),
+        ));
+    }
+    if identity.channel != ManagerReleaseChannel::Stable
+        || identity
+            .version
+            .split_once('+')
+            .map_or(identity.version.as_str(), |(version, _)| version)
+            .contains('-')
+    {
+        return Err(AppError::Engine(
+            "stable manager updater rejects prerelease release identity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_manager_update_identity_claim(
-    version: &str,
+    manifest_version: &str,
+    manifest_channel: &str,
     notes: Option<&str>,
     platform_key: &str,
     manifest_artifact: &str,
-    manifest_signature: &str,
+    manifest_sha256: &str,
     identity: &ManagerReleaseIdentity,
 ) -> Result<String, AppError> {
-    if identity.schema != MANAGER_UPDATE_IDENTITY_SCHEMA || identity.version != version {
+    validate_manager_release_identity_authority(identity)?;
+    if identity.version != manifest_version || manifest_channel != "stable" {
         return Err(AppError::Engine(
             "manager update manifest does not match the signed release identity".to_string(),
         ));
@@ -451,7 +529,7 @@ fn validate_manager_update_identity_claim(
             "signed manager update identity has no entry for this platform".to_string(),
         )
     })?;
-    if platform.artifact != manifest_artifact || platform.signature != manifest_signature {
+    if platform.artifact != manifest_artifact || platform.sha256 != manifest_sha256 {
         return Err(AppError::Engine(
             "manager update artifact does not match the signed release identity".to_string(),
         ));
@@ -469,22 +547,16 @@ fn validate_manager_update_identity_claim(
     Ok(platform.sha256.clone())
 }
 
-async fn authenticate_manager_update(
+async fn fetch_authenticated_manager_release_identity(
     client: &reqwest::Client,
     manifest_endpoint: &url::Url,
     pubkey: &str,
-    mut update: tauri_plugin_updater::Update,
-) -> Result<AuthenticatedManagerUpdate, AppError> {
-    let identity_url = manager_update_versioned_url(
-        manifest_endpoint,
-        &update.version,
-        MANAGER_UPDATE_IDENTITY_FILE,
-    )?;
-    let signature_url = manager_update_versioned_url(
-        manifest_endpoint,
-        &update.version,
-        MANAGER_UPDATE_IDENTITY_SIGNATURE_FILE,
-    )?;
+) -> Result<ManagerReleaseIdentity, AppError> {
+    // This root authority is deliberately independent of unsigned
+    // `latest.json`; the feed cannot select which signed identity is fetched.
+    let identity_url = manager_update_root_url(manifest_endpoint, MANAGER_UPDATE_IDENTITY_FILE)?;
+    let signature_url =
+        manager_update_root_url(manifest_endpoint, MANAGER_UPDATE_IDENTITY_SIGNATURE_FILE)?;
     let identity_bytes = fetch_manager_update_file_limited(
         client,
         identity_url,
@@ -508,18 +580,62 @@ async fn authenticate_manager_update(
         .map_err(|e| AppError::Engine(format!("verify manager release identity: {e}")))?;
     let identity: ManagerReleaseIdentity = serde_json::from_slice(&identity_bytes)
         .map_err(|e| AppError::Engine(format!("parse manager release identity: {e}")))?;
+    validate_manager_release_identity_authority(&identity)?;
+    Ok(identity)
+}
+
+fn manager_update_manifest_claim(
+    update: &tauri_plugin_updater::Update,
+) -> Result<(String, String, String), AppError> {
+    let version = update
+        .raw_json
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::Engine("manager update manifest has no version".to_string()))?;
+    let channel = update
+        .raw_json
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::Engine("manager update manifest has no channel".to_string()))?;
+    let sha256 = update
+        .raw_json
+        .get("platforms")
+        .and_then(|platforms| platforms.get(&update.platform))
+        .and_then(|platform| platform.get("sha256"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AppError::Engine(
+                "manager update manifest has no artifact digest for this platform".to_string(),
+            )
+        })?;
+    Ok((version.to_string(), channel.to_string(), sha256.to_string()))
+}
+
+fn authenticate_manager_update(
+    manifest_endpoint: &url::Url,
+    mut update: tauri_plugin_updater::Update,
+    identity: &ManagerReleaseIdentity,
+) -> Result<AuthenticatedManagerUpdate, AppError> {
+    let (manifest_version, manifest_channel, manifest_sha256) =
+        manager_update_manifest_claim(&update)?;
+    if update.version != manifest_version {
+        return Err(AppError::Engine(
+            "manager update manifest version was not parsed canonically".to_string(),
+        ));
+    }
     let manifest_artifact = update
         .download_url
         .path_segments()
         .and_then(|mut segments| segments.next_back())
         .unwrap_or_default();
     let artifact_sha256 = validate_manager_update_identity_claim(
-        &update.version,
+        &manifest_version,
+        &manifest_channel,
         update.body.as_deref(),
         &update.platform,
         manifest_artifact,
-        &update.signature,
-        &identity,
+        &manifest_sha256,
+        identity,
     )?;
     let artifact = identity
         .platforms
@@ -528,7 +644,7 @@ async fn authenticate_manager_update(
         .artifact
         .clone();
     update.download_url =
-        manager_update_versioned_url(manifest_endpoint, &update.version, &artifact)?;
+        manager_update_versioned_url(manifest_endpoint, &identity.version, &artifact)?;
     Ok(AuthenticatedManagerUpdate {
         update,
         artifact_sha256,
@@ -667,6 +783,12 @@ pub async fn manager_check_update(
         let pubkey = Arc::clone(&pubkey);
         let identity_client = identity_client.clone();
         async move {
+            let identity = fetch_authenticated_manager_release_identity(
+                &identity_client,
+                &endpoint,
+                pubkey.as_str(),
+            )
+            .await?;
             let updater =
                 manager_updater_builder_for_endpoints(&app, Some(vec![endpoint.clone()]))?
                     .build()
@@ -676,14 +798,7 @@ pub async fn manager_check_update(
                 .await
                 .map_err(|e| AppError::Engine(format!("check manager update: {e}")))?;
             match update {
-                Some(update) => authenticate_manager_update(
-                    &identity_client,
-                    &endpoint,
-                    pubkey.as_str(),
-                    update,
-                )
-                .await
-                .map(Some),
+                Some(update) => authenticate_manager_update(&endpoint, update, &identity).map(Some),
                 None => Ok(None),
             }
         }
@@ -800,6 +915,12 @@ pub async fn manager_install_update(
                         emit_manager_update_state(&app, snapshot);
                     }
 
+                    let identity = fetch_authenticated_manager_release_identity(
+                        &identity_client,
+                        &endpoint,
+                        pubkey.as_str(),
+                    )
+                    .await?;
                     let updater =
                         manager_updater_builder_for_endpoints(&app, Some(vec![endpoint.clone()]))?
                             .build()
@@ -815,13 +936,7 @@ pub async fn manager_install_update(
                                 "管理器更新内容已变化，请重新检查后再确认。".to_string(),
                             )
                         })?;
-                    let authenticated = authenticate_manager_update(
-                        &identity_client,
-                        &endpoint,
-                        pubkey.as_str(),
-                        update,
-                    )
-                    .await?;
+                    let authenticated = authenticate_manager_update(&endpoint, update, &identity)?;
                     let update = authenticated.update;
                     if !manager_update_matches_confirmation(
                         &update.version,
@@ -2510,10 +2625,10 @@ pub async fn win_uninstall(
 mod tests {
     use super::{
         check_with_manager_fallback, download_then_install_manager_update,
-        install_root_from_picked_dir, manager_update_matches_confirmation,
+        install_root_from_picked_dir, manager_update_matches_confirmation, manager_update_root_url,
         manager_update_versioned_url, normalize_windows_source_base, sha256_hex,
         validate_install_root_path, validate_manager_update_identity_claim,
-        validated_custom_proxy_for_settings, ManagerReleaseIdentity,
+        validated_custom_proxy_for_settings, ManagerReleaseChannel, ManagerReleaseIdentity,
         ManagerReleaseIdentityPlatform,
     };
     use crate::errors::AppError;
@@ -2584,17 +2699,17 @@ mod tests {
     fn manager_release_identity(
         version: &str,
         notes: &str,
-        signature: &str,
+        channel: ManagerReleaseChannel,
     ) -> ManagerReleaseIdentity {
         ManagerReleaseIdentity {
             schema: 1,
             version: version.to_string(),
+            channel,
             notes_sha256: sha256_hex(notes.as_bytes()),
             platforms: HashMap::from([(
                 "windows-x86_64".to_string(),
                 ManagerReleaseIdentityPlatform {
                     artifact: "CodexAppManager_0.3.1_x64-setup.exe".to_string(),
-                    signature: signature.to_string(),
                     sha256: "a".repeat(64),
                 },
             )]),
@@ -2603,13 +2718,15 @@ mod tests {
 
     #[test]
     fn manager_update_rejects_forged_v999_with_replayed_old_signature() {
-        let identity = manager_release_identity("0.3.1", "reviewed notes", "old-valid-signature");
+        let identity =
+            manager_release_identity("0.3.1", "reviewed notes", ManagerReleaseChannel::Stable);
         let error = validate_manager_update_identity_claim(
             "999.0.0",
+            "stable",
             Some("reviewed notes"),
             "windows-x86_64",
             "CodexAppManager_0.3.1_x64-setup.exe",
-            "old-valid-signature",
+            &"a".repeat(64),
             &identity,
         )
         .unwrap_err();
@@ -2621,13 +2738,15 @@ mod tests {
 
     #[test]
     fn manager_update_accepts_mirror_claim_bound_to_signed_identity() {
-        let identity = manager_release_identity("0.3.1", "reviewed notes", "current-signature");
+        let identity =
+            manager_release_identity("0.3.1", "reviewed notes", ManagerReleaseChannel::Stable);
         let digest = validate_manager_update_identity_claim(
             "0.3.1",
+            "stable",
             Some("reviewed notes"),
             "windows-x86_64",
             "CodexAppManager_0.3.1_x64-setup.exe",
-            "current-signature",
+            &"a".repeat(64),
             &identity,
         )
         .unwrap();
@@ -2636,21 +2755,70 @@ mod tests {
     }
 
     #[test]
+    fn manager_update_rejects_unsigned_manifest_digest_override() {
+        let identity =
+            manager_release_identity("0.3.1", "reviewed notes", ManagerReleaseChannel::Stable);
+        let error = validate_manager_update_identity_claim(
+            "0.3.1",
+            "stable",
+            Some("reviewed notes"),
+            "windows-x86_64",
+            "CodexAppManager_0.3.1_x64-setup.exe",
+            &"b".repeat(64),
+            &identity,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("artifact does not match the signed release identity"));
+    }
+
+    #[test]
+    fn manager_update_rejects_self_consistent_prerelease_replay_on_stable_channel() {
+        let identity = manager_release_identity(
+            "0.4.0-rc.1",
+            "prerelease notes",
+            ManagerReleaseChannel::Prerelease,
+        );
+        let error = validate_manager_update_identity_claim(
+            "0.4.0-rc.1",
+            "prerelease",
+            Some("prerelease notes"),
+            "windows-x86_64",
+            "CodexAppManager_0.3.1_x64-setup.exe",
+            &"a".repeat(64),
+            &identity,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("stable manager updater rejects prerelease"));
+    }
+
+    #[test]
     fn manager_update_derives_versioned_identity_and_artifact_urls_per_source() {
         let mirror =
             url::Url::parse("https://codexapp.agentsmirror.com/manager/latest.json?ignored=1")
                 .unwrap();
         assert_eq!(
-            manager_update_versioned_url(&mirror, "0.3.2", "release-identity.json")
+            manager_update_root_url(&mirror, "release-identity.json")
                 .unwrap()
                 .as_str(),
-            "https://codexapp.agentsmirror.com/manager/0.3.2/release-identity.json"
+            "https://codexapp.agentsmirror.com/manager/release-identity.json"
         );
 
         let github = url::Url::parse(
             "https://github.com/Wangnov/Codex-App-Manager/releases/latest/download/latest.json",
         )
         .unwrap();
+        assert_eq!(
+            manager_update_root_url(&github, "release-identity.json")
+                .unwrap()
+                .as_str(),
+            "https://github.com/Wangnov/Codex-App-Manager/releases/latest/download/release-identity.json"
+        );
         assert_eq!(
             manager_update_versioned_url(
                 &github,
@@ -2665,18 +2833,47 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_manifest_version_cannot_select_the_root_identity() {
+        let mirror =
+            url::Url::parse("https://codexapp.agentsmirror.com/manager/latest.json").unwrap();
+        let root = manager_update_root_url(&mirror, "release-identity.json").unwrap();
+
+        assert_eq!(
+            root.as_str(),
+            "https://codexapp.agentsmirror.com/manager/release-identity.json"
+        );
+        assert!(!root.path().contains("999.0.0"));
+    }
+
+    #[test]
     fn manager_update_cn_path_accepts_authenticated_mirror_first() {
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let attempts_for_check = Arc::clone(&attempts);
+        let identity = Arc::new(manager_release_identity(
+            "0.3.1",
+            "reviewed notes",
+            ManagerReleaseChannel::Stable,
+        ));
+        let identity_for_check = Arc::clone(&identity);
         let result = tauri::async_runtime::block_on(check_with_manager_fallback(
             manager_update_test_endpoints(),
             move |endpoint| {
                 let attempts = Arc::clone(&attempts_for_check);
+                let identity = Arc::clone(&identity_for_check);
                 async move {
                     attempts
                         .lock()
                         .unwrap()
                         .push(endpoint.host_str().unwrap().to_string());
+                    validate_manager_update_identity_claim(
+                        "0.3.1",
+                        "stable",
+                        Some("reviewed notes"),
+                        "windows-x86_64",
+                        "CodexAppManager_0.3.1_x64-setup.exe",
+                        &"a".repeat(64),
+                        &identity,
+                    )?;
                     Ok(Some("authenticated-mirror-update"))
                 }
             },

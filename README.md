@@ -114,7 +114,7 @@ Manager 内置 Tauri updater,按以下顺序检查自身新版本:
 1. `https://codexapp.agentsmirror.com/manager/latest.json` —— 自有镜像,**全球走 R2、中国大陆自动分流到 IHEP S3**
 2. `https://github.com/Wangnov/Codex-App-Manager/releases/latest/download/latest.json` —— GitHub 兜底
 
-`latest.json` 里的签名签的是**安装包字节**而非 URL,镜像只是逐字节复制并改写下载地址,所以签名始终有效。每次正式发版,CI 会自动把产物与改写后的 `latest.json` 同步到两套镜像(安装包置于 `…/manager/<版本>/…` 的版本化路径,长缓存安全;`latest.json` 在固定根路径短缓存),因此**无需依赖 GitHub 也能自更新**——这对国内网络尤其重要。
+`latest.json` 里的签名签的是**安装包字节**而非 URL；Manager 会先验证固定根路径的签名 `release-identity.json(.sig)`，只接受其授权的 stable 版本、文件名与 SHA-256，再读取可因镜像改写 URL 的 `latest.json`。每次正式发版，CI 会把产物、版本化身份文件和根身份指针同步到 R2/IHEP；任一身份或清单不一致都会安全回退 GitHub，不会安装未授权版本。
 
 ## 管理与更新 Codex 本体
 
@@ -251,7 +251,7 @@ The Manager ships the Tauri updater and checks for new versions of itself in thi
 1. `https://codexapp.agentsmirror.com/manager/latest.json` — its own mirror: **R2 globally, auto-failover to IHEP S3 for mainland China**
 2. `https://github.com/Wangnov/Codex-App-Manager/releases/latest/download/latest.json` — GitHub fallback
 
-The signatures in `latest.json` sign the **installer bytes**, not the URL, so the mirror only re-hosts the bytes verbatim and rewrites the download URL — the signature stays valid. On every stable release, CI syncs the artifacts and a rewritten `latest.json` to both mirrors (installers under a versioned path `…/manager/<version>/…` so long caching is safe; `latest.json` at the fixed root with a short cache), so **self-update never depends on GitHub** — which matters most inside China.
+The signatures in `latest.json` sign the **installer bytes**, not the URL. Before trusting that URL-rewritten manifest, the Manager verifies a signed root `release-identity.json(.sig)` and accepts only the authorized stable version, artifact names, and SHA-256 values. Every stable release syncs the artifacts, immutable versioned identity, and root identity pointer to R2/IHEP; any mismatch safely falls back to GitHub instead of installing an unauthorized version.
 
 ## Managing & updating Codex itself
 

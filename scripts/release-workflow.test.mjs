@@ -9,6 +9,11 @@ import {
   assertImmutableReleasesEnabled,
   verifyImmutableReleases,
 } from "./check-immutable-releases.mjs";
+import {
+  assertReleaseTagCommit,
+  assertReleaseTagRuleset,
+  verifyReleaseTagProtection,
+} from "./check-release-tag-protection.mjs";
 import { requiredReleaseAssetNames } from "./check-release-reuse.mjs";
 import {
   assertLocalReleaseArtifactNames,
@@ -16,8 +21,14 @@ import {
 } from "./check-release-version.mjs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const workflow = await readFile(join(repoRoot, ".github/workflows/release.yml"), "utf8");
-const mirrorRelease = await readFile(join(repoRoot, "scripts/mirror-release.mjs"), "utf8");
+const workflow = await readFile(
+  join(repoRoot, ".github/workflows/release.yml"),
+  "utf8",
+);
+const mirrorRelease = await readFile(
+  join(repoRoot, "scripts/mirror-release.mjs"),
+  "utf8",
+);
 const releaseJob = workflow.slice(workflow.indexOf("  release:\n"));
 
 describe("release workflow recovery invariants", () => {
@@ -53,12 +64,16 @@ describe("release workflow recovery invariants", () => {
     expect(reject).not.toContain("actions/checkout@");
     expect(reject).not.toContain("environment:");
     expect(reject).not.toContain("${{ secrets.");
-    expect(dispatchInputs).toMatch(/target_tag:\n\s+description:.*\n\s+required: true/);
+    expect(dispatchInputs).toMatch(
+      /target_tag:\n\s+description:.*\n\s+required: true/,
+    );
 
     expect(preflight).toContain(
       "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
     );
-    expect(preflight).toContain("workflow_dispatch requires a non-empty target_tag");
+    expect(preflight).toContain(
+      "workflow_dispatch requires a non-empty target_tag",
+    );
     expect(preflight).not.toContain("actions/checkout@");
     expect(preflight).not.toContain("environment:");
     expect(preflight).not.toContain("${{ secrets.");
@@ -67,7 +82,9 @@ describe("release workflow recovery invariants", () => {
   });
 
   it("binds the release tag to all six source versions and exact local artifact names", async () => {
-    const packageJson = JSON.parse(await readFile(join(repoRoot, "package.json"), "utf8"));
+    const packageJson = JSON.parse(
+      await readFile(join(repoRoot, "package.json"), "utf8"),
+    );
     const releaseTag = `v${packageJson.version}`;
     const source = assertReleaseSourceVersions(releaseTag, repoRoot);
     expect(source.entries).toHaveLength(6);
@@ -75,20 +92,27 @@ describe("release workflow recovery invariants", () => {
       "mismatched source versions",
     );
 
-    const artifactsDir = await mkdtemp(join(tmpdir(), "cam-release-artifacts-"));
+    const artifactsDir = await mkdtemp(
+      join(tmpdir(), "cam-release-artifacts-"),
+    );
     try {
       const expected = requiredReleaseAssetNames(releaseTag).filter(
-        (name) => name !== "latest.json",
+        (name) => name !== "latest.json" && !name.startsWith("release-identity.json"),
       );
-      await Promise.all(expected.map((name) => writeFile(join(artifactsDir, name), "x")));
-      expect(assertLocalReleaseArtifactNames(releaseTag, artifactsDir).expected).toEqual(
-        expected,
+      await Promise.all(
+        expected.map((name) => writeFile(join(artifactsDir, name), "x")),
       );
+      expect(
+        assertLocalReleaseArtifactNames(releaseTag, artifactsDir).expected,
+      ).toEqual(expected);
 
-      await writeFile(join(artifactsDir, "CodexAppManager_9.9.9_x64-setup.exe"), "x");
-      expect(() => assertLocalReleaseArtifactNames(releaseTag, artifactsDir)).toThrow(
-        "installer artifacts for another version",
+      await writeFile(
+        join(artifactsDir, "CodexAppManager_9.9.9_x64-setup.exe"),
+        "x",
       );
+      expect(() =>
+        assertLocalReleaseArtifactNames(releaseTag, artifactsDir),
+      ).toThrow("installer artifacts for another version");
     } finally {
       await rm(artifactsDir, { force: true, recursive: true });
     }
@@ -97,7 +121,7 @@ describe("release workflow recovery invariants", () => {
       workflow.indexOf("  prepare:\n"),
       workflow.indexOf("  build:\n"),
     );
-    expect(prepare).toContain('ref: ${{ env.RELEASE_TAG }}');
+    expect(prepare).toContain("ref: ${{ env.RELEASE_TAG }}");
     expect(prepare).toContain(
       'node scripts/check-release-version.mjs source "$RELEASE_TAG" release-source',
     );
@@ -110,7 +134,9 @@ describe("release workflow recovery invariants", () => {
         "- name: Verify local updater signatures before immutable publication",
       ),
     );
-    expect(manifestStep).toContain("node scripts/validate-release-manifest.mjs");
+    expect(manifestStep).toContain(
+      "node scripts/validate-release-manifest.mjs",
+    );
     expect(manifestStep).not.toContain('if [[ "$RELEASE_TAG" != *-* ]]');
   });
 
@@ -153,11 +179,15 @@ describe("release workflow recovery invariants", () => {
   });
 
   it("uses the target tag updater trust root without executing historical scripts", () => {
-    const refresh = releaseJob.indexOf("- name: Refresh immutable release state");
+    const refresh = releaseJob.indexOf(
+      "- name: Refresh immutable release state",
+    );
     const resolveTrust = releaseJob.indexOf(
       "- name: Resolve updater trust root for release tag",
     );
-    const download = releaseJob.indexOf("- name: Download canonical build artifacts");
+    const download = releaseJob.indexOf(
+      "- name: Download canonical build artifacts",
+    );
     const localVerify = releaseJob.indexOf(
       "- name: Verify local updater signatures before immutable publication",
     );
@@ -179,7 +209,9 @@ describe("release workflow recovery invariants", () => {
   });
 
   it("fails closed when immutable settings are disabled or cannot be queried", () => {
-    expect(assertImmutableReleasesEnabled({ enabled: true })).toEqual({ enabled: true });
+    expect(assertImmutableReleasesEnabled({ enabled: true })).toEqual({
+      enabled: true,
+    });
     expect(() => assertImmutableReleasesEnabled({ enabled: false })).toThrow(
       "GitHub Immutable Releases are disabled",
     );
@@ -196,9 +228,111 @@ describe("release workflow recovery invariants", () => {
       workflow.indexOf("  build:\n"),
     );
     expect(prepare).toContain("environment: release");
-    expect(prepare).toContain("GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}");
+    expect(prepare).toContain(
+      "GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}",
+    );
     expect(prepare).toContain("run: node scripts/check-immutable-releases.mjs");
-    expect(releaseJob).toContain("run: node scripts/check-immutable-releases.mjs");
+    expect(releaseJob).toContain(
+      "run: node scripts/check-immutable-releases.mjs",
+    );
+  });
+
+  it("requires immutable release tags and rechecks the live peeled commit at publication", () => {
+    const protectedRuleset = {
+      id: 1,
+      name: "immutable release tags",
+      target: "tag",
+      enforcement: "active",
+      bypass_actors: [],
+      conditions: { ref_name: { include: ["refs/tags/v*"], exclude: [] } },
+      rules: [{ type: "update" }, { type: "deletion" }],
+    };
+    expect(assertReleaseTagRuleset([protectedRuleset])).toEqual({
+      id: 1,
+      name: "immutable release tags",
+    });
+    expect(() =>
+      assertReleaseTagRuleset([
+        { ...protectedRuleset, rules: [{ type: "deletion" }] },
+      ]),
+    ).toThrow("must protect refs/tags/v*");
+    expect(() =>
+      assertReleaseTagRuleset([
+        {
+          ...protectedRuleset,
+          bypass_actors: [{ actor_type: "User", actor_id: 1 }],
+        },
+      ]),
+    ).toThrow("visible bypass actors");
+
+    const expectedSha = "a".repeat(40);
+    expect(assertReleaseTagCommit(expectedSha, expectedSha)).toEqual({
+      sha: expectedSha,
+    });
+    expect(() => assertReleaseTagCommit("b".repeat(40), expectedSha)).toThrow(
+      "release tag moved after validation",
+    );
+
+    const responses = new Map([
+      [
+        "repos/owner/repo/rulesets?targets=tag&per_page=100",
+        [protectedRuleset],
+      ],
+      ["repos/owner/repo/rulesets/1", protectedRuleset],
+      [
+        "repos/owner/repo/git/ref/tags/v1.2.3",
+        { object: { type: "tag", sha: "b".repeat(40) } },
+      ],
+      [
+        `repos/owner/repo/git/tags/${"b".repeat(40)}`,
+        { object: { type: "commit", sha: expectedSha } },
+      ],
+    ]);
+    const runner = (_command, args) => ({
+      status: 0,
+      stderr: "",
+      stdout: JSON.stringify(responses.get(args.at(-1))),
+    });
+    expect(
+      verifyReleaseTagProtection({
+        repository: "owner/repo",
+        releaseTag: "v1.2.3",
+        expectedSha,
+        token: "read-token",
+        runner,
+      }),
+    ).toEqual({
+      commit: { sha: expectedSha },
+      ruleset: { id: 1, name: "immutable release tags" },
+    });
+
+    const prepare = workflow.slice(
+      workflow.indexOf("  prepare:\n"),
+      workflow.indexOf("  build:\n"),
+    );
+    expect(prepare).toContain("node scripts/check-release-tag-protection.mjs");
+    expect(prepare).toContain('echo "RELEASE_SOURCE_SHA=$release_source_sha"');
+
+    const upload = releaseJob.indexOf("- name: Upload GitHub Release draft");
+    const publish = releaseJob.indexOf("- name: Publish GitHub Release");
+    const beforeUpload = releaseJob.lastIndexOf(
+      "- name: Re-check protected release tag before draft upload",
+      upload,
+    );
+    const beforePublish = releaseJob.lastIndexOf(
+      "- name: Re-check protected release tag before publication",
+      publish,
+    );
+    expect(beforeUpload).toBeGreaterThan(-1);
+    expect(beforeUpload).toBeLessThan(upload);
+    expect(beforePublish).toBeGreaterThan(upload);
+    expect(beforePublish).toBeLessThan(publish);
+    expect(releaseJob.slice(beforeUpload, upload)).toContain(
+      'node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"',
+    );
+    expect(releaseJob.slice(beforePublish, publish)).toContain(
+      'node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"',
+    );
   });
 
   it("uploads stable and prerelease assets to a draft before publishing", () => {
@@ -244,20 +378,30 @@ describe("release workflow recovery invariants", () => {
     const wingetStep = releaseJob.slice(winget, summary);
     const localVerifyStep = releaseJob.slice(localVerify, stage);
     const mirrorVerifyStep = releaseJob.slice(mirrorVerify, upload);
-    expect(localVerifyStep).toContain("node scripts/verify-release-artifacts.mjs");
+    expect(localVerifyStep).toContain(
+      "node scripts/verify-release-artifacts.mjs",
+    );
     expect(mirrorVerifyStep).toContain("MIRROR_PHASE: verify");
     expect(mirrorVerifyStep).toContain("bash scripts/sync-mirror.sh dist");
     expect(uploadStep).toContain("draft: true");
     expect(uploadStep).toContain("steps.provenance.outputs.ready == 'true'");
-    expect(uploadStep).toContain("prerelease: ${{ contains(env.RELEASE_TAG, '-') }}");
+    expect(uploadStep).toContain(
+      "prerelease: ${{ contains(env.RELEASE_TAG, '-') }}",
+    );
     expect(uploadStep).toContain("files: |");
     expect(publishStep).not.toMatch(/^\s+draft:/m);
     expect(publishStep).not.toContain("files: |");
     expect(publishStep).toContain("steps.provenance.outputs.ready == 'true'");
     expect(verifyStep).toContain("node scripts/check-release-reuse.mjs");
-    expect(verifyStep).toContain("did not become immutable with canonical asset digests");
-    expect(verifyStep).toContain("published immutable digest does not match attested local bytes");
-    expect(attestStep).toContain("steps.release_source.outputs.existing != 'true'");
+    expect(verifyStep).toContain(
+      "did not become immutable with canonical asset digests",
+    );
+    expect(verifyStep).toContain(
+      "published immutable digest does not match attested local bytes",
+    );
+    expect(attestStep).toContain(
+      "steps.release_source.outputs.existing != 'true'",
+    );
     expect(attestStep).toContain("actions/attest-build-provenance@");
     expect(attestStep).not.toContain("continue-on-error: true");
     expect(existingStep).toContain("gh attestation verify");
@@ -275,8 +419,12 @@ describe("release workflow recovery invariants", () => {
   });
 
   it("verifies existing immutable provenance without minting a rerun attestation", () => {
-    const source = releaseJob.indexOf("- name: Resolve immutable release artifact source");
-    const validate = releaseJob.indexOf("- name: Validate final release artifacts");
+    const source = releaseJob.indexOf(
+      "- name: Resolve immutable release artifact source",
+    );
+    const validate = releaseJob.indexOf(
+      "- name: Validate final release artifacts",
+    );
     const attest = releaseJob.indexOf("- name: Attest fresh build provenance");
     const verifyExisting = releaseJob.indexOf(
       "- name: Verify existing immutable release provenance",
@@ -290,10 +438,18 @@ describe("release workflow recovery invariants", () => {
     expect(sourceStep).toContain("--pattern 'CodexAppManager*'");
     expect(sourceStep).toContain("--pattern 'latest.json'");
     expect(sourceStep).toContain('actual_digest="sha256:$(sha256sum "$file"');
-    expect(sourceStep).toContain('if [[ "$actual_digest" != "$expected_digest" ]]');
-    expect(attestStep).toContain("steps.release_source.outputs.existing != 'true'");
-    expect(attestStep).not.toContain("steps.release_source.outputs.existing == 'true'");
-    expect(existingStep).toContain("steps.release_source.outputs.existing == 'true'");
+    expect(sourceStep).toContain(
+      'if [[ "$actual_digest" != "$expected_digest" ]]',
+    );
+    expect(attestStep).toContain(
+      "steps.release_source.outputs.existing != 'true'",
+    );
+    expect(attestStep).not.toContain(
+      "steps.release_source.outputs.existing == 'true'",
+    );
+    expect(existingStep).toContain(
+      "steps.release_source.outputs.existing == 'true'",
+    );
     expect(existingStep).toContain("for file in dist/* latest.json");
     expect(existingStep).toContain("gh attestation verify");
     expect(existingStep).toContain("--deny-self-hosted-runners");
