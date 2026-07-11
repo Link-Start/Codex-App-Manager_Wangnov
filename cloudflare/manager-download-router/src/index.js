@@ -38,6 +38,7 @@ export default {
     }
 
     const country = request.cf?.country || request.headers.get("CF-IPCountry") || "";
+    const probeBackend = requestedProbeBackend(url);
     const secondaryCountryCodes = new Set(
       (env.SECONDARY_COUNTRY_CODES || DEFAULT_SECONDARY_COUNTRY_CODES)
         .split(",")
@@ -46,7 +47,19 @@ export default {
     );
 
     // ── Mainland China: presign the IHEP S3 object and redirect ──────────────
-    if (secondaryCountryCodes.has(country.toUpperCase()) && hasSecondaryS3Config(env)) {
+    const secondaryConfigured = hasSecondaryS3Config(env);
+    if (probeBackend === "ihep" && !secondaryConfigured) {
+      return new Response("Secondary mirror is not configured", {
+        status: 503,
+        headers: { "X-Codex-Mirror-Backend": "ihep" },
+      });
+    }
+    const useSecondary =
+      probeBackend === "ihep" ||
+      (probeBackend !== "r2" &&
+        secondaryCountryCodes.has(country.toUpperCase()) &&
+        secondaryConfigured);
+    if (useSecondary) {
       const objectKey = objectKeyForKey(key, env.SECONDARY_S3_PREFIX || "");
       const signedUrl = await presignS3Url({
         // Sign for the actual method: the redirect preserves it, and an
@@ -62,7 +75,7 @@ export default {
         expiresInSeconds: ttlSeconds(env.SECONDARY_S3_SIGNED_URL_TTL_SECONDS),
         responseHeaders: {},
       });
-      return redirect(signedUrl);
+      return redirect(signedUrl, "ihep");
     }
 
     // ── Everyone else: stream straight from the bound R2 bucket ──────────────
@@ -74,6 +87,7 @@ export default {
     object.writeHttpMetadata(headers); // Content-Type etc. from R2 metadata
     headers.set("ETag", object.httpEtag);
     headers.set("Cache-Control", cacheControlForKey(key));
+    headers.set("X-Codex-Mirror-Backend", "r2");
     if (request.method === "HEAD") {
       return new Response(null, { headers });
     }
@@ -97,16 +111,32 @@ function hasSecondaryS3Config(env) {
   );
 }
 
+// Release verification must exercise both geographic branches from a single
+// GitHub runner. This is a routing selector, not an authorization mechanism:
+// every addressed object is already public through this Worker. Requiring the
+// run-specific probe token shape prevents ordinary download links from changing
+// backend accidentally while allowing CI to force and identify each branch.
+function requestedProbeBackend(url) {
+  const token = url.searchParams.get("cam_probe") || "";
+  const backend = url.searchParams.get("cam_backend") || "";
+  if (!/^[0-9a-f]{24}$/.test(token)) return null;
+  return ["r2", "ihep"].includes(backend) ? backend : null;
+}
+
 function ttlSeconds(value) {
   const parsed = Number.parseInt(value || DEFAULT_SIGNED_URL_TTL_SECONDS, 10);
   if (!Number.isFinite(parsed)) return DEFAULT_SIGNED_URL_TTL_SECONDS;
   return Math.min(Math.max(parsed, 1), 604800);
 }
 
-function redirect(location) {
+function redirect(location, backend) {
   return new Response(null, {
     status: 302,
-    headers: { Location: location, "Cache-Control": "private, no-store" },
+    headers: {
+      Location: location,
+      "Cache-Control": "private, no-store",
+      "X-Codex-Mirror-Backend": backend,
+    },
   });
 }
 
