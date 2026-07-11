@@ -1,0 +1,33 @@
+name: Release source
+
+# This workflow is only an unprivileged signal. Tag workflows are loaded from
+# the tagged commit, so this file must never receive an environment, secrets,
+# write permissions, checkout, or artifacts. The credentialed Release workflow
+# is triggered with workflow_run and is therefore loaded from the default branch.
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Validate release signal shape
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag must be a semantic vX.Y.Z tag: $RELEASE_TAG"
+            exit 1
+          fi
+          if [[ ! "$RELEASE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::release source must be a full commit SHA"
+            exit 1
+          fi
+          echo "Unprivileged release signal accepted for $RELEASE_TAG at $RELEASE_SOURCE_SHA"
