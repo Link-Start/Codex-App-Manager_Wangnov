@@ -131,6 +131,9 @@ Before `prepare` permits any build, and again at the start of every release-job
 attempt, the workflow queries the repository Immutable Releases setting with a
 dedicated fine-grained, read-only token. A missing token, failed query, or
 `enabled: false` response fails closed before draft upload or mirror publication.
+Two separate active tag rulesets restrict `refs/tags/v*` creation to the named
+release publisher and forbid update/deletion for everyone (including that
+publisher). The workflow also re-peels the live tag before publication.
 
 Same-tag reruns reuse the artifacts and `latest.json` attached to a complete,
 published GitHub Release only when GitHub reports `immutable: true` and a canonical
