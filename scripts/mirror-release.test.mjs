@@ -37,6 +37,8 @@ import {
   verifyTauriUpdaterSignature,
 } from "./mirror-release.mjs";
 import {
+  OPTIONAL_RELEASE_METADATA_ASSET_NAMES,
+  REQUIRED_RELEASE_METADATA_ASSET_NAMES,
   inspectReleaseForReuse,
   requiredReleaseAssetNames,
 } from "./check-release-reuse.mjs";
@@ -102,7 +104,10 @@ function completeRelease(releaseTag, overrides = {}) {
   return {
     draft: false,
     immutable: true,
-    assets: requiredReleaseAssetNames(releaseTag).map((name) => ({
+    assets: [
+      ...requiredReleaseAssetNames(releaseTag),
+      ...REQUIRED_RELEASE_METADATA_ASSET_NAMES,
+    ].map((name) => ({
       digest,
       name,
       size: 1,
@@ -554,11 +559,25 @@ describe("existing GitHub Release reuse", () => {
       "has no canonical SHA-256 digest",
     );
 
-    const unpinnedExtra = completeRelease(releaseTag);
-    unpinnedExtra.assets.push({ name: "CodexAppManager_extra.zip", size: 10 });
-    expect(() => inspectReleaseForReuse(unpinnedExtra, releaseTag)).toThrow(
-      "has no canonical SHA-256 digest",
+    const unexpectedExecutable = completeRelease(releaseTag);
+    unexpectedExecutable.assets.push({
+      digest: `sha256:${"b".repeat(64)}`,
+      name: "CodexAppManager_1.2.3_unsigned-debug.exe",
+      size: 10,
+    });
+    expect(() => inspectReleaseForReuse(unexpectedExecutable, releaseTag)).toThrow(
+      "has unexpected assets and cannot be trusted",
     );
+
+    const optionalSbom = completeRelease(releaseTag);
+    optionalSbom.assets.push({
+      digest: `sha256:${"c".repeat(64)}`,
+      name: OPTIONAL_RELEASE_METADATA_ASSET_NAMES[0],
+      size: 10,
+    });
+    expect(inspectReleaseForReuse(optionalSbom, releaseTag)).toMatchObject({
+      reusable: true,
+    });
   });
 });
 

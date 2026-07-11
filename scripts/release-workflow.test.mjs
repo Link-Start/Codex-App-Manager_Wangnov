@@ -27,6 +27,7 @@ import {
   assertLocalReleaseArtifactNames,
   assertReleaseSourceVersions,
 } from "./check-release-version.mjs";
+import { verifyDraftReleaseAssets } from "./check-release-draft-assets.mjs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = await readFile(
@@ -395,6 +396,113 @@ describe("release workflow recovery invariants", () => {
     } finally {
       await rm(root, { force: true, recursive: true });
     }
+  });
+
+  it("requires the mutable Release draft to match the exact canonical local asset set", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cam-release-draft-assets-"));
+    const artifact = join(root, "CodexAppManager_1.2.3_x64-setup.exe");
+    const manifest = join(root, "latest.json");
+    try {
+      await writeFile(artifact, "signed installer bytes");
+      await writeFile(manifest, '{"version":"1.2.3"}\n');
+      const release = {
+        assets: [
+          { id: 101, name: "CodexAppManager_1.2.3_x64-setup.exe", size: 22 },
+          { id: 102, name: "latest.json", size: 20 },
+        ],
+        draft: true,
+        id: 77,
+        immutable: false,
+        tag_name: "v1.2.3",
+      };
+      expect(
+        verifyDraftReleaseAssets(release, "v1.2.3", [artifact, manifest]),
+      ).toMatchObject({
+        assets: [
+          { id: 101, name: "CodexAppManager_1.2.3_x64-setup.exe" },
+          { id: 102, name: "latest.json" },
+        ],
+        releaseId: 77,
+      });
+
+      expect(() =>
+        verifyDraftReleaseAssets(
+          {
+            ...release,
+            assets: [
+              ...release.assets,
+              {
+                id: 103,
+                name: "CodexAppManager_1.2.3_unsigned-debug.exe",
+                size: 1,
+              },
+            ],
+          },
+          "v1.2.3",
+          [artifact, manifest],
+        ),
+      ).toThrow("unexpected: CodexAppManager_1.2.3_unsigned-debug.exe");
+      expect(() =>
+        verifyDraftReleaseAssets(
+          { ...release, assets: release.assets.slice(1) },
+          "v1.2.3",
+          [artifact, manifest],
+        ),
+      ).toThrow("missing: CodexAppManager_1.2.3_x64-setup.exe");
+      expect(() =>
+        verifyDraftReleaseAssets(
+          {
+            ...release,
+            assets: release.assets.map((asset) =>
+              asset.name === "latest.json"
+                ? { ...asset, digest: `sha256:${"f".repeat(64)}` }
+                : asset,
+            ),
+          },
+          "v1.2.3",
+          [artifact, manifest],
+        ),
+      ).toThrow("draft release asset digest differs from local bytes: latest.json");
+      expect(() =>
+        verifyDraftReleaseAssets(
+          { ...release, draft: false, immutable: true },
+          "v1.2.3",
+          [artifact, manifest],
+        ),
+      ).toThrow("no longer the expected mutable draft");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it("resets stale draft assets and verifies an exact byte-for-byte draft before publish", () => {
+    const reset = releaseJob.indexOf(
+      "- name: Reset existing mutable Release draft assets",
+    );
+    const upload = releaseJob.indexOf("- name: Upload GitHub Release draft");
+    const verify = releaseJob.indexOf(
+      "- name: Verify exact GitHub Release draft assets",
+    );
+    const publish = releaseJob.indexOf("- name: Publish GitHub Release");
+    expect(reset).toBeGreaterThan(-1);
+    expect(reset).toBeLessThan(upload);
+    expect(upload).toBeLessThan(verify);
+    expect(verify).toBeLessThan(publish);
+
+    const resetStep = releaseJob.slice(reset, upload);
+    expect(resetStep).toContain("releases/assets/$asset_id");
+    expect(resetStep).toContain("(.assets | length) == 0");
+    expect(resetStep).toContain(".draft == true and .immutable != true");
+
+    const verifyStep = releaseJob.slice(verify, publish);
+    expect(verifyStep).toContain("check-release-draft-assets.mjs");
+    expect(verifyStep).toContain(
+      "canonical_assets=(dist/* latest.json release-binding.json SHA256SUMS release-assets/*)",
+    );
+    expect(verifyStep).toContain('Accept: application/octet-stream');
+    expect(verifyStep).toContain('sha256sum "$downloaded"');
+    expect(verifyStep).toContain('cmp -- "$local_path" "$downloaded"');
+    expect(verifyStep).toContain('cmp -- "$draft_plan" "$post_plan"');
   });
 
   it("binds the release tag to all six source versions and exact local artifact names", async () => {

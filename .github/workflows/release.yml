@@ -1340,6 +1340,60 @@ jobs:
           bash scripts/check-release-source-ancestor.sh release-source "$RELEASE_SOURCE_SHA" "$DEFAULT_BRANCH"
           node scripts/check-release-tag-protection.mjs "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"
 
+      # A failed attempt may leave a mutable draft with stale or attacker-named
+      # assets. action-gh-release replaces matching names but does not remove
+      # extras, which would otherwise become part of the immutable Release.
+      - name: Reset existing mutable Release draft assets
+        if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          draft_json="$RUNNER_TEMP/existing-release-draft.json"
+          lookup_error="$RUNNER_TEMP/existing-release-draft-error.txt"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$draft_json" 2>"$lookup_error"; then
+            release_id="$(jq -er --arg tag "$RELEASE_TAG" '
+              select(.tag_name == $tag and .draft == true and .immutable != true)
+              | .id
+            ' "$draft_json")" || {
+              echo "::error::existing release is no longer the expected mutable draft"
+              exit 1
+            }
+            while IFS= read -r asset_id; do
+              [[ "$asset_id" =~ ^[0-9]+$ ]] || {
+                echo "::error::mutable draft returned an invalid asset id"
+                exit 1
+              }
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            done < <(jq -r '.assets[]?.id' "$draft_json")
+
+            cleared=false
+            for attempt in 1 2 3 4 5; do
+              gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$draft_json"
+              if jq -e \
+                --arg tag "$RELEASE_TAG" \
+                --argjson id "$release_id" \
+                '.id == $id and .tag_name == $tag and .draft == true and .immutable != true and (.assets | length) == 0' \
+                "$draft_json" >/dev/null; then
+                cleared=true
+                break
+              fi
+              sleep 2
+            done
+            [[ "$cleared" == "true" ]] || {
+              echo "::error::could not prove the mutable draft asset set was empty"
+              exit 1
+            }
+          elif grep -q 'HTTP 404' "$lookup_error"; then
+            echo "No existing Release draft to reset for $RELEASE_TAG"
+          else
+            cat "$lookup_error" >&2
+            echo "::error::could not inspect an existing Release before draft upload"
+            exit 1
+          fi
+
       # Explicit draft-first publication keeps asset upload ahead of publication
       # for both stable and prerelease tags. This is required when GitHub immutable
       # releases are enabled: a published release can no longer accept assets.
@@ -1363,6 +1417,71 @@ jobs:
             release-binding.json
             SHA256SUMS
             release-assets/*
+
+      - name: Verify exact GitHub Release draft assets
+        if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          canonical_assets=(dist/* latest.json release-binding.json SHA256SUMS release-assets/*)
+          draft_json="$RUNNER_TEMP/uploaded-release-draft.json"
+          draft_plan="$RUNNER_TEMP/uploaded-release-draft-assets.json"
+          verification_log="$RUNNER_TEMP/uploaded-release-draft-verification.log"
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            : >"$verification_log"
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$draft_json" 2>>"$verification_log" \
+              && node scripts/check-release-draft-assets.mjs \
+                "$RELEASE_TAG" "$draft_json" "$draft_plan" \
+                "${canonical_assets[@]}" >>"$verification_log" 2>&1; then
+              verified=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$verified" != "true" ]]; then
+            cat "$verification_log" >&2
+            echo "::error::uploaded Release draft does not contain the exact canonical asset set"
+            exit 1
+          fi
+          cat "$verification_log"
+
+          readback="$RUNNER_TEMP/uploaded-release-draft-readback"
+          rm -rf "$readback"
+          mkdir -p "$readback"
+          while IFS=$'\t' read -r asset_id name local_path expected_sha256; do
+            [[ "$asset_id" =~ ^[0-9]+$ && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+              echo "::error::draft verification plan contains invalid asset metadata"
+              exit 1
+            }
+            downloaded="$readback/$name"
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >"$downloaded"
+            actual_sha256="$(sha256sum "$downloaded" | cut -d' ' -f1)"
+            [[ -s "$downloaded" && "$actual_sha256" == "$expected_sha256" ]] || {
+              echo "::error::Release draft readback differs from canonical local bytes: $name"
+              exit 1
+            }
+            cmp -- "$local_path" "$downloaded" >/dev/null || {
+              echo "::error::Release draft byte comparison failed: $name"
+              exit 1
+            }
+          done < <(jq -r '.assets[] | [.id, .name, .localPath, .sha256] | @tsv' "$draft_plan")
+
+          post_json="$RUNNER_TEMP/uploaded-release-draft-post-readback.json"
+          post_plan="$RUNNER_TEMP/uploaded-release-draft-post-readback-assets.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$post_json"
+          node scripts/check-release-draft-assets.mjs \
+            "$RELEASE_TAG" "$post_json" "$post_plan" \
+            "${canonical_assets[@]}"
+          cmp -- "$draft_plan" "$post_plan" >/dev/null || {
+            echo "::error::Release draft assets changed during canonical readback"
+            exit 1
+          }
 
       # Upload can take long enough for a repository policy regression to matter.
       # Fence the transition from mutable draft to immutable publication again.

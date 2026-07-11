@@ -223,6 +223,12 @@ an immutable version key. New releases are uploaded as drafts first and publishe
 only after all assets succeed, including prereleases. Immediately after publish,
 the workflow requires the Release itself to report `immutable: true` and canonical
 digests for every required asset before any mirror pointer can advance.
+Before reusing a failed attempt's mutable draft, the workflow deletes every
+stale draft asset and proves the set is empty. After upload it requires an exact
+name/size match against the local canonical files, downloads every draft asset
+for byte-for-byte SHA-256 verification, and rechecks that the draft did not
+change before publication. Immutable reuse rejects every asset outside the
+fixed release/SBOM allowlist.
 Each fresh release also publishes `release-binding.json` and a custom GitHub
 attestation. `workflow_run` OIDC identifies `refs/heads/<default>` rather than the
 tag, so verification separately pins the trusted signer workflow digest and the
