@@ -173,9 +173,10 @@ Before `prepare` permits any build, and again at the start of every release-job
 attempt, the workflow queries the repository Immutable Releases setting with a
 dedicated fine-grained, read-only token. A missing token, failed query, or
 `enabled: false` response fails closed before draft upload or mirror publication.
-The same token verifies an active repository ruleset that forbids update and
-deletion of `refs/tags/v*`; the workflow re-peels the live tag during prepare,
-immediately before draft upload, and again before publication.
+Two separate active tag rulesets restrict `refs/tags/v*` creation to the named
+release publisher and forbid update/deletion for everyone (including that
+publisher). The workflow re-peels the live tag during prepare, immediately
+before draft upload, and again before publication.
 
 Same-tag reruns reuse the artifacts, signed release identity, and `latest.json`
 attached to a complete,

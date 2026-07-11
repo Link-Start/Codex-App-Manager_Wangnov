@@ -32,8 +32,9 @@ name: Release
 # round trips; promotion never relies on its ignored conditional headers.
 # GitHub Immutable Releases must be enabled before any release starts; the
 # workflow verifies the repository setting with IMMUTABLE_RELEASES_READ_TOKEN.
-# An active repository tag ruleset must also forbid update and deletion for
-# refs/tags/v*; the same read-only token verifies the policy and live peeled SHA.
+# Separate active tag rulesets must restrict refs/tags/v* creation to the named
+# release publisher and forbid every update/deletion; the same read-only token
+# verifies those policies and the live peeled SHA.
 # Every reused asset is also pinned to the API-provided sha256 digest.
 # The old MANAGER_*_ACCESS_KEY_ID / SECRET_ACCESS_KEY names must stay deleted;
 # otherwise a historical workflow revision could still perform unconditional writes.

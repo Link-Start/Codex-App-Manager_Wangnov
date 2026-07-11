@@ -10,6 +10,7 @@ import {
   verifyImmutableReleases,
 } from "./check-immutable-releases.mjs";
 import {
+  assertReleaseTagCreationRuleset,
   assertReleaseTagCommit,
   assertReleaseTagRuleset,
   verifyReleaseTagProtection,
@@ -247,6 +248,21 @@ describe("release workflow recovery invariants", () => {
       conditions: { ref_name: { include: ["refs/tags/v*"], exclude: [] } },
       rules: [{ type: "update" }, { type: "deletion" }],
     };
+    const creationRuleset = {
+      id: 2,
+      name: "authorized release tag creation",
+      target: "tag",
+      enforcement: "active",
+      bypass_actors: [
+        {
+          actor_id: 48670012,
+          actor_type: "User",
+          bypass_mode: "always",
+        },
+      ],
+      conditions: { ref_name: { include: ["refs/tags/v*"], exclude: [] } },
+      rules: [{ type: "creation" }],
+    };
     expect(assertReleaseTagRuleset([protectedRuleset])).toEqual({
       id: 1,
       name: "immutable release tags",
@@ -264,6 +280,24 @@ describe("release workflow recovery invariants", () => {
         },
       ]),
     ).toThrow("visible bypass actors");
+    expect(assertReleaseTagCreationRuleset([creationRuleset])).toEqual({
+      id: 2,
+      name: "authorized release tag creation",
+    });
+    expect(() =>
+      assertReleaseTagCreationRuleset([
+        {
+          ...creationRuleset,
+          bypass_actors: [
+            {
+              actor_id: 5,
+              actor_type: "RepositoryRole",
+              bypass_mode: "always",
+            },
+          ],
+        },
+      ]),
+    ).toThrow("authorized release publisher");
 
     const expectedSha = "a".repeat(40);
     expect(assertReleaseTagCommit(expectedSha, expectedSha)).toEqual({
@@ -276,9 +310,10 @@ describe("release workflow recovery invariants", () => {
     const responses = new Map([
       [
         "repos/owner/repo/rulesets?targets=tag&per_page=100",
-        [protectedRuleset],
+        [protectedRuleset, creationRuleset],
       ],
       ["repos/owner/repo/rulesets/1", protectedRuleset],
+      ["repos/owner/repo/rulesets/2", creationRuleset],
       [
         "repos/owner/repo/git/ref/tags/v1.2.3",
         { object: { type: "tag", sha: "b".repeat(40) } },
@@ -303,6 +338,7 @@ describe("release workflow recovery invariants", () => {
       }),
     ).toEqual({
       commit: { sha: expectedSha },
+      creationRuleset: { id: 2, name: "authorized release tag creation" },
       ruleset: { id: 1, name: "immutable release tags" },
     });
 

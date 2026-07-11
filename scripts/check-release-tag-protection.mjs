@@ -63,6 +63,47 @@ export function assertReleaseTagRuleset(rulesets) {
   return { id: matching.id, name: matching.name };
 }
 
+export function assertReleaseTagCreationRuleset(rulesets) {
+  if (!Array.isArray(rulesets)) {
+    throw new Error("GitHub tag rulesets response must be an array");
+  }
+  const matching = rulesets.find((ruleset) => {
+    const includes = ruleset?.conditions?.ref_name?.include;
+    const excludes = ruleset?.conditions?.ref_name?.exclude;
+    const ruleTypes = new Set(
+      Array.isArray(ruleset?.rules)
+        ? ruleset.rules.map((rule) => rule?.type)
+        : [],
+    );
+    // GitHub intentionally omits bypass_actors from read-only responses. When
+    // visible (local/admin verification), require exactly the configured
+    // Wangnov publisher identity and reject a broad role/team bypass.
+    const bypassActors = ruleset?.bypass_actors;
+    const visibleBypassIsAuthorized =
+      !Array.isArray(bypassActors) ||
+      (bypassActors.length === 1 &&
+        bypassActors[0]?.actor_type === "User" &&
+        bypassActors[0]?.actor_id === 48670012 &&
+        bypassActors[0]?.bypass_mode === "always");
+    return (
+      ruleset?.target === "tag" &&
+      ruleset?.enforcement === "active" &&
+      Array.isArray(includes) &&
+      includes.includes(REQUIRED_REF_PATTERN) &&
+      Array.isArray(excludes) &&
+      excludes.length === 0 &&
+      ruleTypes.has("creation") &&
+      visibleBypassIsAuthorized
+    );
+  });
+  if (!matching) {
+    throw new Error(
+      `an active tag ruleset must restrict creation of ${REQUIRED_REF_PATTERN} to the authorized release publisher`,
+    );
+  }
+  return { id: matching.id, name: matching.name };
+}
+
 export function assertReleaseTagCommit(actualSha, expectedSha) {
   if (!SHA_PATTERN.test(expectedSha)) {
     throw new Error(
@@ -134,6 +175,7 @@ export function verifyReleaseTagProtection({
     )
     .map((ruleset) => api(`repos/${repository}/rulesets/${ruleset.id}`));
   const ruleset = assertReleaseTagRuleset(details);
+  const creationRuleset = assertReleaseTagCreationRuleset(details);
 
   let object = api(`repos/${repository}/git/ref/tags/${releaseTag}`).object;
   for (let depth = 0; object?.type === "tag" && depth < 5; depth += 1) {
@@ -144,14 +186,14 @@ export function verifyReleaseTagProtection({
   }
   const commit = assertReleaseTagCommit(object.sha, expectedSha);
 
-  return { commit, ruleset };
+  return { commit, creationRuleset, ruleset };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     const result = verifyReleaseTagProtection();
     console.log(
-      `Release tag protection verified by ${result.ruleset.name || result.ruleset.id}: ${result.commit.sha}`,
+      `Release tag creation/immutability verified by ${result.creationRuleset.name || result.creationRuleset.id} and ${result.ruleset.name || result.ruleset.id}: ${result.commit.sha}`,
     );
   } catch (error) {
     console.error(
