@@ -13,7 +13,12 @@ import type {
   WinUpdateReport,
 } from "../../shared/types";
 import { DEFAULT_SETTINGS, outcomeIsPartial } from "../../shared/types";
-import { resolveFailure, userErrorMessage, type FailureSurface } from "../errorCopy";
+import {
+  contextualFailure,
+  resolveFailure,
+  userErrorMessage,
+  type FailureSurface,
+} from "../errorCopy";
 import { Icon, CodexGlyph } from "../icons";
 import { useI18n, dirOf, type TKey } from "../i18n";
 import { Ring, TopBar, ResultBanner, ErrorHero, FailureBanner, StatusBanner } from "../components";
@@ -103,6 +108,8 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // 〔继续〕/〔取消〕. `installRoot` is preserved so a paused fresh install
   // resumes into the same chosen location.
   const [paused, setPaused] = useState<(PausedDownload & { installRoot?: string }) | null>(null);
+  const [pausedDiscardBusy, setPausedDiscardBusy] = useState(false);
+  const pausedDiscardBusyRef = useRef(false);
   const scopeRef = useRef<HTMLDivElement>(null);
   // Synchronous guard for launch double-clicks (state alone can miss a second
   // click before setBusy("launch") re-renders).
@@ -164,9 +171,9 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     resetStop,
   } = useDownloadProgress({
     eventName: "win://download-progress",
-    pauseDownload: () => managerApi.winPauseDownload(),
-    cancelDownload: () => managerApi.winCancelDownload(),
-    cannotCancelMessage: t("progress.cannotCancel"),
+    pauseDownload: (operationId) => managerApi.winPauseDownload(operationId),
+    cancelDownload: (operationId) => managerApi.winCancelDownload(operationId),
+    getOperationSnapshot: () => managerApi.getOperationSnapshot(),
     onError: setActionError,
   });
 
@@ -598,6 +605,7 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // so the bar picks up where it stopped instead of at 0.
   const resumeDownload = useCallback(() => {
     const snapshot = paused;
+    setActionError(null);
     setPaused(null);
     if (!snapshot) return;
     void runPerform(snapshot.kind, snapshot.installRoot);
@@ -606,15 +614,29 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // 〔取消〕from the paused state — the download already stopped, so drop the
   // cached partial and route home.
   const cancelPausedDownload = useCallback(async () => {
-    setPaused(null);
+    if (pausedDiscardBusyRef.current) return;
+    pausedDiscardBusyRef.current = true;
+    setActionError(null);
+    setPausedDiscardBusy(true);
     try {
       // Only claim "已取消" once the cached partial is actually gone — otherwise
       // a failed discard would leave a `.part` that the next update silently
       // resumes, contradicting the cancel.
       await managerApi.winDiscardDownload();
+      setPaused(null);
       setNotice(t("progress.cancelled"));
     } catch (cause) {
-      setActionError(resolveFailure(cause, t));
+      setActionError(
+        contextualFailure(
+          cause,
+          t,
+          t("progress.discardFailed"),
+          "paused_discard_failed",
+        ),
+      );
+    } finally {
+      pausedDiscardBusyRef.current = false;
+      setPausedDiscardBusy(false);
     }
   }, [t]);
 
@@ -923,7 +945,8 @@ export function WinHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         dlSpeed={dlSpeed}
         installing={paused ? paused.kind === "install" : busy === "install"}
         downloadStop={downloadStop}
-        downloadStopBusy={downloadStopBusy}
+        downloadStopBusy={downloadStopBusy || pausedDiscardBusy}
+        failure={actionError}
         onResume={resumeDownload}
         onPause={() => void requestDownloadStop("pause")}
         onCancel={() => {

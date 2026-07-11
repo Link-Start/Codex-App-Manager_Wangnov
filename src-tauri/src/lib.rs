@@ -22,9 +22,18 @@ fn confirm_close_enabled() -> bool {
 fn quit_policy_for(app: &tauri::AppHandle) -> QuitPolicy {
     let state = app.state::<state::ManagerState>();
     let force = state.force_quit.load(Ordering::SeqCst);
+    if force {
+        return QuitPolicy::Allow;
+    }
     state
         .operations
-        .quit_policy(force, confirm_close_enabled())
+        .prepare_quit(confirm_close_enabled(), false, || {
+            // Arm both platform latches while the operation phase mutex is still
+            // held. Only the active platform has work; the other store is harmless.
+            let _ = crate::app::mac_update::cancel_macos_download();
+            let _ = crate::app::win_update::cancel_windows_download();
+            state.force_quit.store(true, Ordering::SeqCst);
+        })
 }
 
 /// Apply a quit policy decision for window/menu/exit paths.
