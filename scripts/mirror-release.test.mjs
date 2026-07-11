@@ -143,6 +143,8 @@ class MemoryBackend {
     this.objects = new Map();
     this.counter = 0;
     this.latestPutAttempts = 0;
+    this.conditionalLatestPutAttempts = 0;
+    this.unconditionalLatestPutAttempts = 0;
     for (const [key, body] of Object.entries(objects)) this.set(key, body);
   }
 
@@ -196,9 +198,23 @@ class MemoryBackend {
 
   async putLatestConditional(localPath, expectedEtag, promotionToken = "") {
     this.latestPutAttempts += 1;
+    this.conditionalLatestPutAttempts += 1;
     const current = this.objects.get("latest.json");
     const matches = expectedEtag ? current?.etag === expectedEtag : !current;
     if (!matches) throw new ConditionalWriteError(`${this.name}: stale latest ETag`);
+    if (this.failLatestPut) throw new Error(`${this.name}: simulated write failure`);
+    this.set(
+      "latest.json",
+      await readFile(localPath),
+      promotionToken ? { "cam-promotion-token": promotionToken } : {},
+    );
+    const stored = this.objects.get("latest.json");
+    return { etag: stored.etag, size: stored.body.length };
+  }
+
+  async putLatestUnconditional(localPath, promotionToken = "") {
+    this.latestPutAttempts += 1;
+    this.unconditionalLatestPutAttempts += 1;
     if (this.failLatestPut) throw new Error(`${this.name}: simulated write failure`);
     this.set(
       "latest.json",
@@ -215,6 +231,22 @@ class MemoryBackend {
       throw new ConditionalWriteError(`${this.name}: stale delete ETag`);
     }
     this.objects.delete("latest.json");
+  }
+}
+
+class ConditionIgnoringMemoryBackend extends MemoryBackend {
+  async putLatestConditional(localPath, _expectedEtag, promotionToken = "") {
+    // Model the real IHEP behavior: the request accepts If-Match but overwrites
+    // regardless. Production promotion must therefore never call this method.
+    this.latestPutAttempts += 1;
+    this.conditionalLatestPutAttempts += 1;
+    this.set(
+      "latest.json",
+      await readFile(localPath),
+      promotionToken ? { "cam-promotion-token": promotionToken } : {},
+    );
+    const stored = this.objects.get("latest.json");
+    return { etag: stored.etag, size: stored.body.length };
   }
 }
 
@@ -478,7 +510,7 @@ describe("public mirror route verification", () => {
   });
 });
 
-describe("AWS conditional writes", () => {
+describe("AWS latest writes", () => {
   function objectStore() {
     return new AwsObjectStore({
       name: "r2",
@@ -535,6 +567,30 @@ describe("AWS conditional writes", () => {
     await expect(
       backend.putLatestConditional(candidatePath, '"stale-etag"', "promotion-token"),
     ).rejects.toBeInstanceOf(ConditionalWriteError);
+  });
+
+  it("omits conditional headers for the serialized IHEP follower write", async () => {
+    const root = await tempRoot("unconditional-follower-put");
+    const candidatePath = await writeManifest(root, "candidate.json", manifest("1.2.3"));
+    const backend = objectStore();
+    let call;
+    backend.aws = async (args, options) => {
+      call = { args, options };
+      return { code: 0, stderr: "", stdout: '{"ETag":"\\"follower-etag\\""}' };
+    };
+
+    const result = await backend.putLatestUnconditional(candidatePath, "promotion-token");
+
+    expect(result.etag).toBe('"follower-etag"');
+    expect(call.options.env).toEqual({ AWS_MAX_ATTEMPTS: "1" });
+    expect(call.args).toEqual(
+      expect.arrayContaining([
+        "--metadata",
+        "cam-promotion-token=promotion-token",
+      ]),
+    );
+    expect(call.args).not.toContain("--if-match");
+    expect(call.args).not.toContain("--if-none-match");
   });
 });
 
@@ -772,6 +828,101 @@ describe("monotonic mirror promotion", () => {
     ]);
   });
 
+  it("never lets an old rerun fill a lagging IHEP follower behind newer R2", async () => {
+    const root = await tempRoot("old-rerun-lagging-follower");
+    const candidate = manifest("1.9.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const r2 = new MemoryBackend("r2", {
+      "latest.json": `${JSON.stringify(manifest("2.0.0"))}\n`,
+    });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", {
+      "latest.json": `${JSON.stringify(manifest("1.0.0"))}\n`,
+    });
+    const backends = [r2, ihep];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toBeInstanceOf(DowngradeBlockedError);
+
+    expect(r2.latestPutAttempts).toBe(0);
+    expect(ihep.latestPutAttempts).toBe(0);
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("2.0.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.0.0");
+  });
+
+  it("uses IHEP only as an unconditional follower even when it ignores conditions", async () => {
+    const root = await tempRoot("ihep-ignores-conditions");
+    const candidate = manifest("1.1.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "single-writer",
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).resolves.toEqual(expect.objectContaining({ outcome: "promoted" }));
+
+    expect(r2.conditionalLatestPutAttempts).toBe(1);
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(1);
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.1.0");
+  });
+
+  it("does not let an R2 CAS loser touch condition-ignoring IHEP", async () => {
+    const root = await tempRoot("r2-cas-loser");
+    const candidate = manifest("1.1.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const realPut = r2.putLatestConditional.bind(r2);
+    let raced = false;
+    r2.putLatestConditional = async (...args) => {
+      if (!raced) {
+        raced = true;
+        r2.set(
+          "latest.json",
+          `${JSON.stringify(manifest("1.2.0"))}\n`,
+          { "cam-promotion-token": "newer-winner" },
+        );
+      }
+      return await realPut(...args);
+    };
+    const backends = [r2, ihep];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toBeInstanceOf(ConditionalWriteError);
+
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(0);
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("1.2.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.0.0");
+  });
+
   it("treats a same-version rerun as a no-write idempotent success", async () => {
     const root = await tempRoot("same-version");
     const current = manifest("2.0.0");
@@ -829,7 +980,7 @@ describe("monotonic mirror promotion", () => {
     expect(JSON.parse(ihep.body("latest.json")).version).toBe("2.1.0");
   });
 
-  it("uses conditional writes so a concurrent newer release wins without mixed latest pointers", async () => {
+  it("uses R2 CAS so a concurrent newer release wins without mixed latest pointers", async () => {
     const root = await tempRoot("concurrent");
     const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
     const backends = [
@@ -882,7 +1033,288 @@ describe("monotonic mirror promotion", () => {
     ]);
   });
 
-  it("heals a hard-terminated partial promotion without rewriting the committed backend", async () => {
+  it("repairs IHEP when an older writer is superseded after its pre-write ownership check", async () => {
+    const root = await tempRoot("cross-version-follower-race");
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+    const older = manifest("2.0.0");
+    const newer = manifest("3.0.0");
+    const olderPath = await writeManifest(root, "older.json", older);
+    const newerPath = await writeManifest(root, "newer.json", newer);
+    const olderSummary = summaryFor(backends);
+    let releaseOlderFollower;
+    let olderAtFollower;
+    const holdOlderFollower = new Promise((resolvePromise) => {
+      releaseOlderFollower = resolvePromise;
+    });
+    const olderFollowerReady = new Promise((resolvePromise) => {
+      olderAtFollower = resolvePromise;
+    });
+
+    const olderRun = promoteCandidateTransaction({
+      backends,
+      candidateManifest: older,
+      candidatePath: olderPath,
+      override: overrideOff(),
+      promotionToken: "older-writer",
+      summary: olderSummary,
+      workDir: join(root, "older-transaction"),
+      hooks: {
+        beforeWrite: async (state) => {
+          if (state.backend.name === "ihep") {
+            olderAtFollower();
+            await holdOlderFollower;
+          }
+        },
+      },
+    });
+    await olderFollowerReady;
+
+    await promoteCandidateTransaction({
+      backends,
+      candidateManifest: newer,
+      candidatePath: newerPath,
+      override: overrideOff(),
+      promotionToken: "newer-writer",
+      summary: summaryFor(backends),
+      workDir: join(root, "newer-transaction"),
+    });
+    releaseOlderFollower();
+
+    await expect(olderRun).rejects.toBeInstanceOf(ConditionalWriteError);
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("3.0.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("3.0.0");
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(3);
+    expect(olderSummary.backends.find((backend) => backend.name === "ihep").supersession).toBe(
+      "repaired-to-r2",
+    );
+  });
+
+  it("keeps B's R2 v3 CAS when A repairs B's changed follower before B resumes", async () => {
+    const root = await tempRoot("post-cas-follower-repaired-by-older-writer");
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+    const aManifest = manifest("2.0.0");
+    const bManifest = manifest("3.0.0");
+    const aPath = await writeManifest(root, "a-v2.json", aManifest);
+    const bPath = await writeManifest(root, "b-v3.json", bManifest);
+    const bSummary = summaryFor(backends);
+
+    let releaseA;
+    let signalAReady;
+    const holdA = new Promise((resolvePromise) => {
+      releaseA = resolvePromise;
+    });
+    const aReady = new Promise((resolvePromise) => {
+      signalAReady = resolvePromise;
+    });
+    const aRun = promoteCandidateTransaction({
+      backends,
+      candidateManifest: aManifest,
+      candidatePath: aPath,
+      override: overrideOff(),
+      promotionToken: "writer-a-v2",
+      summary: summaryFor(backends),
+      workDir: join(root, "a-transaction"),
+      hooks: {
+        beforeWrite: async (state) => {
+          if (state.backend.name === "ihep") {
+            signalAReady();
+            await holdA;
+          }
+        },
+      },
+    });
+    await aReady;
+
+    let releaseB;
+    let signalBCasCommitted;
+    const holdB = new Promise((resolvePromise) => {
+      releaseB = resolvePromise;
+    });
+    const bCasCommitted = new Promise((resolvePromise) => {
+      signalBCasCommitted = resolvePromise;
+    });
+    const bRun = promoteCandidateTransaction({
+      backends,
+      candidateManifest: bManifest,
+      candidatePath: bPath,
+      override: overrideOff(),
+      promotionToken: "writer-b-v3",
+      summary: bSummary,
+      workDir: join(root, "b-transaction"),
+      hooks: {
+        afterWrite: async (state) => {
+          if (state.backend.name === "r2") {
+            signalBCasCommitted();
+            await holdB;
+          }
+        },
+      },
+    });
+    await bCasCommitted;
+
+    releaseA();
+    await expect(aRun).rejects.toBeInstanceOf(ConditionalWriteError);
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("3.0.0");
+
+    releaseB();
+    await expect(bRun).resolves.toEqual(expect.objectContaining({ outcome: "promoted" }));
+
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("3.0.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("3.0.0");
+    expect(r2.conditionalLatestPutAttempts).toBe(2);
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(2);
+    expect(bSummary.backends.find((backend) => backend.name === "r2").rollback).toBe(
+      "not-needed",
+    );
+    expect(bSummary.backends.find((backend) => backend.name === "ihep").promotion).toBe(
+      "already-current-after-authority-cas",
+    );
+  });
+
+  it("fails closed on a higher post-CAS follower without rolling R2 back", async () => {
+    const root = await tempRoot("post-cas-safe-successor");
+    const candidate = manifest("2.0.0");
+    const successor = manifest("3.0.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+    const summary = summaryFor(backends);
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "candidate-v2",
+        summary,
+        workDir: join(root, "transaction"),
+        hooks: {
+          afterWrite: (state) => {
+            if (state.backend.name === "r2") {
+              ihep.set(
+                "latest.json",
+                `${JSON.stringify(successor)}\n`,
+                { "cam-promotion-token": "successor-v3" },
+              );
+            }
+          },
+        },
+      }),
+    ).rejects.toBeInstanceOf(ConditionalWriteError);
+
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("2.0.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("3.0.0");
+    expect(r2.conditionalLatestPutAttempts).toBe(1);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(0);
+    expect(summary.authorityPreserved).toBe(true);
+    expect(summary.backends.find((backend) => backend.name === "r2").rollback).toBe(
+      "preserved-authoritative-cas",
+    );
+    expect(summary.backends.find((backend) => backend.name === "ihep").promotion).toBe(
+      "conflict-after-authority-cas",
+    );
+  });
+
+  it("fails closed on an unknown post-CAS identity without rolling R2 back", async () => {
+    const root = await tempRoot("post-cas-unknown-identity");
+    const candidate = manifest("2.0.0");
+    const unknown = structuredClone(candidate);
+    unknown.platforms["windows-x86_64"].signature = "unknown-signature";
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+    const summary = summaryFor(backends);
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "candidate-v2",
+        summary,
+        workDir: join(root, "transaction"),
+        hooks: {
+          afterWrite: (state) => {
+            if (state.backend.name === "r2") {
+              ihep.set(
+                "latest.json",
+                `${JSON.stringify(unknown)}\n`,
+                { "cam-promotion-token": "unknown-v2" },
+              );
+            }
+          },
+        },
+      }),
+    ).rejects.toBeInstanceOf(ConditionalWriteError);
+
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("2.0.0");
+    expect(JSON.parse(ihep.body("latest.json")).platforms["windows-x86_64"].signature).toBe(
+      "unknown-signature",
+    );
+    expect(r2.conditionalLatestPutAttempts).toBe(1);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(0);
+    expect(summary.authorityPreserved).toBe(true);
+  });
+
+  it("fails closed when the final follower becomes higher after this run writes it", async () => {
+    const root = await tempRoot("final-follower-safe-successor");
+    const candidate = manifest("2.0.0");
+    const successor = manifest("3.0.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+    const summary = summaryFor(backends);
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "candidate-v2",
+        summary,
+        workDir: join(root, "transaction"),
+        hooks: {
+          afterWrite: (state) => {
+            if (state.backend.name === "ihep") {
+              ihep.set(
+                "latest.json",
+                `${JSON.stringify(successor)}\n`,
+                { "cam-promotion-token": "successor-v3" },
+              );
+            }
+          },
+        },
+      }),
+    ).rejects.toBeInstanceOf(ConditionalWriteError);
+
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("2.0.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("3.0.0");
+    expect(r2.conditionalLatestPutAttempts).toBe(1);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(1);
+    expect(summary.authorityPreserved).toBe(true);
+    expect(summary.backends.find((backend) => backend.name === "r2").rollback).toBe(
+      "preserved-authoritative-cas",
+    );
+  });
+
+  it("reclaims R2 CAS and heals a hard-terminated R2-only promotion", async () => {
     const root = await tempRoot("partial-terminated-transaction");
     const current = manifest("1.0.0");
     const candidate = manifest("1.1.0");
@@ -897,13 +1329,14 @@ describe("monotonic mirror promotion", () => {
     const r2AttemptsAfterTermination = r2.latestPutAttempts;
     const backends = [r2, ihep];
     const failedResumeSummary = summaryFor(backends);
-    const realIhepPut = ihep.putLatestConditional.bind(ihep);
+    const realIhepPut = ihep.putLatestUnconditional.bind(ihep);
     let failFirstResume = true;
-    ihep.putLatestConditional = async (...args) => {
+    ihep.putLatestUnconditional = async (...args) => {
       if (failFirstResume) {
         failFirstResume = false;
         ihep.latestPutAttempts += 1;
-        throw new ConditionalWriteError("ihep: simulated conditional outage");
+        ihep.unconditionalLatestPutAttempts += 1;
+        throw new Error("ihep: simulated follower outage");
       }
       return await realIhepPut(...args);
     };
@@ -918,15 +1351,15 @@ describe("monotonic mirror promotion", () => {
         summary: failedResumeSummary,
         workDir: join(root, "failed-resume"),
       }),
-    ).rejects.toBeInstanceOf(ConditionalWriteError);
+    ).rejects.toThrow("simulated follower outage");
 
-    expect(r2.latestPutAttempts).toBe(r2AttemptsAfterTermination);
+    expect(r2.latestPutAttempts).toBe(r2AttemptsAfterTermination + 2);
     expect(backends.map((backend) => JSON.parse(backend.body("latest.json")).version)).toEqual([
       "1.1.0",
       "1.0.0",
     ]);
     expect(failedResumeSummary.rollback).toEqual(
-      expect.objectContaining({ attempted: false, complete: true }),
+      expect.objectContaining({ attempted: true, complete: true }),
     );
 
     await expect(
@@ -941,16 +1374,48 @@ describe("monotonic mirror promotion", () => {
       }),
     ).resolves.toEqual(expect.objectContaining({ outcome: "promoted" }));
 
-    expect(r2.latestPutAttempts).toBe(r2AttemptsAfterTermination);
+    expect(r2.latestPutAttempts).toBe(r2AttemptsAfterTermination + 3);
     expect(ihep.latestPutAttempts).toBe(2);
     expect(backends.map((backend) => JSON.parse(backend.body("latest.json")).version)).toEqual([
       "1.1.0",
       "1.1.0",
     ]);
     expect(r2.objects.get("latest.json").metadata["cam-promotion-token"]).toBe(
-      "terminated-run",
+      "fresh-run",
     );
     expect(ihep.objects.get("latest.json").metadata["cam-promotion-token"]).toBe("fresh-run");
+  });
+
+  it("lets a newer rerun converge after a hard-terminated R2-only promotion", async () => {
+    const root = await tempRoot("newer-after-hard-termination");
+    const previous = manifest("1.0.0");
+    const interrupted = manifest("1.1.0");
+    const newer = manifest("1.2.0");
+    const interruptedPath = await writeManifest(root, "interrupted.json", interrupted);
+    const newerPath = await writeManifest(root, "newer.json", newer);
+    const initial = `${JSON.stringify(previous)}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const before = await r2.head("latest.json");
+    await r2.putLatestConditional(interruptedPath, before.etag, "terminated-run");
+    const backends = [r2, ihep];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: newer,
+        candidatePath: newerPath,
+        override: overrideOff(),
+        promotionToken: "newer-rerun",
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).resolves.toEqual(expect.objectContaining({ outcome: "promoted" }));
+
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("1.2.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.2.0");
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(1);
   });
 
   it("fails closed before writing when either backend has no baseline latest.json", async () => {
@@ -976,6 +1441,161 @@ describe("monotonic mirror promotion", () => {
 
     expect(backends.map((backend) => backend.latestPutAttempts)).toEqual([0, 0]);
     expect(ihep.body("latest.json")).toBeUndefined();
+  });
+
+  it("CAS-rolls R2 back and preserves IHEP when the follower fails before writing", async () => {
+    const root = await tempRoot("follower-failure-before-write");
+    const candidate = manifest("1.1.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = Buffer.from(`${JSON.stringify(manifest("1.0.0"))}\n`);
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    ihep.failLatestPut = true;
+    const backends = [r2, ihep];
+    const summary = summaryFor(backends);
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "failed-follower",
+        summary,
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toThrow("simulated write failure");
+
+    expect(r2.body("latest.json").equals(initial)).toBe(true);
+    expect(ihep.body("latest.json").equals(initial)).toBe(true);
+    expect(r2.conditionalLatestPutAttempts).toBe(2);
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(1);
+    expect(summary.backends.find((backend) => backend.name === "r2").rollback).toBe("restored");
+    expect(summary.backends.find((backend) => backend.name === "ihep").rollback).toBe(
+      "preserved-previous",
+    );
+  });
+
+  it("restores only its own IHEP follower write after a later local failure", async () => {
+    const root = await tempRoot("follower-failure-after-write");
+    const candidate = manifest("1.1.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = Buffer.from(`${JSON.stringify(manifest("1.0.0"))}\n`);
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+    const summary = summaryFor(backends);
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "restore-follower",
+        summary,
+        workDir: join(root, "transaction"),
+        hooks: {
+          afterWrite: (state) => {
+            if (state.backend.name === "ihep") throw new Error("simulated post-write failure");
+          },
+        },
+      }),
+    ).rejects.toThrow("simulated post-write failure");
+
+    expect(r2.body("latest.json").equals(initial)).toBe(true);
+    expect(ihep.body("latest.json").equals(initial)).toBe(true);
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(ihep.unconditionalLatestPutAttempts).toBe(2);
+    expect(summary.backends.find((backend) => backend.name === "ihep").rollback).toBe(
+      "restored-unconditionally",
+    );
+  });
+
+  it("does not roll R2 back when IHEP fails after a newer authority takes ownership", async () => {
+    const root = await tempRoot("follower-failure-authority-lost");
+    const candidate = manifest("1.1.0");
+    const successor = manifest("1.2.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    ihep.putLatestUnconditional = async () => {
+      ihep.latestPutAttempts += 1;
+      ihep.unconditionalLatestPutAttempts += 1;
+      r2.set(
+        "latest.json",
+        `${JSON.stringify(successor)}\n`,
+        { "cam-promotion-token": "newer-authority" },
+      );
+      throw new Error("simulated IHEP outage after R2 supersession");
+    };
+    const backends = [r2, ihep];
+    const summary = summaryFor(backends);
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "older-authority",
+        summary,
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toThrow("rollback incomplete");
+
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("1.2.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.0.0");
+    expect(r2.conditionalLatestPutAttempts).toBe(1);
+    expect(ihep.conditionalLatestPutAttempts).toBe(0);
+    expect(summary.backends.find((backend) => backend.name === "r2").rollback).toBe(
+      "skipped-concurrent-change",
+    );
+  });
+
+  it("preserves a concurrent newer IHEP value while rolling back owned R2", async () => {
+    const root = await tempRoot("preserve-concurrent-follower");
+    const candidate = manifest("1.1.0");
+    const followerSuccessor = manifest("1.2.0");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const initial = `${JSON.stringify(manifest("1.0.0"))}\n`;
+    const r2 = new MemoryBackend("r2", { "latest.json": initial });
+    const ihep = new ConditionIgnoringMemoryBackend("ihep", { "latest.json": initial });
+    const backends = [r2, ihep];
+    const summary = summaryFor(backends);
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        promotionToken: "owned-follower",
+        summary,
+        workDir: join(root, "transaction"),
+        hooks: {
+          afterWrite: (state) => {
+            if (state.backend.name === "ihep") {
+              ihep.set(
+                "latest.json",
+                `${JSON.stringify(followerSuccessor)}\n`,
+                { "cam-promotion-token": "newer-follower" },
+              );
+              throw new Error("simulated failure after concurrent IHEP advance");
+            }
+          },
+        },
+      }),
+    ).rejects.toThrow("simulated failure after concurrent IHEP advance");
+
+    expect(JSON.parse(r2.body("latest.json")).version).toBe("1.0.0");
+    expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.2.0");
+    expect(summary.backends.find((backend) => backend.name === "r2").rollback).toBe("restored");
+    expect(summary.backends.find((backend) => backend.name === "ihep").rollback).toBe(
+      "preserved-concurrent-change",
+    );
   });
 
   it("never rolls back an ETag that a concurrent writer owns", async () => {
@@ -1013,7 +1633,7 @@ describe("monotonic mirror promotion", () => {
         summary,
         workDir: join(root, "transaction"),
       }),
-    ).rejects.toBeInstanceOf(ConditionalWriteError);
+    ).rejects.toThrow("rollback incomplete");
 
     expect(JSON.parse(r2.body("latest.json")).version).toBe("1.2.0");
     expect(JSON.parse(ihep.body("latest.json")).version).toBe("1.0.0");

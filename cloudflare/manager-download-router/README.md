@@ -64,14 +64,15 @@ So each release uploads to the mirror (`release.yml` → `scripts/sync-mirror.sh
 | --- | --- |
 | `MANAGER_R2_S3_ENDPOINT` | `https://d39dc6c92d1c4cfde580bf13e946b616.r2.cloudflarestorage.com` |
 | `MANAGER_R2_PROMOTION_ACCESS_KEY_ID` / `MANAGER_R2_PROMOTION_SECRET_ACCESS_KEY` | R2 S3 API token for the current protected release workflow |
-| `MANAGER_IHEP_S3_ENDPOINT` / `_BUCKET` | IHEP endpoint and bucket (`_REGION`/`_PREFIX` optional) |
+| `MANAGER_IHEP_S3_ENDPOINT` / `_BUCKET` environment variables | IHEP endpoint and bucket (`_REGION`/`_PREFIX` variables optional) |
 | `MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID` / `MANAGER_IHEP_S3_PROMOTION_SECRET_ACCESS_KEY` | IHEP token for the current protected release workflow |
 
-Both backends must already contain the same valid `latest.json` baseline and must
-support conditional `PutObject` (`If-Match` / `If-None-Match`) plus custom
-user-metadata round trips through `HeadObject`. Delete the legacy access-key secret
-names after migration so historical workflow revisions cannot perform their old
-unconditional write.
+Both backends must already contain the same valid `latest.json` baseline and
+preserve custom user metadata through `HeadObject`. R2 is the sole CAS authority
+and must enforce conditional `PutObject` (`If-Match` / `If-None-Match`). IHEP is
+the serialized unconditional follower; its ignored conditional headers are not a
+promotion prerequisite. Delete the legacy access-key secret names after migration
+so historical workflow revisions cannot perform their old unconditional write.
 
 Deploy this Worker revision before enabling the protected release workflow. The
 release gate intentionally rejects an older Worker that cannot force and identify

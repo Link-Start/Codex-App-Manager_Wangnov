@@ -94,21 +94,38 @@ Stable releases use a stage/verify/promote, dual-backend protocol implemented by
    immutable with canonical asset digests.
 5. Repeat the complete direct-backend and public-route readback immediately before
    promotion, then read each backend's current `latest.json` and compare semantic
-   versions. Newer candidates advance, same-version reruns are
-   no-write/idempotent, and older tags fail closed.
-6. Publish with ETag (`If-Match` / `If-None-Match`) conditions. If the second
-   backend or final verification fails, restore every backend already changed,
-   also using ETag conditions so rollback cannot overwrite a concurrent writer.
+   versions. Newer candidates advance, a fully converged same-version rerun is a
+   no-write success, and older tags fail closed. If a hard-killed run left R2 on
+   the candidate while IHEP still lags, the rerun first reclaims R2 with CAS.
+6. Treat R2 as the only linearization authority. The workflow conditionally
+   writes R2, verifies the committed ETag and promotion token, then writes IHEP
+   unconditionally as a follower. A CAS loser never writes IHEP. The winner
+   checks R2 ownership immediately before and after the follower write. If it is
+   superseded during that window, it either preserves the newer follower or
+   repairs only its own IHEP value from the newer stable R2 snapshot. If another
+   repair already moved IHEP to the exact R2 candidate after the CAS, that
+   follower is accepted. A higher version or any identity that cannot be proven
+   canonical is preserved but fails closed; it cannot force the owned R2 CAS to
+   roll back and it is never overwritten by the older run.
+7. If IHEP fails, roll R2 back only while its committed ETag and token are still
+   owned by this transaction. IHEP is restored only when it still contains this
+   transaction's token and bytes; an unchanged baseline or a concurrent value is
+   preserved rather than overwritten.
 
 The release workflow has one repository-wide `release-latest-*` concurrency lane
 with `queue: max`, so every pending tag remains queued instead of a third tag
-replacing the second. The object-store conditions remain the independent backstop
-for manual/external writes. `mirror-stage-summary.json`,
+replacing the second. This single-writer lane and the promotion-only credential
+names are a correctness boundary because IHEP does not enforce conditional
+writes. Do not run another credentialed promotion workflow outside this lane.
+R2 CAS and the before/after ownership checks are defense in depth for accidental
+overlap; they are not a claim of an atomic transaction across providers.
+`mirror-stage-summary.json`,
 `mirror-verification-summary.json`, and `mirror-promotion-summary.json` are shown
 in the job summary and retained as workflow artifacts for 90 days. If a runner is
-hard-killed after only one
-`latest.json` write, a fresh run recognizes the exact candidate identity, leaves
-that backend untouched, and conditionally advances only the lagging backend.
+hard-killed after the R2 CAS but before IHEP follows, rerun that release or a newer
+one: the new run reclaims R2 with CAS and converges IHEP. A hard kill during an
+out-of-policy concurrent follower race can still leave IHEP temporarily stale;
+rerunning the release currently authoritative in R2 is the recovery procedure.
 
 Before `prepare` permits any build, and again at the start of every release-job
 attempt, the workflow queries the repository Immutable Releases setting with a
@@ -171,10 +188,6 @@ used, and the run URL are written to the promotion audit and job summary.
 | `MANAGER_R2_S3_ENDPOINT` | R2 S3-compatible endpoint |
 | `MANAGER_R2_PROMOTION_ACCESS_KEY_ID` | R2 write/read credential used only by the protected workflow |
 | `MANAGER_R2_PROMOTION_SECRET_ACCESS_KEY` | R2 write/read secret used only by the protected workflow |
-| `MANAGER_IHEP_S3_ENDPOINT` | IHEP S3-compatible endpoint |
-| `MANAGER_IHEP_S3_BUCKET` | IHEP bucket |
-| `MANAGER_IHEP_S3_REGION` | IHEP region; defaults to `auto` when empty |
-| `MANAGER_IHEP_S3_PREFIX` | optional object-key prefix for IHEP |
 | `MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID` | IHEP write/read credential used only by the protected workflow |
 | `MANAGER_IHEP_S3_PROMOTION_SECRET_ACCESS_KEY` | IHEP write/read secret used only by the protected workflow |
 
@@ -193,6 +206,10 @@ those exact names; leaving any of them available defeats old-run isolation.
 | `AUTHENTICODE_REQUIRED` (repo **variable**) | `true` → fail release when PE is not `Valid` |
 | `WINDOWS_TIMESTAMP_URL` (repo **variable**) | optional RFC3161 timestamp URL |
 | `MANAGER_R2_BUCKET` (repo **variable**) | R2 bucket; defaults to `codex-app-manager` |
+| `MANAGER_IHEP_S3_ENDPOINT` (`release` environment **variable**) | IHEP S3-compatible endpoint |
+| `MANAGER_IHEP_S3_BUCKET` (`release` environment **variable**) | IHEP bucket |
+| `MANAGER_IHEP_S3_REGION` (`release` environment **variable**) | IHEP region; defaults to `auto` when empty |
+| `MANAGER_IHEP_S3_PREFIX` (`release` environment **variable**) | optional object-key prefix for IHEP |
 
 Export your local .p12 / .p8 / .pfx to base64 with `base64 -i file -o -`.
 
@@ -204,7 +221,9 @@ Export your local .p12 / .p8 / .pfx to base64 with `base64 -i file -o -`.
 > conceptually separate — see [`docs/windows-signing.md`](./windows-signing.md).
 >
 > Before enabling promotion, seed both S3-compatible endpoints with a valid
-> `latest.json` baseline. Both endpoints must support conditional `PutObject`
-> requests (`If-Match` / `If-None-Match`) and must preserve custom user metadata
-> through `HeadObject`. Promotion fails closed if either baseline is absent or an
-> endpoint cannot enforce those requirements.
+> `latest.json` baseline. R2 must enforce conditional `PutObject` requests
+> (`If-Match` / `If-None-Match`) and preserve custom user metadata through
+> `HeadObject`. IHEP must preserve metadata and support ordinary read/write, but
+> it is explicitly allowed to ignore conditional headers because the workflow
+> uses it only as the serialized unconditional follower. Promotion fails closed
+> if either baseline is absent.

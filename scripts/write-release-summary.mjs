@@ -114,8 +114,8 @@ if (mirrorStage || mirrorVerification || mirrorPromotion) {
     );
   }
   rows.push("");
-  rows.push("| Backend | Candidate verification | Previous | Decision | Promotion | Rollback | Final | Error |");
-  rows.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  rows.push("| Backend | Candidate verification | Previous | Decision | Promotion | Supersession | Rollback | Final | Error |");
+  rows.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   const backendRows =
     mirrorPromotion?.backends || mirrorVerification?.backends || mirrorStage?.backends || [];
   for (const backend of backendRows) {
@@ -123,6 +123,8 @@ if (mirrorStage || mirrorVerification || mirrorPromotion) {
       `| ${cell(backend.name)} | ${cell(backend.candidateVerification || backend.status)} | ${cell(
         backend.currentVersion || "absent",
       )} | ${cell(backend.decision)} | ${cell(backend.promotion)} | ${cell(
+        backend.supersession,
+      )} | ${cell(
         backend.rollback,
       )} | ${cell(backend.finalVersion)} | ${cell(
         backend.error || backend.rollbackError,
@@ -146,7 +148,11 @@ if (mirrorStage || mirrorVerification || mirrorPromotion) {
   } else {
     rows.push("Emergency downgrade override: not requested.");
   }
-  if (mirrorPromotion?.rollback?.complete === false) {
+  if (mirrorPromotion?.authorityPreserved) {
+    rows.push(
+      "**Authority preserved:** R2 kept its verified CAS commit, but IHEP did not expose the exact canonical candidate identity. The follower was not overwritten and this run failed closed.",
+    );
+  } else if (mirrorPromotion?.rollback?.complete === false) {
     rows.push(
       "**Manual intervention required:** promotion rollback was incomplete; inspect the per-backend errors before another release.",
     );

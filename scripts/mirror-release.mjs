@@ -914,6 +914,16 @@ export class AwsObjectStore {
       singleAttempt: true,
     });
   }
+
+  async putLatestUnconditional(localPath, promotionToken = "") {
+    return await this.putObject(localPath, LATEST_KEY, {
+      contentType: "application/json",
+      ...(promotionToken
+        ? { metadata: { "cam-promotion-token": promotionToken } }
+        : {}),
+      singleAttempt: true,
+    });
+  }
 }
 
 function contentType(name) {
@@ -1178,7 +1188,7 @@ async function readCurrentState(backend, workDir, candidateManifest) {
   const snapshot = await backend.snapshot(LATEST_KEY, path);
   if (!snapshot.exists) {
     throw new Error(
-      `${backend.name}: latest.json is absent; seed both backends with the same valid baseline before enabling transactional promotion`,
+      `${backend.name}: latest.json is absent; seed both backends with the same valid baseline before enabling single-writer promotion`,
     );
   }
   const manifest = await readJson(path, `${backend.name} current latest.json`);
@@ -1246,54 +1256,305 @@ async function withRollbackIo(callback) {
   }
 }
 
-async function rollbackTouched(touched, summaryByName, workDir) {
+function promotionBackends(backends) {
+  const r2 = backends.filter((backend) => backend.name === "r2");
+  const ihep = backends.filter((backend) => backend.name === "ihep");
+  if (backends.length !== 2 || r2.length !== 1 || ihep.length !== 1) {
+    throw new Error("mirror promotion requires exactly one r2 authority and one ihep follower");
+  }
+  return { ihep: ihep[0], r2: r2[0] };
+}
+
+async function assertSnapshotUnchanged(state) {
+  const current = await state.backend.head(LATEST_KEY);
+  if (!current || current.etag !== state.previous.etag) {
+    throw new ConditionalWriteError(
+      `${state.backend.name}: latest.json changed after the promotion snapshot`,
+    );
+  }
+}
+
+async function classifyFollowerCoverage(snapshot, candidateManifest, label) {
+  if (!snapshot.exists) throw new Error(`${label}: latest.json disappeared`);
+  const manifest = await readJson(snapshot.path, `${label} latest.json`);
+  const followerVersion = assertManifestShape(manifest, `${label} latest.json`);
+  const candidateVersion = assertManifestShape(candidateManifest, "candidate latest.json");
+  const comparison = compareSemver(followerVersion, candidateVersion);
+  if (comparison > 0) {
+    return { coverage: "higher-version", manifest, version: followerVersion };
+  }
+  if (
+    comparison === 0 &&
+    manifestReleaseIdentity(manifest) === manifestReleaseIdentity(candidateManifest)
+  ) {
+    return { coverage: "candidate", manifest, version: followerVersion };
+  }
+  if (comparison === 0) {
+    throw new Error(
+      `${label}: latest.json has the candidate version but different artifact/signature identity`,
+    );
+  }
+  return { coverage: "behind", manifest, version: followerVersion };
+}
+
+async function refreshFollowerAfterAuthorityCas(state, candidateManifest, workDir) {
+  const snapshot = await state.backend.snapshot(
+    LATEST_KEY,
+    join(workDir, "ihep-post-authority-cas.json"),
+  );
+  if (!snapshot.exists) throw new Error("ihep: latest.json disappeared after the R2 CAS");
+  if (snapshot.etag === state.previous.etag) {
+    return { coverage: "snapshot-unchanged", needsWrite: true, snapshot };
+  }
+  const classified = await classifyFollowerCoverage(
+    snapshot,
+    candidateManifest,
+    "IHEP after R2 CAS",
+  );
+  if (classified.coverage !== "candidate") {
+    throw new ConditionalWriteError(
+      `ihep: latest.json changed after the R2 CAS to ${classified.version}; exact candidate identity is required`,
+    );
+  }
+  return { ...classified, needsWrite: false, snapshot };
+}
+
+async function ownedCandidateSnapshot({
+  state,
+  candidatePath,
+  expectedEtag,
+  promotionToken,
+  workDir,
+  label,
+}) {
+  const snapshot = await state.backend.snapshot(
+    LATEST_KEY,
+    join(workDir, `${state.backend.name}-${label}.json`),
+  );
+  if (
+    !snapshot.exists ||
+    snapshot.etag !== expectedEtag ||
+    snapshot.metadata?.["cam-promotion-token"] !== promotionToken ||
+    !(await snapshotMatchesFile(snapshot, candidatePath))
+  ) {
+    throw new ConditionalWriteError(
+      `${state.backend.name}: latest.json is no longer owned by this promotion`,
+    );
+  }
+  return snapshot;
+}
+
+async function rollbackAuthoritativePromotion({
+  r2State,
+  ihepState,
+  r2Commit,
+  followerWriteAttempted,
+  candidatePath,
+  promotionToken,
+  summaryByName,
+  workDir,
+}) {
   const failures = [];
+  const r2Summary = summaryByName.get("r2");
+  const ihepSummary = summaryByName.get("ihep");
   rollbackInProgress = true;
   try {
-    for (const item of [...touched].reverse()) {
-      const backendSummary = summaryByName.get(item.state.backend.name);
+    try {
+      await ownedCandidateSnapshot({
+        state: r2State,
+        candidatePath,
+        expectedEtag: r2Commit.etag,
+        promotionToken,
+        workDir,
+        label: "rollback-ownership",
+      });
+    } catch (error) {
+      r2Summary.rollback = "skipped-concurrent-change";
+      r2Summary.rollbackError = safeSummaryError(error);
+      if (followerWriteAttempted) ihepSummary.rollback = "preserved-authority-lost";
+      failures.push(`r2: ${errorText(error)}`);
+      return { failures, rolledBack: false };
+    }
+
+    try {
+      if (!r2State.previous.exists) {
+        throw new Error("authoritative promotion cannot roll back an unseeded R2 baseline");
+      }
+      const restored = await r2State.backend.putLatestConditional(
+        r2State.previous.path,
+        r2Commit.etag,
+        `rollback-${randomUUID()}`,
+      );
+      const check = await r2State.backend.snapshot(
+        LATEST_KEY,
+        join(workDir, "r2-rollback-check.json"),
+      );
+      if (
+        check.etag !== restored.etag ||
+        !(await snapshotMatchesFile(check, r2State.previous.path))
+      ) {
+        throw new Error("R2 rollback verification did not match the previous latest.json");
+      }
+      r2Summary.rollback = "restored";
+    } catch (error) {
+      r2Summary.rollback = "failed";
+      r2Summary.rollbackError = safeSummaryError(error);
+      failures.push(`r2: ${errorText(error)}`);
+      if (followerWriteAttempted) ihepSummary.rollback = "preserved-authority-rollback-failed";
+      return { failures, rolledBack: false };
+    }
+
+    if (followerWriteAttempted) {
       try {
-        const owned = await item.state.backend.snapshot(
+        const current = await ihepState.backend.snapshot(
           LATEST_KEY,
-          join(workDir, `${item.state.backend.name}-rollback-ownership.json`),
+          join(workDir, "ihep-rollback-current.json"),
         );
-        if (
-          !owned.exists ||
-          owned.etag !== item.promotedEtag ||
-          owned.metadata?.["cam-promotion-token"] !== item.promotionToken
+        if (await snapshotMatchesFile(current, ihepState.previous.path)) {
+          ihepSummary.rollback = "preserved-previous";
+        } else if (
+          current.exists &&
+          current.metadata?.["cam-promotion-token"] === promotionToken &&
+          (await snapshotMatchesFile(current, candidatePath))
         ) {
-          throw new ConditionalWriteError(
-            `${item.state.backend.name}: latest.json is no longer owned by this promotion`,
-          );
-        }
-        if (item.state.previous.exists) {
-          const restored = await item.state.backend.putLatestConditional(
-            item.state.previous.path,
-            item.promotedEtag,
+          const restored = await ihepState.backend.putLatestUnconditional(
+            ihepState.previous.path,
             `rollback-${randomUUID()}`,
           );
-          const check = await item.state.backend.snapshot(
+          const check = await ihepState.backend.snapshot(
             LATEST_KEY,
-            join(workDir, `${item.state.backend.name}-rollback-check.json`),
+            join(workDir, "ihep-rollback-check.json"),
           );
-          if (!(await snapshotMatchesFile(check, item.state.previous.path))) {
-            throw new Error("rollback verification did not match previous latest.json");
+          if (
+            check.etag !== restored.etag ||
+            !(await snapshotMatchesFile(check, ihepState.previous.path))
+          ) {
+            throw new Error("IHEP rollback verification did not match the previous latest.json");
           }
-          item.promotedEtag = restored.etag;
+          ihepSummary.rollback = "restored-unconditionally";
         } else {
-          throw new Error("transactional promotion cannot roll back an unseeded backend");
+          // IHEP cannot enforce conditional writes. If its object is neither the
+          // snapshot nor this transaction's token+bytes, never overwrite it.
+          ihepSummary.rollback = "preserved-concurrent-change";
         }
-        backendSummary.rollback = "restored";
       } catch (error) {
-        backendSummary.rollback = "failed";
-        backendSummary.rollbackError = safeSummaryError(error);
-        failures.push(`${item.state.backend.name}: ${errorText(error)}`);
+        ihepSummary.rollback = "failed";
+        ihepSummary.rollbackError = safeSummaryError(error);
+        failures.push(`ihep: ${errorText(error)}`);
       }
     }
   } finally {
     rollbackInProgress = false;
   }
-  return failures;
+  return { failures, rolledBack: true };
+}
+
+async function reconcileFollowerToCurrentAuthority({
+  r2State,
+  ihepState,
+  candidateManifest,
+  candidatePath,
+  promotionToken,
+  summaryByName,
+  workDir,
+}) {
+  const authority = await r2State.backend.snapshot(
+    LATEST_KEY,
+    join(workDir, "r2-superseding-authority.json"),
+  );
+  if (!authority.exists) throw new Error("r2: superseding latest.json disappeared");
+  const authorityManifest = await readJson(
+    authority.path,
+    "R2 superseding authoritative latest.json",
+  );
+  const authorityVersion = assertManifestShape(
+    authorityManifest,
+    "R2 superseding authoritative latest.json",
+  );
+  const candidateVersion = assertManifestShape(candidateManifest, "candidate latest.json");
+  const comparison = compareSemver(authorityVersion, candidateVersion);
+  if (
+    comparison < 0 ||
+    (comparison === 0 &&
+      manifestReleaseIdentity(authorityManifest) !==
+        manifestReleaseIdentity(candidateManifest))
+  ) {
+    throw new Error(
+      `r2: superseding authority ${authorityVersion} is not a safe monotonic successor of ${candidateVersion}`,
+    );
+  }
+
+  const currentFollower = await ihepState.backend.snapshot(
+    LATEST_KEY,
+    join(workDir, "ihep-supersession-current.json"),
+  );
+  if (!currentFollower.exists) {
+    throw new Error("ihep: latest.json disappeared during supersession repair");
+  }
+  if (await snapshotMatchesFile(currentFollower, authority.path)) {
+    summaryByName.get("ihep").supersession = "already-follows-r2";
+    return authorityManifest;
+  }
+
+  const followerManifest = await readJson(
+    currentFollower.path,
+    "IHEP latest.json during supersession repair",
+  );
+  const followerVersion = assertManifestShape(
+    followerManifest,
+    "IHEP latest.json during supersession repair",
+  );
+  if (compareSemver(followerVersion, authorityVersion) > 0) {
+    // Never let an older workflow overwrite a follower that has already moved
+    // beyond the R2 snapshot it observed.
+    summaryByName.get("ihep").supersession = "preserved-newer-follower";
+    return followerManifest;
+  }
+
+  const ownsFollower =
+    (currentFollower.metadata?.["cam-promotion-token"] === promotionToken &&
+      (await snapshotMatchesFile(currentFollower, candidatePath))) ||
+    (currentFollower.etag === ihepState.previous.etag &&
+      (await snapshotMatchesFile(currentFollower, ihepState.previous.path)));
+  if (!ownsFollower) {
+    throw new ConditionalWriteError(
+      "ihep: cannot safely repair a follower object owned by another writer",
+    );
+  }
+
+  const repaired = await ihepState.backend.putLatestUnconditional(
+    authority.path,
+    `superseded-${randomUUID()}`,
+  );
+  const check = await ihepState.backend.snapshot(
+    LATEST_KEY,
+    join(workDir, "ihep-supersession-check.json"),
+  );
+  if (
+    check.etag === repaired.etag &&
+    (await snapshotMatchesFile(check, authority.path))
+  ) {
+    summaryByName.get("ihep").supersession = "repaired-to-r2";
+    return authorityManifest;
+  }
+
+  if (check.exists) {
+    const racedManifest = await readJson(
+      check.path,
+      "IHEP latest.json after supersession repair race",
+    );
+    const racedVersion = assertManifestShape(
+      racedManifest,
+      "IHEP latest.json after supersession repair race",
+    );
+    if (compareSemver(racedVersion, authorityVersion) >= 0) {
+      summaryByName.get("ihep").supersession = "preserved-racing-successor";
+      return racedManifest;
+    }
+  }
+  throw new ConditionalWriteError(
+    "ihep: follower changed to an older value during supersession repair",
+  );
 }
 
 export async function promoteCandidateTransaction({
@@ -1306,9 +1567,10 @@ export async function promoteCandidateTransaction({
   hooks = {},
   promotionToken = randomUUID(),
 }) {
+  const { r2, ihep } = promotionBackends(backends);
   const summaryByName = new Map(summary.backends.map((entry) => [entry.name, entry]));
   const states = [];
-  for (const backend of backends) {
+  for (const backend of [r2, ihep]) {
     try {
       states.push(await readCurrentState(backend, workDir, candidateManifest));
     } catch (error) {
@@ -1348,8 +1610,11 @@ export async function promoteCandidateTransaction({
     }
   }
 
-  const toPromote = states.filter((state) => state.decision !== "idempotent");
-  if (toPromote.length === 0) {
+  const r2State = states.find((state) => state.backend === r2);
+  const ihepState = states.find((state) => state.backend === ihep);
+  let followerNeedsWrite = ihepState.decision !== "idempotent";
+  const authorityNeedsWrite = r2State.decision !== "idempotent";
+  if (!authorityNeedsWrite && !followerNeedsWrite) {
     for (const state of states) {
       const backendSummary = summaryByName.get(state.backend.name);
       try {
@@ -1383,105 +1648,237 @@ export async function promoteCandidateTransaction({
     return { outcome: "idempotent", states };
   }
 
-  const touched = [];
-  let activeState = null;
+  if (!authorityNeedsWrite && followerNeedsWrite) {
+    r2State.decision = override.used
+      ? "claim-follower-downgrade-override"
+      : "claim-follower-reconciliation";
+    summaryByName.get("r2").decision = r2State.decision;
+  }
+
+  let activeState = r2State;
+  let r2Commit = null;
+  let followerWriteAttempted = false;
+  let followerCommit = null;
+  let supersededByAuthority = false;
+  let supersessionFailures = [];
+  let followerConflictAfterAuthority = false;
   try {
-    for (const state of toPromote) {
-      activeState = state;
-      const backendSummary = summaryByName.get(state.backend.name);
-      await hooks.beforeWrite?.(state);
-      let promoted;
-      try {
-        promoted = await state.backend.putLatestConditional(
+    // R2 is the only linearization authority. The follower snapshot must still
+    // be current before this workflow attempts the authoritative CAS.
+    await assertSnapshotUnchanged(ihepState);
+    await hooks.beforeWrite?.(r2State);
+    try {
+      r2Commit = await r2.putLatestConditional(
+        candidatePath,
+        r2State.previous.etag,
+        promotionToken,
+      );
+      summaryByName.get("r2").promotion = "written-authoritative-cas";
+    } catch (error) {
+      if (error instanceof ConditionalWriteError) throw error;
+      const ambiguous = await withRollbackIo(() =>
+        observeAmbiguousWrite(
+          r2State,
           candidatePath,
-          state.previous.etag,
+          workDir,
           promotionToken,
+        ),
+      );
+      if (!ambiguous) {
+        summaryByName.get("r2").promotion = "write-outcome-unresolved";
+        summaryByName.get("r2").rollback = "uncertain";
+        throw new WriteOutcomeUncertainError(
+          `r2: write failed and ownership could not be resolved after ${errorText(error)}`,
+        );
+      }
+      r2Commit = ambiguous;
+      summaryByName.get("r2").promotion = "write-outcome-ambiguous";
+      throw error;
+    }
+
+    await ownedCandidateSnapshot({
+      state: r2State,
+      candidatePath,
+      expectedEtag: r2Commit.etag,
+      promotionToken,
+      workDir,
+      label: "authoritative-check",
+    });
+    summaryByName.get("r2").promotion = "verified-authoritative-cas";
+    await hooks.afterWrite?.(r2State);
+
+    if (followerNeedsWrite) {
+      await ownedCandidateSnapshot({
+        state: r2State,
+        candidatePath,
+        expectedEtag: r2Commit.etag,
+        promotionToken,
+        workDir,
+        label: "pre-follower-ownership",
+      });
+      activeState = ihepState;
+      let refreshedFollower;
+      try {
+        refreshedFollower = await refreshFollowerAfterAuthorityCas(
+          ihepState,
+          candidateManifest,
+          workDir,
         );
       } catch (error) {
-        if (error instanceof ConditionalWriteError) {
-          throw error;
-        }
-        const ambiguous = await withRollbackIo(() =>
+        followerConflictAfterAuthority = true;
+        summaryByName.get("r2").rollback = "preserved-authoritative-cas";
+        summaryByName.get("ihep").promotion = "conflict-after-authority-cas";
+        summaryByName.get("ihep").rollback = "preserved-unowned-follower";
+        if (error instanceof ConditionalWriteError) throw error;
+        throw new ConditionalWriteError(
+          `ihep: cannot prove exact candidate identity after the R2 CAS: ${errorText(error)}`,
+        );
+      }
+      if (!refreshedFollower.needsWrite) {
+        followerNeedsWrite = false;
+        summaryByName.get("ihep").promotion = "already-current-after-authority-cas";
+      }
+    }
+
+    if (followerNeedsWrite) {
+      activeState = ihepState;
+      await hooks.beforeWrite?.(ihepState);
+      followerWriteAttempted = true;
+      try {
+        followerCommit = await ihep.putLatestUnconditional(candidatePath, promotionToken);
+        summaryByName.get("ihep").promotion = "written-unconditional-follower";
+      } catch (error) {
+        const observed = await withRollbackIo(() =>
           observeAmbiguousWrite(
-            state,
+            ihepState,
             candidatePath,
             workDir,
             promotionToken,
           ),
         );
-        if (ambiguous) {
-          touched.push({
-            state,
-            promotedEtag: ambiguous.etag,
-            promotionToken,
-          });
-          backendSummary.promotion = "write-outcome-ambiguous";
-        } else {
-          backendSummary.promotion = "write-outcome-unresolved";
-          backendSummary.rollback = "uncertain";
-          throw new WriteOutcomeUncertainError(
-            `${state.backend.name}: write failed and ownership could not be resolved after ${errorText(error)}`,
-          );
+        if (!observed) {
+          summaryByName.get("ihep").promotion = "write-outcome-unresolved";
+          throw error;
         }
-        throw error;
+        followerCommit = observed;
+        summaryByName.get("ihep").promotion = "write-outcome-confirmed";
       }
-      const touchedItem = {
-        state,
-        promotedEtag: promoted.etag,
+      await ownedCandidateSnapshot({
+        state: ihepState,
+        candidatePath,
+        expectedEtag: followerCommit.etag,
         promotionToken,
-      };
-      touched.push(touchedItem);
-      backendSummary.promotion = "written";
-      const check = await state.backend.snapshot(
-        LATEST_KEY,
-        join(workDir, `${state.backend.name}-promoted-check.json`),
-      );
-      if (
-        check.etag !== promoted.etag ||
-        check.metadata?.["cam-promotion-token"] !== promotionToken
-      ) {
-        touched.pop();
-        backendSummary.promotion = "ownership-lost";
-        backendSummary.rollback = "skipped-concurrent-change";
-        throw new ConditionalWriteError(
-          `${state.backend.name}: latest.json changed after the conditional write`,
-        );
-      }
-      if (!(await snapshotMatchesFile(check, candidatePath))) {
-        throw new Error(`${state.backend.name}: promoted latest.json failed byte verification`);
-      }
-      backendSummary.promotion = "verified";
-      await hooks.afterWrite?.(state);
+        workDir,
+        label: "follower-check",
+      });
+      summaryByName.get("ihep").promotion = "verified-unconditional-follower";
+      await hooks.afterWrite?.(ihepState);
+    } else if (summaryByName.get("ihep").promotion === "not-started") {
+      summaryByName.get("ihep").promotion = "already-current";
     }
 
-    for (const state of states) {
-      activeState = state;
-      const finalSnapshot = await state.backend.snapshot(
-        LATEST_KEY,
-        join(workDir, `${state.backend.name}-final-latest.json`),
-      );
-      if (!finalSnapshot.exists) throw new Error(`${state.backend.name}: latest.json disappeared`);
-      const finalManifest = await readJson(
-        finalSnapshot.path,
-        `${state.backend.name} final latest.json`,
-      );
-      if (manifestReleaseIdentity(finalManifest) !== manifestReleaseIdentity(candidateManifest)) {
-        throw new Error(`${state.backend.name}: final latest.json does not expose the candidate release`);
+    activeState = r2State;
+    try {
+      await ownedCandidateSnapshot({
+        state: r2State,
+        candidatePath,
+        expectedEtag: r2Commit.etag,
+        promotionToken,
+        workDir,
+        label: "final-authority",
+      });
+    } catch (ownershipError) {
+      // The protected release workflow is serialized, but keep a fencing repair
+      // for accidental/manual overlap. An older writer that was superseded
+      // between its pre-IHEP check and its unconditional IHEP write repairs only
+      // an object it still owns, using the newer stable R2 snapshot.
+      supersededByAuthority = true;
+      summaryByName.get("r2").rollback = "skipped-superseded";
+      try {
+        await withRollbackIo(() =>
+          reconcileFollowerToCurrentAuthority({
+            r2State,
+            ihepState,
+            candidateManifest,
+            candidatePath,
+            promotionToken,
+            summaryByName,
+            workDir,
+          }),
+        );
+      } catch (repairError) {
+        supersessionFailures = [`ihep: ${errorText(repairError)}`];
       }
-      summaryByName.get(state.backend.name).finalVersion = finalManifest.version;
+      throw ownershipError;
     }
+    summaryByName.get("r2").finalVersion = candidateManifest.version;
+
+    activeState = ihepState;
+    let finalFollower;
+    let finalFollowerCoverage;
+    try {
+      finalFollower = await ihep.snapshot(
+        LATEST_KEY,
+        join(workDir, "ihep-final-latest.json"),
+      );
+      finalFollowerCoverage = await classifyFollowerCoverage(
+        finalFollower,
+        candidateManifest,
+        "IHEP final",
+      );
+    } catch (error) {
+      followerConflictAfterAuthority = true;
+      summaryByName.get("r2").rollback = "preserved-authoritative-cas";
+      summaryByName.get("ihep").rollback = "preserved-unowned-follower";
+      throw new ConditionalWriteError(
+        `ihep: cannot prove exact final candidate identity: ${errorText(error)}`,
+      );
+    }
+    if (finalFollowerCoverage.coverage !== "candidate") {
+      followerConflictAfterAuthority = true;
+      summaryByName.get("r2").rollback = "preserved-authoritative-cas";
+      summaryByName.get("ihep").rollback = "preserved-unowned-follower";
+      throw new ConditionalWriteError(
+        `ihep: final latest.json is ${finalFollowerCoverage.version}; exact candidate identity is required`,
+      );
+    }
+    if (
+      followerCommit &&
+      (finalFollower.etag !== followerCommit.etag ||
+        finalFollower.metadata?.["cam-promotion-token"] !== promotionToken)
+    ) {
+      summaryByName.get("ihep").supersession =
+        "already-follows-r2";
+    }
+    summaryByName.get("ihep").finalVersion = finalFollowerCoverage.manifest.version;
     return { outcome: override.used ? "downgrade-override-promoted" : "promoted", states };
   } catch (error) {
     if (activeState) {
       summaryByName.get(activeState.backend.name).error = safeSummaryError(error);
     }
-    const rollbackFailures = await rollbackTouched(touched, summaryByName, workDir);
-    const ownershipUncertain = error instanceof WriteOutcomeUncertainError;
-    const failures = ownershipUncertain
-      ? [...rollbackFailures, `${activeState?.backend.name || "backend"}: write ownership unresolved`]
-      : rollbackFailures;
+    let failures = [];
+    let rolledBack = false;
+    if (followerConflictAfterAuthority) {
+      summary.authorityPreserved = true;
+    } else if (supersededByAuthority) {
+      failures = supersessionFailures;
+    } else if (r2Commit) {
+      ({ failures, rolledBack } = await rollbackAuthoritativePromotion({
+        r2State,
+        ihepState,
+        r2Commit,
+        followerWriteAttempted,
+        candidatePath,
+        promotionToken,
+        summaryByName,
+        workDir,
+      }));
+    } else if (error instanceof WriteOutcomeUncertainError) {
+      failures = ["r2: write ownership unresolved"];
+    }
     summary.rollback = {
-      attempted: touched.length > 0,
+      attempted:
+        Boolean(r2Commit) && !supersededByAuthority && !followerConflictAfterAuthority,
       complete: failures.length === 0,
       failures,
     };
@@ -1490,7 +1887,7 @@ export async function promoteCandidateTransaction({
         `${errorText(error)}; rollback incomplete: ${failures.join("; ")}`,
       );
     }
-    if (touched.length > 0) summary.outcome = "rolled-back";
+    if (rolledBack) summary.outcome = "rolled-back";
     throw error;
   }
 }

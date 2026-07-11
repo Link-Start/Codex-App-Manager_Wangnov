@@ -21,6 +21,28 @@ describe("release workflow recovery invariants", () => {
     );
   });
 
+  it("enforces the single-writer boundary for the unconditional IHEP follower", () => {
+    expect(workflow).toContain(
+      "correctness boundary for the unconditional IHEP follower",
+    );
+    expect(releaseJob).toContain("Enforce legacy mirror credential revocation");
+    expect(releaseJob).toContain("MANAGER_R2_PROMOTION_ACCESS_KEY_ID");
+    expect(releaseJob).toContain("MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID");
+    expect(releaseJob).toContain(
+      "MANAGER_IHEP_S3_ENDPOINT: ${{ vars.MANAGER_IHEP_S3_ENDPOINT }}",
+    );
+    expect(releaseJob).toContain(
+      "MANAGER_IHEP_S3_BUCKET: ${{ vars.MANAGER_IHEP_S3_BUCKET }}",
+    );
+    expect(releaseJob).not.toContain(
+      "MANAGER_IHEP_S3_ENDPOINT: ${{ secrets.MANAGER_IHEP_S3_ENDPOINT }}",
+    );
+    expect(mirrorRelease).toContain(
+      "followerCommit = await ihep.putLatestUnconditional(candidatePath, promotionToken)",
+    );
+    expect(mirrorRelease).not.toContain("await ihep.putLatestConditional(");
+  });
+
   it("refreshes immutable Release state inside the release job on failed-job reruns", () => {
     expect(releaseJob).toContain("id: live_release");
     expect(releaseJob).toContain(
