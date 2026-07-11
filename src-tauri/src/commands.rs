@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
@@ -275,9 +275,9 @@ fn manager_updater_builder_for_endpoints(
             .endpoints(endpoints)
             .map_err(|e| AppError::Engine(format!("configure manager updater endpoints: {e}")))?;
     }
-    // `UpdaterBuilder::timeout` only reaches manifest checks. Artifact transfer
-    // remains allowed to run while bytes keep flowing, but the patched plugin
-    // enforces a hard byte cap and this client still aborts read stalls.
+    // The builder timeout applies to manifest checks. The shared client hook
+    // intentionally sets only connection/read stall limits; the authenticated
+    // Update gets its independent artifact total timeout below.
     Ok(builder
         .timeout(MANAGER_UPDATE_CHECK_TIMEOUT)
         .max_manifest_size(MANAGER_UPDATE_MANIFEST_MAX_BYTES)
@@ -286,9 +286,6 @@ fn manager_updater_builder_for_endpoints(
             client
                 .connect_timeout(MANAGER_UPDATE_CONNECT_TIMEOUT)
                 .read_timeout(MANAGER_UPDATE_READ_TIMEOUT)
-                // The plugin's per-check timeout does not cover artifact
-                // downloads. Bound slow-drip responses as well as byte size.
-                .timeout(MANAGER_UPDATE_ARTIFACT_TIMEOUT)
         }))
 }
 
@@ -690,6 +687,9 @@ fn authenticate_manager_update(
         .clone();
     update.download_url =
         manager_update_versioned_url(manifest_endpoint, &identity.version, &artifact)?;
+    // Only the artifact selected by the signed identity receives the longer
+    // total transfer window. Manifest checks retain the builder's 30s bound.
+    update.timeout = Some(MANAGER_UPDATE_ARTIFACT_TIMEOUT);
     Ok(AuthenticatedManagerUpdate {
         update,
         artifact_sha256,
@@ -1096,6 +1096,42 @@ pub async fn manager_install_update(
     }
 }
 
+fn reserve_manager_relaunch(
+    operations: &OperationManager,
+) -> Result<OperationGuard, CommandError> {
+    let guard = begin_operation_guard(operations, OperationKind::ManagerUpdate)?;
+    operations
+        .set_phase(guard.token(), OperationPhase::Committing)
+        .map_err(AppError::from)
+        .map_err(CommandError::from)?;
+    Ok(guard)
+}
+
+#[tauri::command]
+pub async fn manager_relaunch(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<(), CommandError> {
+    let relaunch_guard = reserve_manager_relaunch(&state.operations)?;
+    // Run off the UI thread so Tauri delivers ExitRequested + Exit. The latter
+    // lets the single-instance plugin release its mutex/socket before Tauri
+    // spawns the replacement process. `restart() -> !` keeps the guard on this
+    // worker stack until exit; `request_restart()` would return and reopen the
+    // TOCTOU window we just closed.
+    tauri::async_runtime::spawn_blocking(move || {
+        let _relaunch_guard = relaunch_guard;
+        app.state::<ManagerState>()
+            .force_quit
+            .store(true, Ordering::SeqCst);
+        app.restart();
+        #[allow(unreachable_code)]
+        ()
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("manager relaunch worker failed: {error}")))?;
+    Err(AppError::Internal("manager relaunch returned without restarting".to_string()).into())
+}
+
 fn windows_domain_settings_for_persisted(state: &ManagerState) -> DomainAppSettings {
     let saved = PersistedAppSettings::load();
     let mut settings = state.settings.clone();
@@ -1131,9 +1167,11 @@ fn mac_existing_install_start_dir() -> PathBuf {
 
 const MIN_PORTABLE_FREE_SPACE_BYTES: u64 = 1_073_741_824;
 
-fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGuard, CommandError> {
-    state
-        .operations
+fn begin_operation_guard(
+    operations: &OperationManager,
+    kind: OperationKind,
+) -> Result<OperationGuard, CommandError> {
+    operations
         .begin(kind)
         .map_err(|err| {
             log::warn!(
@@ -1145,16 +1183,24 @@ fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGua
         .map_err(Into::into)
 }
 
+fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGuard, CommandError> {
+    begin_operation_guard(&state.operations, kind)
+}
+
 struct DetachedGuard {
     operations: OperationManager,
     token: Option<OperationToken>,
 }
 
 impl DetachedGuard {
-    fn validate(state: &ManagerState, token: OperationToken) -> Result<Self, CommandError> {
+    fn validate(
+        state: &ManagerState,
+        token: OperationToken,
+        expected_kind: OperationKind,
+    ) -> Result<Self, CommandError> {
         let operations = state.operations.clone();
         operations
-            .validate(&token)
+            .validate_detached(&token, expected_kind)
             .map_err(destructive_token_error)?;
         Ok(Self {
             operations,
@@ -1520,7 +1566,7 @@ pub async fn mac_perform_update(
             AppError::Internal("拒绝执行：破坏性更新必须带显式 confirm".to_string()).into(),
         );
     }
-    let op = DetachedGuard::validate(&state, token)?;
+    let op = DetachedGuard::validate(&state, token, OperationKind::Update)?;
     op.set_phase(OperationPhase::Preparing);
     // Best-effort: a full-package update needs no delta tool, so don't reject the
     // whole operation when it's absent — only the delta branch requires it.
@@ -1942,7 +1988,11 @@ pub fn retry_ancillary(
                 "清除用户数据需要破坏性令牌（先 arm_destructive uninstall）".to_string(),
             )
         })?;
-        RetryGuard::Detached(DetachedGuard::validate(&state, token)?)
+        RetryGuard::Detached(DetachedGuard::validate(
+            &state,
+            token,
+            OperationKind::Uninstall,
+        )?)
     } else {
         RetryGuard::Scoped(begin_guard(&state, OperationKind::Adopt)?)
     };
@@ -1954,24 +2004,6 @@ pub fn retry_ancillary(
         }
         _ => Err(AppError::UnsupportedPlatform.into()),
     }
-}
-
-#[tauri::command]
-pub fn begin_operation(
-    state: State<'_, ManagerState>,
-    kind: OperationKind,
-) -> Result<OperationToken, CommandError> {
-    state
-        .operations
-        .begin_detached(kind)
-        .map_err(|err| {
-            log::warn!(
-                "begin_operation rejected kind={} error={err}",
-                kind.as_str()
-            );
-            AppError::from(err)
-        })
-        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -2002,9 +2034,11 @@ pub fn end_operation(
     state: State<'_, ManagerState>,
     token: OperationToken,
 ) -> Result<(), CommandError> {
+    // Renderer cleanup is intentionally limited to an armed token that no
+    // backend worker has claimed. Internal guards use OperationManager::end.
     state
         .operations
-        .end(token)
+        .cancel_unclaimed_detached(token)
         .map_err(AppError::from)
         .map_err(Into::into)
 }
@@ -2197,7 +2231,7 @@ pub async fn mac_uninstall(
     if !confirm {
         return Err(AppError::Internal("拒绝执行：卸载必须带显式 confirm".to_string()).into());
     }
-    let _op = DetachedGuard::validate(&state, token)?;
+    let _op = DetachedGuard::validate(&state, token, OperationKind::Uninstall)?;
     tauri::async_runtime::spawn_blocking(move || uninstall_macos(keep_codex_home))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -2563,7 +2597,7 @@ pub async fn win_perform_update(
             AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
         );
     }
-    let op = DetachedGuard::validate(&state, token)?;
+    let op = DetachedGuard::validate(&state, token, OperationKind::Update)?;
     op.set_phase(OperationPhase::Preparing);
     let endpoints = windows_endpoints_for_settings(&state)?;
     let mut settings = windows_domain_settings_for_persisted(&state);
@@ -2656,7 +2690,7 @@ pub async fn win_uninstall(
             AppError::Internal("拒绝执行：Windows 卸载必须带显式 confirm".to_string()).into(),
         );
     }
-    let _op = DetachedGuard::validate(&state, token)?;
+    let _op = DetachedGuard::validate(&state, token, OperationKind::Uninstall)?;
     let settings = windows_domain_settings_for_persisted(&state);
     tauri::async_runtime::spawn_blocking(move || {
         uninstall_windows_codex(&settings, confirm, purge_user_data)
@@ -2672,10 +2706,13 @@ mod tests {
         check_with_manager_fallback, download_then_install_manager_update,
         install_root_from_picked_dir, manager_update_matches_confirmation,
         manager_update_reqwest_error, manager_update_root_url, manager_update_versioned_url,
-        normalize_windows_source_base, sha256_hex, validate_install_root_path,
+        normalize_windows_source_base, reserve_manager_relaunch, sha256_hex,
+        validate_install_root_path,
         validate_manager_update_identity_claim, validated_custom_proxy_for_settings,
         ManagerReleaseChannel, ManagerReleaseIdentity, ManagerReleaseIdentityPlatform,
     };
+    use crate::app::op_phase::OperationPhase;
+    use crate::app::oplock::{OperationKind, OperationManager};
     use crate::errors::AppError;
     use std::collections::HashMap;
     use std::fs;
@@ -2731,6 +2768,38 @@ mod tests {
         assert!(!manager_update_matches_confirmation(
             "0.2.1", "0.2.1", "0.2.1", "0.2.0"
         ));
+    }
+
+    #[test]
+    fn manager_relaunch_reservation_rejects_a_live_codex_mutation() {
+        let path = temp_path("manager-relaunch-busy.lock");
+        let _ = fs::remove_file(&path);
+        let operations = OperationManager::new(path.clone());
+        let active = operations.begin(OperationKind::Update).unwrap();
+        let error = match reserve_manager_relaunch(&operations) {
+            Ok(_) => panic!("manager relaunch unexpectedly bypassed the active operation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "operation_busy");
+        assert_eq!(operations.active_kind(), Some(OperationKind::Update));
+        drop(active);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn manager_relaunch_reservation_holds_the_shared_lock_until_exit() {
+        let path = temp_path("manager-relaunch-reserved.lock");
+        let _ = fs::remove_file(&path);
+        let operations = OperationManager::new(path.clone());
+        let reservation = reserve_manager_relaunch(&operations).unwrap();
+
+        assert_eq!(operations.active_kind(), Some(OperationKind::ManagerUpdate));
+        assert_eq!(operations.phase(), OperationPhase::Committing);
+        assert!(operations.begin(OperationKind::Install).is_err());
+        assert!(operations.begin(OperationKind::Update).is_err());
+        drop(reservation);
+        let _ = fs::remove_file(path);
     }
 
     fn manager_update_test_endpoints() -> Vec<url::Url> {

@@ -176,6 +176,14 @@ describe("manager updater API", () => {
     });
   });
 
+  it("routes manager relaunch through the shared backend operation lock", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await expect(managerApi.relaunchManager()).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenCalledWith("manager_relaunch");
+  });
+
   it("preserves updater command failures for structured recovery UI", async () => {
     window.__TAURI_INTERNALS__ = {};
     const failure = { code: "network", message: "offline" };

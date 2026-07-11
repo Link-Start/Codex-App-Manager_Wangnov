@@ -117,6 +117,7 @@ describe("release identity minisign", () => {
 
   it("reuses the exact first-stage signature on a release rerun", async () => {
     const identityBytes = Buffer.from("test");
+    const publishedSignature = Buffer.from(TAURI_SIGNATURE, "utf8");
     const missingFetch = async () => response(null, 404);
     await expect(
       reuseReleaseIdentitySignature({
@@ -129,7 +130,7 @@ describe("release identity minisign", () => {
     ).resolves.toBeNull();
 
     const rerunFetch = async (url) =>
-      response(url.pathname.endsWith(".sig") ? TAURI_SIGNATURE : identityBytes);
+      response(url.pathname.endsWith(".sig") ? publishedSignature : identityBytes);
     const reused = await reuseReleaseIdentitySignature({
       identityBytes,
       version: "1.0.0",
@@ -138,7 +139,7 @@ describe("release identity minisign", () => {
       fetchImpl: rerunFetch,
     });
 
-    expect(reused.toString("utf8")).toBe(`${TAURI_SIGNATURE}\n`);
+    expect(reused).toEqual(publishedSignature);
   });
 
   it("reuses an already-published GitHub Release signature before consulting mirrors", async () => {
@@ -171,7 +172,7 @@ describe("release identity minisign", () => {
       fetchImpl,
     });
 
-    expect(reused.toString("utf8")).toBe(`${TAURI_SIGNATURE}\n`);
+    expect(reused).toEqual(Buffer.from(TAURI_SIGNATURE, "utf8"));
     expect(calls).toEqual([
       "https://api.github.com/repos/owner/repo/releases/tags/v1.0.0",
       "https://api.github.test/assets/1",

@@ -295,8 +295,11 @@ describe("manager self-update state machine", () => {
     const user = userEvent.setup();
     api.checkManagerUpdate.mockResolvedValue(AVAILABLE);
     api.relaunchManager
-      .mockRejectedValueOnce(new Error("process plugin unavailable"))
-      .mockRejectedValueOnce(new Error("process plugin still unavailable"))
+      .mockRejectedValueOnce(new Error("backend restart unavailable"))
+      .mockRejectedValueOnce({
+        code: "operation_busy",
+        message: "Codex update started before relaunch retry",
+      })
       .mockResolvedValueOnce(undefined);
     renderManager({ includeAbout: true });
 
@@ -316,8 +319,8 @@ describe("manager self-update state machine", () => {
     expect(screen.queryByRole("button", { name: "更新" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "立即重启" })).toBeEnabled();
 
-    // A retry launched from the compact Home banner must reopen the error
-    // surface if relaunch still fails instead of looking like a dead button.
+    // A retry launched from the compact Home banner must recover when the
+    // backend's atomic preflight finds a newly-started Codex operation.
     await user.click(screen.getByRole("button", { name: "立即重启" }));
     expect(api.relaunchManager).toHaveBeenCalledTimes(2);
     expect(await screen.findByRole("dialog")).toHaveTextContent(
@@ -574,7 +577,7 @@ describe("manager self-update state machine", () => {
     api.getManagerUpdateRuntime.mockResolvedValue(
       runtimeSnapshot({ revision: 4, phase: "installed", downloaded: 10, total: 10 }),
     );
-    api.relaunchManager.mockRejectedValueOnce(new Error("process plugin unavailable"));
+    api.relaunchManager.mockRejectedValueOnce(new Error("backend restart unavailable"));
     renderManager();
 
     await waitFor(() => expect(api.relaunchManager).toHaveBeenCalledTimes(1));

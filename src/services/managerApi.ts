@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { relaunch } from "@tauri-apps/plugin-process";
 
 import type {
   AncillaryRetryReport,
@@ -580,7 +579,7 @@ export const managerApi = {
   },
   relaunchManager(): Promise<void> {
     if (!hasTauriRuntime()) return Promise.resolve();
-    return relaunch();
+    return invoke<void>("manager_relaunch");
   },
   macStatus(): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {

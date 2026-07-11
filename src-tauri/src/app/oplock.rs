@@ -97,9 +97,9 @@ struct ActiveOp {
     /// Claimed leases are not subject to wall-clock stale reclaim.
     detached: bool,
     claimed: bool,
-    /// Number of live `validate` holders (DetachedGuard instances). `end` only
-    /// unlocks when the last holder releases, so concurrent guards cannot free
-    /// the lock while another worker still thinks it owns the lease.
+    /// Number of live backend holders. Renderer-created destructive tokens are
+    /// single-use, so this is currently 0 before claim and 1 while its
+    /// DetachedGuard is alive.
     holders: u32,
     /// Progress through the op lifecycle; drives quit policy.
     phase: OperationPhase,
@@ -214,7 +214,14 @@ impl OperationManager {
         Err(OperationError::InvalidToken)
     }
 
-    pub fn validate(&self, token: &OperationToken) -> Result<(), OperationError> {
+    /// Claim a renderer-created detached lease for the exact destructive kind.
+    /// Attached backend guards are deliberately ineligible even if a renderer
+    /// learns their snapshot id.
+    pub fn validate_detached(
+        &self,
+        token: &OperationToken,
+        expected_kind: OperationKind,
+    ) -> Result<(), OperationError> {
         let mut inner = self
             .inner
             .lock()
@@ -224,22 +231,69 @@ impl OperationManager {
         // reclaimed on begin/is_busy/end (or validate of a non-matching token).
         if let Some(active) = inner.active.as_mut() {
             if active.token == token.0 {
-                // First successful validate claims a detached lease so long-running
-                // tasks are no longer reclaimed solely by wall-clock age.
-                if active.detached && !active.claimed {
-                    active.claimed = true;
-                    log::info!(
-                        "claimed detached operation lease kind={} token_prefix={}",
+                if !active.detached
+                    || active.kind != expected_kind
+                    || active.claimed
+                    || active.holders != 0
+                {
+                    log::warn!(
+                        "detached operation token rejected expected_kind={} active_kind={} detached={} claimed={} holders={} token_prefix={}",
+                        expected_kind.as_str(),
                         active.kind.as_str(),
+                        active.detached,
+                        active.claimed,
+                        active.holders,
                         token_prefix(&token.0)
                     );
+                    return Err(OperationError::InvalidToken);
                 }
-                active.holders = active.holders.saturating_add(1);
+                // A destructive confirmation token is single-use. Claiming it
+                // both disables stale reclaim and prevents parallel invokes
+                // from running two swaps/uninstalls under one lease.
+                active.claimed = true;
+                active.holders = 1;
+                log::info!(
+                    "claimed detached operation lease kind={} token_prefix={}",
+                    active.kind.as_str(),
+                    token_prefix(&token.0)
+                );
                 return Ok(());
             }
         }
         self.reclaim_stale_detached(&mut inner)?;
         log::warn!("operation token validation failed");
+        Err(OperationError::InvalidToken)
+    }
+
+    /// Cancel only a renderer-created lease that no backend worker has claimed.
+    /// This is the safe public counterpart to the internal `end` holder release.
+    pub fn cancel_unclaimed_detached(
+        &self,
+        token: OperationToken,
+    ) -> Result<(), OperationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationError::Lock("operation mutex poisoned".to_string()))?;
+        if let Some(active) = inner.active.as_ref() {
+            if active.token == token.0
+                && active.detached
+                && !active.claimed
+                && active.holders == 0
+            {
+                let kind = active.kind;
+                Self::unlock_lock_file(&mut inner)?;
+                inner.active.take();
+                log::info!(
+                    "cancelled unclaimed detached operation kind={} token_prefix={}",
+                    kind.as_str(),
+                    token_prefix(&token.0)
+                );
+                return Ok(());
+            }
+        }
+        self.reclaim_stale_detached(&mut inner)?;
+        log::warn!("cancel detached operation received a claimed or invalid token");
         Err(OperationError::InvalidToken)
     }
 
@@ -600,14 +654,20 @@ mod tests {
     }
 
     #[test]
-    fn begin_validate_and_drop_release_lock() {
+    fn attached_guard_token_cannot_be_claimed_by_renderer() {
         let path = lock_path("basic");
         let manager = OperationManager::new(path.clone());
         let guard = manager.begin(OperationKind::Update).unwrap();
         assert!(manager.is_busy());
-        assert!(manager.validate(guard.token()).is_ok());
         assert!(matches!(
-            manager.validate(&OperationToken("wrong".to_string())),
+            manager.validate_detached(guard.token(), OperationKind::Update),
+            Err(OperationError::InvalidToken)
+        ));
+        assert!(matches!(
+            manager.validate_detached(
+                &OperationToken("wrong".to_string()),
+                OperationKind::Update
+            ),
             Err(OperationError::InvalidToken)
         ));
         assert!(matches!(
@@ -669,6 +729,34 @@ mod tests {
     }
 
     #[test]
+    fn renderer_can_cancel_only_an_unclaimed_detached_token() {
+        let path = lock_path("cancel-detached");
+        let manager = OperationManager::new(path.clone());
+        let token = manager.begin_detached(OperationKind::Uninstall).unwrap();
+
+        manager
+            .cancel_unclaimed_detached(token.clone())
+            .unwrap();
+        assert!(!manager.is_busy());
+        assert!(matches!(
+            manager.cancel_unclaimed_detached(token),
+            Err(OperationError::InvalidToken)
+        ));
+
+        let claimed = manager.begin_detached(OperationKind::Update).unwrap();
+        manager
+            .validate_detached(&claimed, OperationKind::Update)
+            .unwrap();
+        assert!(matches!(
+            manager.cancel_unclaimed_detached(claimed.clone()),
+            Err(OperationError::InvalidToken)
+        ));
+        assert_eq!(manager.active_kind(), Some(OperationKind::Update));
+        manager.end(claimed).unwrap();
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn unclaimed_detached_past_stale_can_be_reclaimed() {
         let path = lock_path("unclaimed-timeout");
         let manager = OperationManager::new_with_stale_after(path.clone(), 0);
@@ -679,7 +767,7 @@ mod tests {
         assert_eq!(guard.kind(), OperationKind::Install);
         // Original unclaimed token is gone after reclaim.
         assert!(matches!(
-            manager.validate(&token),
+            manager.validate_detached(&token, OperationKind::Update),
             Err(OperationError::InvalidToken)
         ));
         assert!(matches!(
@@ -697,7 +785,9 @@ mod tests {
         let token = manager.begin_detached(OperationKind::Update).unwrap();
 
         // Claim via validate before any reclaim path runs with a zero threshold.
-        manager.validate(&token).unwrap();
+        manager
+            .validate_detached(&token, OperationKind::Update)
+            .unwrap();
 
         // Past wall-clock stale threshold, but claimed → still busy / blocked.
         assert!(manager.is_busy());
@@ -709,8 +799,12 @@ mod tests {
             manager.begin_detached(OperationKind::Uninstall),
             Err(OperationError::BusySameProcess("update"))
         ));
-        // Lease remains valid under the original token.
-        manager.validate(&token).unwrap();
+        // The claimed lease remains active, but the confirmation token cannot
+        // start a second concurrent destructive worker.
+        assert!(matches!(
+            manager.validate_detached(&token, OperationKind::Update),
+            Err(OperationError::InvalidToken)
+        ));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -723,23 +817,31 @@ mod tests {
         let token = manager.begin_detached(OperationKind::Adopt).unwrap();
 
         assert!(matches!(
-            manager.validate(&OperationToken("wrong".to_string())),
+            manager.validate_detached(
+                &OperationToken("wrong".to_string()),
+                OperationKind::Adopt
+            ),
             Err(OperationError::InvalidToken)
         ));
         // Wrong token must not claim or clear the unclaimed op.
         assert!(manager.is_busy());
 
-        manager.validate(&token).unwrap();
-        // Second validate adds another holder (concurrent DetachedGuard) — still busy.
-        manager.validate(&token).unwrap();
+        assert!(matches!(
+            manager.validate_detached(&token, OperationKind::Update),
+            Err(OperationError::InvalidToken)
+        ));
+        manager
+            .validate_detached(&token, OperationKind::Adopt)
+            .unwrap();
+        assert!(matches!(
+            manager.validate_detached(&token, OperationKind::Adopt),
+            Err(OperationError::InvalidToken)
+        ));
 
         assert!(matches!(
             manager.begin(OperationKind::Install),
             Err(OperationError::BusySameProcess("adopt"))
         ));
-        // First end only drops one holder; lock stays until the last end.
-        manager.end(token.clone()).unwrap();
-        assert!(manager.is_busy());
         manager.end(token).unwrap();
         assert!(!manager.is_busy());
 
@@ -751,12 +853,14 @@ mod tests {
         let path = lock_path("end-claimed");
         let manager = OperationManager::new_with_stale_after(path.clone(), 0);
         let token = manager.begin_detached(OperationKind::Install).unwrap();
-        manager.validate(&token).unwrap();
+        manager
+            .validate_detached(&token, OperationKind::Install)
+            .unwrap();
 
         manager.end(token.clone()).unwrap();
         assert!(!manager.is_busy());
         assert!(matches!(
-            manager.validate(&token),
+            manager.validate_detached(&token, OperationKind::Install),
             Err(OperationError::InvalidToken)
         ));
         assert!(manager.begin(OperationKind::Update).is_ok());
@@ -770,13 +874,17 @@ mod tests {
         let path = lock_path("drop-claimed");
         let manager = OperationManager::new_with_stale_after(path.clone(), 0);
         let token = manager.begin_detached(OperationKind::Update).unwrap();
-        manager.validate(&token).unwrap();
+        manager
+            .validate_detached(&token, OperationKind::Update)
+            .unwrap();
 
         // Simulate DetachedGuard Drop.
         manager.end(token).unwrap();
         assert!(!manager.is_busy());
         let next = manager.begin_detached(OperationKind::Install).unwrap();
-        assert!(manager.validate(&next).is_ok());
+        assert!(manager
+            .validate_detached(&next, OperationKind::Install)
+            .is_ok());
         manager.end(next).unwrap();
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -787,7 +895,9 @@ mod tests {
         let path = lock_path("concurrent-claimed");
         let manager = OperationManager::new(path.clone());
         let token = manager.begin_detached(OperationKind::Update).unwrap();
-        manager.validate(&token).unwrap();
+        manager
+            .validate_detached(&token, OperationKind::Update)
+            .unwrap();
 
         assert!(matches!(
             manager.begin(OperationKind::Install),
@@ -827,7 +937,9 @@ mod tests {
         let path = lock_path("phase-quit");
         let manager = OperationManager::new(path.clone());
         let token = manager.begin_detached(OperationKind::Update).unwrap();
-        manager.validate(&token).unwrap();
+        manager
+            .validate_detached(&token, OperationKind::Update)
+            .unwrap();
 
         assert!(matches!(
             manager.quit_policy(false, false),
@@ -866,7 +978,9 @@ mod tests {
         assert!(manager.snapshot().is_none());
 
         let token = manager.begin_detached(OperationKind::Update).unwrap();
-        manager.validate(&token).unwrap();
+        manager
+            .validate_detached(&token, OperationKind::Update)
+            .unwrap();
 
         let snap = manager.snapshot().expect("active snapshot");
         assert_eq!(snap.id, token.0);

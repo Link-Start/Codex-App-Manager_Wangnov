@@ -137,7 +137,6 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         // Launch-at-login support. Off by default — the user opts in from
         // Settings; we only register the plugin so the toggle can flip it.
@@ -164,13 +163,13 @@ pub fn run() {
             commands::manager_ack_update_runtime,
             commands::manager_get_update_runtime,
             commands::manager_install_update,
+            commands::manager_relaunch,
             commands::get_settings,
             commands::set_settings,
             commands::get_config_health,
             commands::restore_config_backup,
             commands::reset_config,
             commands::retry_ancillary,
-            commands::begin_operation,
             commands::arm_destructive,
             commands::end_operation,
             commands::get_operation_snapshot,

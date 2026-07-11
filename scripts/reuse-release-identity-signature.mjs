@@ -38,7 +38,11 @@ const verifyReusableSignature = ({ identityBytes, remoteIdentity, remoteSignatur
   if (!remoteSignature) return null;
   const encodedSignature = remoteSignature.toString("utf8").trim();
   verifyTauriMinisign(identityBytes, encodedSignature, publicKey);
-  return Buffer.from(`${encodedSignature}\n`, "utf8");
+  // Verification accepts the text envelope after trimming surrounding
+  // whitespace, but immutable reruns must preserve the already-published asset
+  // byte-for-byte. Re-encoding here would change the SHA-256 when the original
+  // Tauri signer output has no trailing newline.
+  return Buffer.from(remoteSignature);
 };
 
 export const reuseGithubReleaseIdentitySignature = async ({
