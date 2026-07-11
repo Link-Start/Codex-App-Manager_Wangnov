@@ -16,7 +16,10 @@ import {
   assertReleaseTagRuleset,
   verifyReleaseTagProtection,
 } from "./check-release-tag-protection.mjs";
-import { requiredReleaseAssetNames } from "./check-release-reuse.mjs";
+import {
+  REQUIRED_RELEASE_METADATA_ASSET_NAMES,
+  requiredReleaseAssetNames,
+} from "./check-release-reuse.mjs";
 import {
   assertReleaseBindingAttestation,
   createReleaseBinding,
@@ -400,28 +403,34 @@ describe("release workflow recovery invariants", () => {
 
   it("requires the mutable Release draft to match the exact canonical local asset set", async () => {
     const root = await mkdtemp(join(tmpdir(), "cam-release-draft-assets-"));
-    const artifact = join(root, "CodexAppManager_1.2.3_x64-setup.exe");
-    const manifest = join(root, "latest.json");
+    const releaseTag = "v1.2.3";
+    const names = [
+      ...requiredReleaseAssetNames(releaseTag),
+      ...REQUIRED_RELEASE_METADATA_ASSET_NAMES,
+    ];
+    const paths = names.map((name) => join(root, name));
     try {
-      await writeFile(artifact, "signed installer bytes");
-      await writeFile(manifest, '{"version":"1.2.3"}\n');
+      await Promise.all(
+        paths.map((path, index) => writeFile(path, `canonical asset ${index}`)),
+      );
       const release = {
-        assets: [
-          { id: 101, name: "CodexAppManager_1.2.3_x64-setup.exe", size: 22 },
-          { id: 102, name: "latest.json", size: 20 },
-        ],
+        assets: names.map((name, index) => ({
+          id: 101 + index,
+          name,
+          size: Buffer.byteLength(`canonical asset ${index}`),
+        })),
         draft: true,
         id: 77,
         immutable: false,
-        tag_name: "v1.2.3",
+        tag_name: releaseTag,
       };
-      expect(
-        verifyDraftReleaseAssets(release, "v1.2.3", [artifact, manifest]),
-      ).toMatchObject({
-        assets: [
-          { id: 101, name: "CodexAppManager_1.2.3_x64-setup.exe" },
-          { id: 102, name: "latest.json" },
-        ],
+      expect(verifyDraftReleaseAssets(release, releaseTag, paths)).toMatchObject({
+        assets: expect.arrayContaining([
+          expect.objectContaining({
+            name: "CodexAppManager_1.2.3_x64-setup.exe",
+          }),
+          expect.objectContaining({ name: "latest.json" }),
+        ]),
         releaseId: 77,
       });
 
@@ -438,17 +447,17 @@ describe("release workflow recovery invariants", () => {
               },
             ],
           },
-          "v1.2.3",
-          [artifact, manifest],
+          releaseTag,
+          paths,
         ),
       ).toThrow("unexpected: CodexAppManager_1.2.3_unsigned-debug.exe");
       expect(() =>
         verifyDraftReleaseAssets(
           { ...release, assets: release.assets.slice(1) },
-          "v1.2.3",
-          [artifact, manifest],
+          releaseTag,
+          paths,
         ),
-      ).toThrow("missing: CodexAppManager_1.2.3_x64-setup.exe");
+      ).toThrow(`missing: ${names[0]}`);
       expect(() =>
         verifyDraftReleaseAssets(
           {
@@ -459,17 +468,23 @@ describe("release workflow recovery invariants", () => {
                 : asset,
             ),
           },
-          "v1.2.3",
-          [artifact, manifest],
+          releaseTag,
+          paths,
         ),
       ).toThrow("draft release asset digest differs from local bytes: latest.json");
       expect(() =>
         verifyDraftReleaseAssets(
           { ...release, draft: false, immutable: true },
-          "v1.2.3",
-          [artifact, manifest],
+          releaseTag,
+          paths,
         ),
       ).toThrow("no longer the expected mutable draft");
+
+      const localExtra = join(root, "unsigned-debug.exe");
+      await writeFile(localExtra, "unsigned debug bytes");
+      expect(() =>
+        verifyDraftReleaseAssets(release, releaseTag, [...paths, localExtra]),
+      ).toThrow("local release asset is not in the canonical allowlist: unsigned-debug.exe");
     } finally {
       await rm(root, { force: true, recursive: true });
     }
@@ -565,6 +580,9 @@ describe("release workflow recovery invariants", () => {
     );
     expect(manifestStep).toContain(
       "node scripts/validate-release-manifest.mjs",
+    );
+    expect(manifestStep).toContain(
+      'node scripts/gen-updater-manifest.mjs "$RELEASE_TAG" dist release-source',
     );
     expect(manifestStep).not.toContain('if [[ "$RELEASE_TAG" != *-* ]]');
   });

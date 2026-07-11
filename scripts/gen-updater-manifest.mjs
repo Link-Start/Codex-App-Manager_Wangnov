@@ -5,14 +5,16 @@
 // and point the urls at the GitHub release download path. The manifest is
 // served as a release asset, matching the updater endpoints in tauri.conf.json.
 //
-// Usage: node scripts/gen-updater-manifest.mjs <tag> <artifacts-dir>
+// Usage: node scripts/gen-updater-manifest.mjs <tag> <artifacts-dir> <source-root>
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const [, , tag, dir] = process.argv;
-if (!tag || !dir) {
-  console.error("usage: gen-updater-manifest.mjs <tag> <artifacts-dir>");
+const [, , tag, dir, sourceRoot] = process.argv;
+if (!tag || !dir || !sourceRoot) {
+  console.error(
+    "usage: gen-updater-manifest.mjs <tag> <artifacts-dir> <source-root>",
+  );
   process.exit(2);
 }
 
@@ -47,7 +49,7 @@ if (!release) {
 }
 const { version, channel } = release;
 const REPO = "Wangnov/Codex-App-Manager";
-const releaseNotesPath = join("docs", "releases", `${tag}.md`);
+const releaseNotesPath = join(sourceRoot, "docs", "releases", `${tag}.md`);
 const updaterNotes = (markdown) => {
   // Release pages start with a GitHub-only banner and end with the fixed
   // download/signature table. The in-app sheet needs the reviewed summary and

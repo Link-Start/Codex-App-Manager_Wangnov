@@ -339,6 +339,11 @@ export async function verifyLocalUpdaterArtifacts({
 }
 
 function manifestReleaseIdentity(manifest) {
+  const channel = typeof manifest.channel === "string" ? manifest.channel : null;
+  const notesSha256 =
+    typeof manifest.notes === "string"
+      ? createHash("sha256").update(manifest.notes, "utf8").digest("hex")
+      : null;
   const platforms = Object.fromEntries(
     Object.entries(manifest.platforms || {})
       .sort(([left], [right]) => left.localeCompare(right))
@@ -351,7 +356,7 @@ function manifestReleaseIdentity(manifest) {
         },
       ]),
   );
-  return JSON.stringify({ version: manifest.version, platforms });
+  return JSON.stringify({ channel, notesSha256, version: manifest.version, platforms });
 }
 
 function assertManifestShape(manifest, label, { allowMissingSha256 = false } = {}) {
@@ -596,7 +601,7 @@ export function assertCandidateMatchesRelease(candidateManifest, artifactManifes
   }
   if (manifestReleaseIdentity(candidateManifest) !== manifestReleaseIdentity(artifactManifest)) {
     throw new Error(
-      "candidate latest.json platforms/signatures/sha256 do not match the artifact-derived manifest",
+      "candidate latest.json channel/notes/platforms/signatures/sha256 do not match the artifact-derived manifest",
     );
   }
   return {
@@ -1672,7 +1677,7 @@ async function classifyFollowerCoverage(snapshot, candidateManifest, label) {
   }
   if (comparison === 0) {
     throw new Error(
-      `${label}: latest.json has the candidate version but different artifact/signature identity`,
+      `${label}: latest.json has the candidate version but different channel/notes/artifact/signature identity`,
     );
   }
   return { coverage: "behind", manifest, version: followerVersion };
@@ -1971,7 +1976,7 @@ export async function promoteCandidateTransaction({
   const mismatch = states.find((state) => state.decision === "blocked-same-version-mismatch");
   if (mismatch) {
     throw new Error(
-      `${mismatch.backend.name}: current latest has the candidate version but different artifact/signature/sha256 identity`,
+      `${mismatch.backend.name}: current latest has the candidate version but different channel/notes/artifact/signature/sha256 identity`,
     );
   }
   const downgradeStates = states.filter((state) => state.decision === "blocked-downgrade");

@@ -66,8 +66,9 @@ Every `latest.json` platform entry must include a lowercase 64-character
 `sha256`. Fresh publication, immutable historical-release reuse, and mirror
 verification all fail closed when that field is missing or malformed, or when
 it differs from either the signed release identity or the local artifact bytes.
-Mirror same-version identity comparisons include this digest, so a rerun cannot
-treat a byte-different artifact claim as idempotent.
+Mirror same-version identity comparisons include the channel, release-note hash,
+and artifact digests, so a rerun cannot treat drifted notes or a byte-different
+artifact claim as idempotent.
 The one compatibility exception is a strictly older mirror baseline published
 before this field existed: a fully bound newer candidate may migrate it once.
 Legacy baselines are never accepted for same-version reuse or downgrade.

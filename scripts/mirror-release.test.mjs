@@ -500,7 +500,7 @@ describe("release candidate binding", () => {
     const changedSignature = structuredClone(candidate);
     changedSignature.platforms["windows-x86_64"].signature = "different-signature";
     expect(() => assertCandidateMatchesRelease(changedSignature, derived, "v1.2.3")).toThrow(
-      "platforms/signatures/sha256 do not match",
+      "channel/notes/platforms/signatures/sha256 do not match",
     );
 
     const missingSha256 = structuredClone(candidate);
@@ -518,7 +518,7 @@ describe("release candidate binding", () => {
     const changedSha256 = structuredClone(candidate);
     changedSha256.platforms["windows-x86_64"].sha256 = "b".repeat(64);
     expect(() => assertCandidateMatchesRelease(changedSha256, derived, "v1.2.3")).toThrow(
-      "platforms/signatures/sha256 do not match",
+      "channel/notes/platforms/signatures/sha256 do not match",
     );
   });
 });
@@ -1546,8 +1546,38 @@ describe("monotonic mirror promotion", () => {
         summary: summaryFor(backends),
         workDir: join(root, "transaction"),
       }),
-    ).rejects.toThrow("different artifact/signature/sha256 identity");
+    ).rejects.toThrow("different channel/notes/artifact/signature/sha256 identity");
     expect(backends.map((backend) => backend.latestPutAttempts)).toEqual([0, 0]);
+  });
+
+  it.each([
+    ["release notes", (current) => { current.notes = "tampered release notes"; }],
+    ["channel", (current) => { current.channel = "prerelease"; }],
+  ])("does not treat same-version %s drift as idempotent", async (_field, mutate) => {
+    const root = await tempRoot(`same-version-${_field.replaceAll(" ", "-")}-mismatch`);
+    const candidate = manifest("2.0.0");
+    candidate.channel = "stable";
+    const current = structuredClone(candidate);
+    mutate(current);
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const original = Buffer.from(`${JSON.stringify(current)}\n`);
+    const backends = [
+      new MemoryBackend("r2", { "latest.json": original }),
+      new MemoryBackend("ihep", { "latest.json": original }),
+    ];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toThrow("different channel/notes/artifact/signature/sha256 identity");
+    expect(backends.map((backend) => backend.latestPutAttempts)).toEqual([0, 0]);
+    expect(backends.every((backend) => backend.body("latest.json").equals(original))).toBe(true);
   });
 
   it("rejects a concurrent latest change before returning idempotent", async () => {

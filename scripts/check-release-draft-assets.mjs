@@ -5,6 +5,12 @@ import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  REQUIRED_RELEASE_METADATA_ASSET_NAMES,
+  allowedReleaseAssetNames,
+  requiredReleaseAssetNames,
+} from "./check-release-reuse.mjs";
+
 const RELEASE_TAG_PATTERN =
   /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const SAFE_ASSET_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
@@ -31,6 +37,7 @@ export function verifyDraftReleaseAssets(release, releaseTag, paths) {
   }
 
   const localByName = new Map();
+  const allowedNames = new Set(allowedReleaseAssetNames(releaseTag));
   for (const path of paths) {
     const metadata = statSync(path);
     if (!metadata.isFile() || metadata.size <= 0) {
@@ -39,6 +46,9 @@ export function verifyDraftReleaseAssets(release, releaseTag, paths) {
     const name = basename(path);
     if (!SAFE_ASSET_NAME.test(name)) {
       throw new Error(`canonical release asset name is unsafe: ${name}`);
+    }
+    if (!allowedNames.has(name)) {
+      throw new Error(`local release asset is not in the canonical allowlist: ${name}`);
     }
     if (localByName.has(name)) {
       throw new Error(`canonical release assets contain duplicate basename: ${name}`);
@@ -49,6 +59,15 @@ export function verifyDraftReleaseAssets(release, releaseTag, paths) {
       sha256: sha256File(path),
       size: metadata.size,
     });
+  }
+  const missingRequiredLocal = [
+    ...requiredReleaseAssetNames(releaseTag),
+    ...REQUIRED_RELEASE_METADATA_ASSET_NAMES,
+  ].filter((name) => !localByName.has(name));
+  if (missingRequiredLocal.length > 0) {
+    throw new Error(
+      `canonical local release assets are incomplete: ${missingRequiredLocal.join(", ")}`,
+    );
   }
 
   const remoteAssets = Array.isArray(release.assets) ? release.assets : [];

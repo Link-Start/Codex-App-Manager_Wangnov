@@ -29,8 +29,15 @@ describe("release identity generation", () => {
     tempDirs.push(root);
     mkdirSync(join(root, "dist"));
     mkdirSync(join(root, "docs", "releases"), { recursive: true });
+    mkdirSync(join(root, "release-source", "docs", "releases"), {
+      recursive: true,
+    });
     writeFileSync(
       join(root, "docs", "releases", `${tag}.md`),
+      "Drifted notes from the current default branch\n",
+    );
+    writeFileSync(
+      join(root, "release-source", "docs", "releases", `${tag}.md`),
       "Reviewed notes\n",
     );
 
@@ -50,7 +57,7 @@ describe("release identity generation", () => {
       run: (releaseTag = tag) => {
         const result = spawnSync(
           process.execPath,
-          [script, releaseTag, "dist"],
+          [script, releaseTag, "dist", "release-source"],
           {
             cwd: root,
             encoding: "utf8",
@@ -79,6 +86,7 @@ describe("release identity generation", () => {
     expect(identity).not.toHaveProperty("pub_date");
     expect(identity.channel).toBe("stable");
     expect(manifest.channel).toBe("stable");
+    expect(manifest.notes).toBe("Reviewed notes");
     expect(identity.notes_sha256).toBe(
       createHash("sha256").update("Reviewed notes", "utf8").digest("hex"),
     );

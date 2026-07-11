@@ -987,7 +987,7 @@ jobs:
         env:
           ALLOW_PARTIAL_RELEASE: ${{ vars.ALLOW_PARTIAL_RELEASE }}
         run: |
-          node scripts/gen-updater-manifest.mjs "$RELEASE_TAG" dist
+          node scripts/gen-updater-manifest.mjs "$RELEASE_TAG" dist release-source
           cp latest.json "$RUNNER_TEMP/artifact-derived-latest.json"
           if [[ "${{ steps.release_source.outputs.existing }}" == "true" ]]; then
             cp "$RUNNER_TEMP/published-latest.json" latest.json
