@@ -41,6 +41,11 @@ import {
 
 const roots = [];
 const execFileAsync = promisify(execFile);
+const TEST_IHEP_REDIRECT = Object.freeze({
+  endpoint: "https://ihep.example/root",
+  bucket: "mirror-bucket",
+  prefix: "manager",
+});
 
 async function tempRoot(name) {
   const root = await mkdtemp(join(tmpdir(), `cam-${name}-`));
@@ -140,6 +145,9 @@ function overrideOff() {
 class MemoryBackend {
   constructor(name, objects = {}) {
     this.name = name;
+    this.endpoint = name === "ihep" ? TEST_IHEP_REDIRECT.endpoint : "https://r2.example";
+    this.bucket = name === "ihep" ? TEST_IHEP_REDIRECT.bucket : "r2-bucket";
+    this.prefix = name === "ihep" ? TEST_IHEP_REDIRECT.prefix : "";
     this.objects = new Map();
     this.counter = 0;
     this.latestPutAttempts = 0;
@@ -285,12 +293,41 @@ function updaterFixture(artifact) {
   };
 }
 
-function publicRouteFetch(objects, requests = [], { ihepObjects = objects } = {}) {
+function testIhepRedirect(workerUrl, overrides = {}) {
+  const config = { ...TEST_IHEP_REDIRECT, ...overrides };
+  const redirected = new URL(config.endpoint);
+  const objectKey = decodeURIComponent(workerUrl.pathname.slice("/manager/".length));
+  const prefix = config.prefix.replace(/^\/+|\/+$/g, "");
+  redirected.pathname = [
+    redirected.pathname.replace(/\/+$/g, ""),
+    config.bucket,
+    prefix,
+    objectKey,
+  ]
+    .filter(Boolean)
+    .join("/");
+  if (!redirected.pathname.startsWith("/")) redirected.pathname = `/${redirected.pathname}`;
+  redirected.searchParams.set("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
+  redirected.searchParams.set("X-Amz-Credential", "AKIATEST/20260711/auto/s3/aws4_request");
+  redirected.searchParams.set("X-Amz-SignedHeaders", "host");
+  redirected.searchParams.set("X-Amz-Signature", "a".repeat(64));
+  return redirected.toString();
+}
+
+function publicRouteFetch(
+  objects,
+  requests = [],
+  { ihepObjects = objects, ihepRedirectOverrides = {} } = {},
+) {
   return async (value) => {
     const url = new URL(value);
     requests.push(url);
     if (url.hostname === "ihep.example") {
-      const body = ihepObjects.get(url.pathname);
+      const objectPrefix = "/root/mirror-bucket/manager/";
+      const objectKey = url.pathname.startsWith(objectPrefix)
+        ? decodeURIComponent(url.pathname.slice(objectPrefix.length))
+        : "";
+      const body = ihepObjects.get(`/manager/${objectKey}`);
       return body === undefined
         ? new Response("not found", { status: 404 })
         : new Response(body, { status: 200 });
@@ -300,7 +337,7 @@ function publicRouteFetch(objects, requests = [], { ihepObjects = objects } = {}
       return new Response(null, {
         status: 302,
         headers: {
-          Location: `https://ihep.example${url.pathname}`,
+          Location: testIhepRedirect(url, ihepRedirectOverrides),
           "X-Codex-Mirror-Backend": "ihep",
         },
       });
@@ -475,6 +512,7 @@ describe("public mirror route verification", () => {
       candidateManifest: candidate,
       candidatePath,
       expectedArtifacts,
+      ihepRedirect: TEST_IHEP_REDIRECT,
       mirrorBase: "https://mirror.example/manager",
       publicKey: fixture.publicKey,
       workDir: join(root, "verify"),
@@ -501,12 +539,56 @@ describe("public mirror route verification", () => {
         candidateManifest: candidate,
         candidatePath,
         expectedArtifacts,
+        ihepRedirect: TEST_IHEP_REDIRECT,
         mirrorBase: "https://mirror.example/manager",
         publicKey: fixture.publicKey,
         workDir: join(root, "corrupt"),
         fetchImpl: publicRouteFetch(objects, [], { ihepObjects: corruptedIhep }),
       }),
     ).rejects.toThrow(`public mirror ihep size mismatch for ${corruptedName}`);
+  });
+
+  it.each([
+    ["origin", { endpoint: "https://r2.example/root" }],
+    ["bucket", { bucket: "wrong-bucket" }],
+    ["prefix", { prefix: "wrong-prefix" }],
+  ])("rejects an IHEP redirect with the wrong %s even when bytes are identical", async (_name, overrides) => {
+    const root = await tempRoot("public-route-binding");
+    const artifact = Buffer.from("identical public updater payload");
+    const fixture = updaterFixture(artifact);
+    const candidate = completeManifest("1.2.3", fixture.signature);
+    const candidateKey = candidateKeyFor("1.2.3", "binding-run");
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const objects = new Map([[`/manager/${candidateKey}`, await readFile(candidatePath)]]);
+    const expectedArtifacts = Object.entries(candidate.platforms).map(([platform, entry]) => {
+      const name = new URL(entry.url).pathname.split("/").at(-1);
+      objects.set(`/manager/1.2.3/${name}`, artifact);
+      return {
+        key: `1.2.3/${name}`,
+        localPath: join(root, name),
+        name,
+        platform,
+        sha256: hash(artifact),
+        signature: fixture.signature,
+        size: artifact.length,
+      };
+    });
+
+    await expect(
+      verifyPublicMirrorRoute({
+        candidateKey,
+        candidateManifest: candidate,
+        candidatePath,
+        expectedArtifacts,
+        ihepRedirect: TEST_IHEP_REDIRECT,
+        mirrorBase: "https://mirror.example/manager",
+        publicKey: fixture.publicKey,
+        workDir: join(root, "verify"),
+        fetchImpl: publicRouteFetch(objects, [], { ihepRedirectOverrides: overrides }),
+      }),
+    ).rejects.toThrow(
+      "Worker IHEP redirect target does not match the configured endpoint, bucket, prefix, and object",
+    );
   });
 });
 

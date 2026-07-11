@@ -61,6 +61,13 @@ class WriteOutcomeUncertainError extends Error {
   }
 }
 
+class PublicRouteBindingError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PublicRouteBindingError";
+  }
+}
+
 function errorText(error) {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -497,7 +504,92 @@ function publicProbeUrl(value, candidateKey, backend) {
   return parsed.toString();
 }
 
-async function downloadPublicObject(fetchImpl, url, destination, label, backend) {
+function normalizedObjectKey(value, label, { allowEmpty = false } = {}) {
+  const text = String(value || "").replace(/^\/+|\/+$/g, "");
+  if (!text) {
+    if (allowEmpty) return "";
+    throw new Error(`${label} is empty`);
+  }
+  return text
+    .split("/")
+    .map((segment) => assertSafeSegment(segment, label))
+    .join("/");
+}
+
+function normalizeIhepRedirectExpectation(value) {
+  if (!value || typeof value !== "object") {
+    throw new Error("IHEP public verification requires an expected redirect target");
+  }
+  const endpoint = new URL(value.endpoint);
+  if (
+    endpoint.protocol !== "https:" ||
+    endpoint.username ||
+    endpoint.password ||
+    endpoint.search ||
+    endpoint.hash
+  ) {
+    throw new Error(
+      "IHEP redirect endpoint must be HTTPS without credentials, query, or fragment",
+    );
+  }
+  let endpointPath;
+  try {
+    endpointPath = decodeURIComponent(endpoint.pathname).replace(/\/+$/g, "");
+  } catch {
+    throw new Error("IHEP redirect endpoint path is not valid percent-encoding");
+  }
+  return {
+    origin: endpoint.origin,
+    endpointPath,
+    bucket: assertSafeSegment(String(value.bucket || "").trim(), "IHEP redirect bucket"),
+    prefix: normalizedObjectKey(value.prefix, "IHEP redirect prefix", { allowEmpty: true }),
+  };
+}
+
+function assertExpectedIhepRedirect(redirected, expectation, objectKey) {
+  const key = normalizedObjectKey(objectKey, "IHEP redirect object key");
+  const suffix = [expectation.bucket, expectation.prefix, key].filter(Boolean).join("/");
+  const expectedPath = `${expectation.endpointPath}/${suffix}` || "/";
+  let actualPath;
+  try {
+    actualPath = decodeURIComponent(redirected.pathname);
+  } catch {
+    throw new PublicRouteBindingError(
+      "Worker IHEP redirect path is not valid percent-encoding",
+    );
+  }
+  if (
+    redirected.protocol !== "https:" ||
+    redirected.username ||
+    redirected.password ||
+    redirected.hash ||
+    redirected.origin !== expectation.origin ||
+    actualPath !== expectedPath
+  ) {
+    throw new PublicRouteBindingError(
+      "Worker IHEP redirect target does not match the configured endpoint, bucket, prefix, and object",
+    );
+  }
+  if (
+    redirected.searchParams.get("X-Amz-Algorithm") !== "AWS4-HMAC-SHA256" ||
+    !redirected.searchParams.get("X-Amz-Credential") ||
+    redirected.searchParams.get("X-Amz-SignedHeaders") !== "host" ||
+    !/^[0-9a-f]{64}$/i.test(redirected.searchParams.get("X-Amz-Signature") || "")
+  ) {
+    throw new PublicRouteBindingError(
+      "Worker IHEP redirect is not a complete SigV4 presigned URL",
+    );
+  }
+}
+
+async function downloadPublicObject(
+  fetchImpl,
+  url,
+  destination,
+  label,
+  backend,
+  ihepRedirect,
+) {
   await mkdir(dirname(destination), { recursive: true });
   let lastError;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
@@ -525,13 +617,16 @@ async function downloadPublicObject(fetchImpl, url, destination, label, backend)
         }
         const location = response.headers.get("Location");
         const redirected = location ? new URL(location, url) : null;
-        if (!redirected || redirected.protocol !== "https:") {
+        if (!redirected) {
           throw new Error("Worker IHEP probe did not return a secure redirect");
         }
+        assertExpectedIhepRedirect(redirected, ihepRedirect.expectation, ihepRedirect.objectKey);
         await response.body?.cancel().catch(() => {});
         response = await fetchImpl(redirected, {
           headers: { "User-Agent": "Codex-App-Manager release verifier" },
-          redirect: "follow",
+          // Do not let the expected IHEP endpoint redirect the verifier to a
+          // different store after its Location has passed the binding check.
+          redirect: "manual",
           signal: AbortSignal.timeout(300_000),
         });
       }
@@ -543,6 +638,7 @@ async function downloadPublicObject(fetchImpl, url, destination, label, backend)
       return { path: destination, size: (await stat(destination)).size, url };
     } catch (error) {
       await rm(destination, { force: true });
+      if (error instanceof PublicRouteBindingError) throw error;
       lastError = error;
       if (attempt < 5) {
         await new Promise((resolveDelay) => setTimeout(resolveDelay, attempt * 1_000));
@@ -562,6 +658,7 @@ async function verifyPublicMirrorBackend({
   publicKey,
   publicDir,
   fetchImpl,
+  ihepRedirectExpectation,
 }) {
   const encodedCandidateKey = candidateKey
     .split("/")
@@ -579,6 +676,9 @@ async function verifyPublicMirrorBackend({
     downloadedCandidate,
     "mirror candidate",
     backend,
+    backend === "ihep"
+      ? { expectation: ihepRedirectExpectation, objectKey: candidateKey }
+      : null,
   );
   const [localCandidateHash, publicCandidateHash] = await Promise.all([
     sha256File(candidatePath),
@@ -615,6 +715,9 @@ async function verifyPublicMirrorBackend({
       publicPath,
       `mirror artifact ${updater.name}`,
       backend,
+      backend === "ihep"
+        ? { expectation: ihepRedirectExpectation, objectKey: expected.key }
+        : null,
     );
     if (response.size !== expected.size) {
       throw new Error(
@@ -655,7 +758,9 @@ export async function verifyPublicMirrorRoute({
   publicKey,
   workDir,
   fetchImpl = fetch,
+  ihepRedirect,
 }) {
+  const ihepRedirectExpectation = normalizeIhepRedirectExpectation(ihepRedirect);
   const expectedByPlatform = new Map(
     expectedArtifacts
       .filter((artifact) => artifact.platform)
@@ -673,6 +778,7 @@ export async function verifyPublicMirrorRoute({
       publicKey,
       publicDir: join(workDir, "public-route"),
       fetchImpl,
+      ihepRedirectExpectation,
     });
   }
   return {
@@ -1907,6 +2013,16 @@ function mirrorVerificationRows(backends, includeTransaction = false) {
   }));
 }
 
+function ihepRedirectFromBackends(backends) {
+  const ihep = backends.find((backend) => backend.name === "ihep");
+  if (!ihep) throw new Error("public mirror verification requires the IHEP backend");
+  return {
+    endpoint: ihep.endpoint,
+    bucket: ihep.bucket,
+    prefix: ihep.prefix || "",
+  };
+}
+
 async function verifyMirrorCandidates({
   backends,
   candidateKey,
@@ -1968,6 +2084,7 @@ async function verifyMirrorCandidates({
       publicKey,
       workDir: join(tempRoot, "public"),
       fetchImpl,
+      ihepRedirect: ihepRedirectFromBackends(backends),
     });
     summary.publicRouteVerification = "passed";
   } catch (error) {
