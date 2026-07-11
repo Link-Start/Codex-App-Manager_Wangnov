@@ -55,6 +55,13 @@ asset, stages immutable `<version>/` copies on R2/IHEP, and promotes a root
 `release-identity.json(.sig)` pair only after the immutable GitHub Release and
 mirror `latest.json` pointer are committed.
 
+Every `latest.json` platform entry must include a lowercase 64-character
+`sha256`. Fresh publication, immutable historical-release reuse, and mirror
+verification all fail closed when that field is missing or malformed, or when
+it differs from either the signed release identity or the local artifact bytes.
+Mirror same-version identity comparisons include this digest, so a rerun cannot
+treat a byte-different artifact claim as idempotent.
+
 The client still checks the mainland-friendly mirror first. It bounded-fetches
 and verifies that source's root identity **before** reading unsigned `latest.json`,
 accepts only a signed `stable` channel, then requires the manifest version,

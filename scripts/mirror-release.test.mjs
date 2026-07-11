@@ -65,6 +65,7 @@ function manifest(version, signature = "test-signature") {
     pub_date: "2026-01-01T00:00:00.000Z",
     platforms: {
       "windows-x86_64": {
+        sha256: "a".repeat(64),
         signature,
         url: `https://mirror.example/manager/${version}/manager-${version}.exe`,
       },
@@ -87,6 +88,7 @@ function completeManifest(version, signature = "test-signature") {
       ].map((platform) => [
         platform,
         {
+          sha256: "a".repeat(64),
           signature,
           url: `https://mirror.example/manager/${version}/manager-${platform}-${version}.bin`,
         },
@@ -417,6 +419,9 @@ async function prepareMirrorPromotionFixture(
   const artifact = Buffer.from(`stable updater payload for ${version}`);
   const fixture = updaterFixture(artifact);
   const candidate = completeManifest(version, fixture.signature);
+  for (const entry of Object.values(candidate.platforms)) {
+    entry.sha256 = hash(artifact);
+  }
   candidate.channel = channel;
   for (const entry of Object.values(candidate.platforms)) {
     const name = new URL(entry.url).pathname.split("/").at(-1);
@@ -490,7 +495,25 @@ describe("release candidate binding", () => {
     const changedSignature = structuredClone(candidate);
     changedSignature.platforms["windows-x86_64"].signature = "different-signature";
     expect(() => assertCandidateMatchesRelease(changedSignature, derived, "v1.2.3")).toThrow(
-      "platforms/signatures do not match",
+      "platforms/signatures/sha256 do not match",
+    );
+
+    const missingSha256 = structuredClone(candidate);
+    delete missingSha256.platforms["windows-x86_64"].sha256;
+    expect(() => assertCandidateMatchesRelease(missingSha256, derived, "v1.2.3")).toThrow(
+      "sha256 must be a lowercase SHA-256 digest",
+    );
+
+    const invalidSha256 = structuredClone(candidate);
+    invalidSha256.platforms["windows-x86_64"].sha256 = "A".repeat(64);
+    expect(() => assertCandidateMatchesRelease(invalidSha256, derived, "v1.2.3")).toThrow(
+      "sha256 must be a lowercase SHA-256 digest",
+    );
+
+    const changedSha256 = structuredClone(candidate);
+    changedSha256.platforms["windows-x86_64"].sha256 = "b".repeat(64);
+    expect(() => assertCandidateMatchesRelease(changedSha256, derived, "v1.2.3")).toThrow(
+      "platforms/signatures/sha256 do not match",
     );
   });
 });
@@ -562,6 +585,7 @@ describe("Tauri updater verification", () => {
     const artifact = Buffer.from("locally signed updater bytes");
     const fixture = updaterFixture(artifact);
     const candidate = manifest("1.2.3", fixture.signature);
+    candidate.platforms["windows-x86_64"].sha256 = hash(artifact);
     const artifactName = "manager-1.2.3.exe";
     await writeFile(join(root, artifactName), artifact);
     await writeFile(join(root, `${artifactName}.sig`), `${fixture.signature}\n`);
@@ -582,6 +606,15 @@ describe("Tauri updater verification", () => {
         publicKey: wrongKey,
       }),
     ).rejects.toThrow("artifact signature is invalid");
+
+    candidate.platforms["windows-x86_64"].sha256 = "b".repeat(64);
+    await expect(
+      verifyLocalUpdaterArtifacts({
+        manifest: candidate,
+        distDir: root,
+        publicKey: fixture.publicKey,
+      }),
+    ).rejects.toThrow("artifact sha256 does not match manifest");
   });
 });
 
@@ -591,6 +624,9 @@ describe("local signed release identity verification", () => {
     const artifact = Buffer.from("prerelease updater payload");
     const fixture = updaterFixture(artifact);
     const candidate = completeManifest("1.2.3-rc.1", fixture.signature);
+    for (const entry of Object.values(candidate.platforms)) {
+      entry.sha256 = hash(artifact);
+    }
     candidate.channel = "prerelease";
     for (const entry of Object.values(candidate.platforms)) {
       const name = new URL(entry.url).pathname.split("/").at(-1);
@@ -620,6 +656,72 @@ describe("local signed release identity verification", () => {
       }),
     ).rejects.toThrow("version 1.2.3-rc.1 is prerelease");
   });
+
+  it.each([
+    ["missing", undefined],
+    ["invalid", "A".repeat(64)],
+  ])(
+    "rejects historical immutable reuse with a %s manifest sha256 even when its signed identity is valid",
+    async (_case, manifestSha256) => {
+      const root = await tempRoot(`historical-${_case}-manifest-sha256`);
+      const artifact = Buffer.from("historical immutable updater payload");
+      const fixture = updaterFixture(artifact);
+      const candidate = completeManifest("1.2.3", fixture.signature);
+      for (const entry of Object.values(candidate.platforms)) {
+        entry.sha256 = hash(artifact);
+        const name = new URL(entry.url).pathname.split("/").at(-1);
+        await writeFile(join(root, name), artifact);
+        await writeFile(join(root, `${name}.sig`), `${fixture.signature}\n`);
+      }
+      await writeReleaseIdentity(root, candidate, fixture);
+
+      const publishedManifest = structuredClone(candidate);
+      if (manifestSha256 === undefined) {
+        delete publishedManifest.platforms["windows-x86_64"].sha256;
+      } else {
+        publishedManifest.platforms["windows-x86_64"].sha256 = manifestSha256;
+      }
+
+      await expect(
+        verifyLocalUpdaterArtifacts({
+          manifest: publishedManifest,
+          distDir: root,
+          publicKey: fixture.publicKey,
+        }),
+      ).rejects.toThrow("sha256 must be a lowercase SHA-256 digest");
+      await expect(
+        verifyLocalReleaseIdentity({
+          candidateManifest: publishedManifest,
+          distDir: root,
+          expectedChannel: "stable",
+          publicKey: fixture.publicKey,
+        }),
+      ).rejects.toThrow("sha256 must be a lowercase SHA-256 digest");
+    },
+  );
+
+  it("rejects a valid-looking manifest sha256 that differs from its signed identity", async () => {
+    const root = await tempRoot("historical-mismatched-manifest-sha256");
+    const artifact = Buffer.from("historical updater payload with signed identity");
+    const fixture = updaterFixture(artifact);
+    const candidate = completeManifest("1.2.3", fixture.signature);
+    for (const entry of Object.values(candidate.platforms)) {
+      entry.sha256 = hash(artifact);
+      const name = new URL(entry.url).pathname.split("/").at(-1);
+      await writeFile(join(root, name), artifact);
+    }
+    await writeReleaseIdentity(root, candidate, fixture);
+    candidate.platforms["windows-x86_64"].sha256 = "b".repeat(64);
+
+    await expect(
+      verifyLocalReleaseIdentity({
+        candidateManifest: candidate,
+        distDir: root,
+        expectedChannel: "stable",
+        publicKey: fixture.publicKey,
+      }),
+    ).rejects.toThrow("sha256 does not match candidate manifest");
+  });
 });
 
 describe("public mirror route verification", () => {
@@ -628,6 +730,9 @@ describe("public mirror route verification", () => {
     const artifact = Buffer.from("public updater payload");
     const fixture = updaterFixture(artifact);
     const candidate = completeManifest("1.2.3", fixture.signature);
+    for (const entry of Object.values(candidate.platforms)) {
+      entry.sha256 = hash(artifact);
+    }
     const candidateKey = candidateKeyFor("1.2.3", "public-run");
     const candidatePath = await writeManifest(root, "candidate.json", candidate);
     const objects = new Map([
@@ -782,6 +887,7 @@ describe("backend candidate verification", () => {
     const artifact = Buffer.from("release artifact from object storage");
     const fixture = updaterFixture(artifact);
     const candidate = manifest("1.2.3", fixture.signature);
+    candidate.platforms["windows-x86_64"].sha256 = hash(artifact);
     const artifactName = "manager-1.2.3.exe";
     const dmgName = "CodexAppManager_aarch64.dmg";
     const signatureName = `${artifactName}.sig`;
@@ -868,6 +974,7 @@ describe("backend candidate verification", () => {
     const artifact = Buffer.from("release artifact from object storage");
     const fixture = updaterFixture(artifact);
     const candidate = manifest("1.2.3", fixture.signature);
+    candidate.platforms["windows-x86_64"].sha256 = hash(artifact);
     const artifactName = "manager-1.2.3.exe";
     await writeFile(join(dist, artifactName), artifact);
     await writeFile(join(dist, `${artifactName}.sig`), "different-signature\n");
@@ -900,6 +1007,9 @@ describe("pre-publication mirror verification", () => {
     const artifact = Buffer.from("stable updater payload");
     const fixture = updaterFixture(artifact);
     const candidate = completeManifest("1.2.3", fixture.signature);
+    for (const entry of Object.values(candidate.platforms)) {
+      entry.sha256 = hash(artifact);
+    }
     const candidatePath = await writeManifest(dist, "latest.mirror.json", candidate);
     const candidateKey = candidateKeyFor("1.2.3", "verify-run");
     const candidateBytes = await readFile(candidatePath);
@@ -1316,6 +1426,31 @@ describe("monotonic mirror promotion", () => {
     expect(result.outcome).toBe("idempotent");
     expect(backends.map((backend) => backend.latestPutAttempts)).toEqual([0, 0]);
     expect(backends.every((backend) => backend.body("latest.json").equals(original))).toBe(true);
+  });
+
+  it("does not treat a same-version manifest with a different sha256 as idempotent", async () => {
+    const root = await tempRoot("same-version-sha256-mismatch");
+    const current = manifest("2.0.0");
+    const candidate = structuredClone(current);
+    candidate.platforms["windows-x86_64"].sha256 = "b".repeat(64);
+    const candidatePath = await writeManifest(root, "candidate.json", candidate);
+    const original = Buffer.from(`${JSON.stringify(current)}\n`);
+    const backends = [
+      new MemoryBackend("r2", { "latest.json": original }),
+      new MemoryBackend("ihep", { "latest.json": original }),
+    ];
+
+    await expect(
+      promoteCandidateTransaction({
+        backends,
+        candidateManifest: candidate,
+        candidatePath,
+        override: overrideOff(),
+        summary: summaryFor(backends),
+        workDir: join(root, "transaction"),
+      }),
+    ).rejects.toThrow("different artifact/signature/sha256 identity");
+    expect(backends.map((backend) => backend.latestPutAttempts)).toEqual([0, 0]);
   });
 
   it("rejects a concurrent latest change before returning idempotent", async () => {
@@ -2098,6 +2233,9 @@ describe("monotonic mirror promotion", () => {
     const artifact = Buffer.from("valid release artifact");
     const fixture = updaterFixture(artifact);
     const candidate = completeManifest("1.1.0", fixture.signature);
+    for (const entry of Object.values(candidate.platforms)) {
+      entry.sha256 = hash(artifact);
+    }
     const artifactNames = Object.values(candidate.platforms).map((entry) =>
       new URL(entry.url).pathname.split("/").at(-1),
     );

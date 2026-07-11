@@ -280,7 +280,13 @@ function updaterArtifactsFromManifest(manifest, label) {
         throw new Error(`multiple updater platforms resolve to the same artifact: ${name}`);
       }
       seenNames.add(name);
-      return { name, platform, signature: entry.signature, url: entry.url };
+      return {
+        name,
+        platform,
+        sha256: entry.sha256,
+        signature: entry.signature,
+        url: entry.url,
+      };
     });
 }
 
@@ -315,11 +321,17 @@ export async function verifyLocalUpdaterArtifacts({
     if (!metadata.isFile() || metadata.size <= 0) {
       throw new Error(`local updater artifact is empty for ${artifact.platform}`);
     }
+    const artifactSha256 = await sha256File(artifactPath);
+    if (artifactSha256 !== artifact.sha256) {
+      throw new Error(
+        `local updater artifact sha256 does not match manifest for ${artifact.platform}`,
+      );
+    }
     await verifyTauriUpdaterSignature(artifactPath, artifact.signature, publicKey);
     reports.push({
       name: artifact.name,
       platform: artifact.platform,
-      sha256: await sha256File(artifactPath),
+      sha256: artifactSha256,
       size: metadata.size,
     });
   }
@@ -332,7 +344,11 @@ function manifestReleaseIdentity(manifest) {
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([platform, entry]) => [
         platform,
-        { signature: entry?.signature || "", url: entry?.url || "" },
+        {
+          sha256: entry?.sha256 || "",
+          signature: entry?.signature || "",
+          url: entry?.url || "",
+        },
       ]),
   );
   return JSON.stringify({ version: manifest.version, platforms });
@@ -355,6 +371,7 @@ function assertManifestShape(manifest, label) {
     if (!entry.signature.trim()) {
       throw new Error(`${label} platform ${platform} has an empty updater signature`);
     }
+    assertSha256(entry.sha256, `${label} platform ${platform} sha256`);
   }
   return version;
 }
@@ -499,10 +516,7 @@ export async function verifyLocalReleaseIdentity({
         `${ROOT_IDENTITY_KEY} platform ${platform} sha256 does not match local artifact`,
       );
     }
-    if (
-      manifestEntry.sha256 !== undefined &&
-      manifestEntry.sha256 !== expectedArtifactSha256
-    ) {
+    if (manifestEntry.sha256 !== expectedArtifactSha256) {
       throw new Error(
         `${ROOT_IDENTITY_KEY} platform ${platform} sha256 does not match candidate manifest`,
       );
@@ -580,7 +594,7 @@ export function assertCandidateMatchesRelease(candidateManifest, artifactManifes
   }
   if (manifestReleaseIdentity(candidateManifest) !== manifestReleaseIdentity(artifactManifest)) {
     throw new Error(
-      "candidate latest.json platforms/signatures do not match the artifact-derived manifest",
+      "candidate latest.json platforms/signatures/sha256 do not match the artifact-derived manifest",
     );
   }
   return {
@@ -624,7 +638,11 @@ async function expectedArtifactsFromManifest(manifest, distDir, mirrorBase) {
     if (updaterByName.has(name)) {
       throw new Error(`multiple updater platforms resolve to the same artifact: ${name}`);
     }
-    updaterByName.set(name, { platform, signature: entry.signature });
+    updaterByName.set(name, {
+      platform,
+      sha256: entry.sha256,
+      signature: entry.signature,
+    });
   }
 
   for (const [name, updater] of updaterByName) {
@@ -654,13 +672,19 @@ async function expectedArtifactsFromManifest(manifest, distDir, mirrorBase) {
     const metadata = await stat(localPath);
     if (!metadata.isFile()) continue;
     const updater = updaterByName.get(name);
+    const localSha256 = await sha256File(localPath);
+    if (updater && localSha256 !== updater.sha256) {
+      throw new Error(
+        `local updater artifact sha256 does not match manifest for ${updater.platform}`,
+      );
+    }
     artifacts.push({
       platform: updater?.platform || null,
       name,
       key: `${version}/${name}`,
       localPath,
       size: metadata.size,
-      sha256: await sha256File(localPath),
+      sha256: localSha256,
       signature: updater ? updater.signature : null,
     });
     updaterByName.delete(name);
@@ -739,6 +763,36 @@ async function downloadPublicObject(fetchImpl, url, destination, label, backend)
     }
   }
   throw new Error(`${label} public ${backend} download failed: ${errorText(lastError)}`);
+}
+
+function bindExpectedUpdaterArtifacts(manifest, expectedArtifacts, label) {
+  if (!Array.isArray(expectedArtifacts)) {
+    throw new Error(`${label} expected artifacts must be an array`);
+  }
+  const expectedByPlatform = new Map();
+  for (const artifact of expectedArtifacts) {
+    if (!artifact?.platform) continue;
+    if (expectedByPlatform.has(artifact.platform)) {
+      throw new Error(`${label} has duplicate expected platform ${artifact.platform}`);
+    }
+    expectedByPlatform.set(artifact.platform, artifact);
+  }
+  const updaters = updaterArtifactsFromManifest(manifest, label);
+  for (const updater of updaters) {
+    const expected = expectedByPlatform.get(updater.platform);
+    if (!expected || expected.name !== updater.name) {
+      throw new Error(`${label} has no bound artifact for ${updater.platform}`);
+    }
+    if (expected.sha256 !== updater.sha256) {
+      throw new Error(
+        `${label} expected artifact sha256 does not match manifest for ${updater.platform}`,
+      );
+    }
+  }
+  if (expectedByPlatform.size !== updaters.length) {
+    throw new Error(`${label} expected artifacts contain an unknown updater platform`);
+  }
+  return expectedByPlatform;
 }
 
 async function verifyPublicMirrorBackend({
@@ -845,10 +899,10 @@ export async function verifyPublicMirrorRoute({
   workDir,
   fetchImpl = fetch,
 }) {
-  const expectedByPlatform = new Map(
-    expectedArtifacts
-      .filter((artifact) => artifact.platform)
-      .map((artifact) => [artifact.platform, artifact]),
+  const expectedByPlatform = bindExpectedUpdaterArtifacts(
+    candidateManifest,
+    expectedArtifacts,
+    "public mirror candidate",
   );
   const backends = {};
   for (const backend of ["r2", "ihep"]) {
@@ -1372,6 +1426,11 @@ export async function verifyBackendCandidate({
   const expectedArtifacts =
     preparedArtifacts ||
     (await expectedArtifactsFromManifest(candidateManifest, distDir, mirrorBase));
+  bindExpectedUpdaterArtifacts(
+    candidateManifest,
+    expectedArtifacts,
+    `${backend.name} candidate`,
+  );
   const artifactReports = [];
   for (const artifact of expectedArtifacts) {
     const remotePath = join(backendDir, artifact.name);
@@ -1898,7 +1957,7 @@ export async function promoteCandidateTransaction({
   const mismatch = states.find((state) => state.decision === "blocked-same-version-mismatch");
   if (mismatch) {
     throw new Error(
-      `${mismatch.backend.name}: current latest has the candidate version but different artifact/signature identity`,
+      `${mismatch.backend.name}: current latest has the candidate version but different artifact/signature/sha256 identity`,
     );
   }
   const downgradeStates = states.filter((state) => state.decision === "blocked-downgrade");
