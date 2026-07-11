@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import worker from "../src/index.js";
 
+const PROBE_TOKEN = "0123456789abcdef01234567";
+
 const latestManifest = JSON.stringify({
   version: "0.1.18",
   platforms: {
@@ -140,6 +142,7 @@ describe("manager download router", () => {
     const jsonRes = await worker.fetch(request("/manager/0.1.18/latest.json"), jsonEnv);
     expect(jsonRes.status).toBe(200);
     expect(jsonRes.headers.get("Cache-Control")).toBe("public, max-age=120, s-maxage=120");
+    expect(jsonRes.headers.get("X-Codex-Mirror-Backend")).toBe("r2");
 
     const installerEnv = {
       BUCKET: bucket({
@@ -166,6 +169,7 @@ describe("manager download router", () => {
     );
 
     expect(res.status).toBe(302);
+    expect(res.headers.get("X-Codex-Mirror-Backend")).toBe("ihep");
     const location = new URL(res.headers.get("Location"));
     expect(location.origin).toBe("https://s3.example.test");
     expect(location.pathname).toBe("/root/mirror-bucket/manager/0.1.18/CodexAppManager_0.1.18_x64-setup.exe");
@@ -193,6 +197,42 @@ describe("manager download router", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("installer");
     expect(calls).toEqual(["0.1.18/CodexAppManager_0.1.18_x64-setup.exe"]);
+  });
+
+  it("lets release probes force and identify both geographic backends", async () => {
+    const calls = [];
+    const path = "/manager/0.1.18/CodexAppManager_0.1.18_x64-setup.exe";
+    const env = {
+      BUCKET: bucket(
+        { "0.1.18/CodexAppManager_0.1.18_x64-setup.exe": r2Object("installer") },
+        calls,
+      ),
+      ...secondaryEnv(),
+    };
+
+    const forcedR2 = await worker.fetch(
+      request(`${path}?cam_probe=${PROBE_TOKEN}&cam_backend=r2`, {}, { country: "CN" }),
+      env,
+    );
+    expect(forcedR2.status).toBe(200);
+    expect(forcedR2.headers.get("X-Codex-Mirror-Backend")).toBe("r2");
+    expect(await forcedR2.text()).toBe("installer");
+
+    const forcedIhep = await worker.fetch(
+      request(`${path}?cam_probe=${PROBE_TOKEN}&cam_backend=ihep`, {}, { country: "US" }),
+      env,
+    );
+    expect(forcedIhep.status).toBe(302);
+    expect(forcedIhep.headers.get("X-Codex-Mirror-Backend")).toBe("ihep");
+    expect(new URL(forcedIhep.headers.get("Location")).origin).toBe("https://s3.example.test");
+    expect(calls).toEqual(["0.1.18/CodexAppManager_0.1.18_x64-setup.exe"]);
+
+    const missingSecondary = await worker.fetch(
+      request(`${path}?cam_probe=${PROBE_TOKEN}&cam_backend=ihep`),
+      { BUCKET: bucket({}), ...secondaryEnv({ SECONDARY_S3_SECRET_ACCESS_KEY: "" }) },
+    );
+    expect(missingSecondary.status).toBe(503);
+    expect(missingSecondary.headers.get("X-Codex-Mirror-Backend")).toBe("ihep");
   });
 
   it("rejects empty keys, directory keys, and traversal-looking keys", async () => {

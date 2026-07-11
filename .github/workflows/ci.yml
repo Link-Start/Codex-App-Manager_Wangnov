@@ -2,7 +2,8 @@ name: CI
 
 # Fast pull-request gate: type-check, unit tests and a cross-platform Rust
 # clippy/test pass. The heavy signed/notarized bundle build stays in
-# release.yml (tags only) — this never builds or signs the .app.
+# the default-branch release.yml (signalled by v* tags) — this never builds or
+# signs the .app.
 on:
   pull_request:
   push:

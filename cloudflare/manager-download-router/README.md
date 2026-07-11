@@ -18,8 +18,12 @@ The updater (`src-tauri/tauri.conf.json`) already checks
 ## Why a separate latest.json on the mirror
 `latest.json`'s embedded signatures sign the artifact **bytes**, not the URL, so
 re-hosting the same files keeps them valid — we only rewrite the download URLs to
-`…/manager/<version>/<file>`. `scripts/sync-mirror.sh` does this on every
-(non-pre-)release.
+`…/manager/<version>/<file>`. `scripts/sync-mirror.sh` stages stable releases,
+then verifies both storage endpoints and separately forces this Worker's R2 and
+IHEP branches before the GitHub Release becomes immutable. Probe responses identify
+their backend with `X-Codex-Mirror-Backend`; an explicit IHEP probe fails instead
+of falling back when its Worker secrets are incomplete. The release repeats that
+readback immediately before advancing the mirror's `latest.json` pointer.
 
 Installers are uploaded under a **per-version** key (`<version>/<file>`) and
 `latest.json` stays at the fixed root the updater polls. macOS updater tarballs
@@ -31,7 +35,7 @@ self-consistent; v0.1.9+ use the versioned layout.)
 
 > ⚠️ The mirror's `latest.json` MUST be refreshed on every stable release, or the
 > first endpoint serves a stale version and **blocks** updates. That's why the
-> `release.yml` "Sync to CDN mirror" step exists.
+> `release.yml` stage, verify, and promote steps exist.
 
 ## Already provisioned (done)
 - R2 bucket `codex-app-manager` created.
@@ -59,17 +63,28 @@ So each release uploads to the mirror (`release.yml` → `scripts/sync-mirror.sh
 | Secret | Notes |
 | --- | --- |
 | `MANAGER_R2_S3_ENDPOINT` | `https://d39dc6c92d1c4cfde580bf13e946b616.r2.cloudflarestorage.com` |
-| `MANAGER_R2_ACCESS_KEY_ID` / `MANAGER_R2_SECRET_ACCESS_KEY` | R2 S3 API token (can reuse the mirror's; account-scoped) |
-| `MANAGER_IHEP_S3_ENDPOINT` / `_BUCKET` / `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | IHEP creds (optional; `_REGION`/`_PREFIX` optional) |
+| `MANAGER_R2_PROMOTION_ACCESS_KEY_ID` / `MANAGER_R2_PROMOTION_SECRET_ACCESS_KEY` | R2 S3 API token for the current protected release workflow |
+| `MANAGER_IHEP_S3_ENDPOINT` / `_BUCKET` environment variables | IHEP endpoint and bucket (`_REGION`/`_PREFIX` variables optional) |
+| `MANAGER_IHEP_S3_PROMOTION_ACCESS_KEY_ID` / `MANAGER_IHEP_S3_PROMOTION_SECRET_ACCESS_KEY` | IHEP token for the current protected release workflow |
 
-R2 secrets missing → step warns and skips (mirror goes stale). IHEP missing →
-CN just falls back to R2 via the worker.
+Both backends must already contain the same valid `latest.json` baseline and
+preserve custom user metadata through `HeadObject`. R2 is the sole CAS authority
+and must enforce conditional `PutObject` (`If-Match` / `If-None-Match`). IHEP is
+the serialized unconditional follower; its ignored conditional headers are not a
+promotion prerequisite. Delete the legacy access-key secret names after migration
+so historical workflow revisions cannot perform their old unconditional write.
+
+Deploy this Worker revision before enabling the protected release workflow. The
+release gate intentionally rejects an older Worker that cannot force and identify
+both public backend branches.
 
 ## Deploy / manual sync
 ```bash
 wrangler deploy                         # from this directory
 # manual re-sync of a tag's assets (download release → rewrite → upload):
-#   gh release download vX.Y.Z -D dist && cp -f dist/latest.json dist/ && \
+#   rm -rf dist && gh release download vX.Y.Z -D dist && \
 #   MANAGER_R2_S3_ENDPOINT=… MANAGER_R2_ACCESS_KEY_ID=… MANAGER_R2_SECRET_ACCESS_KEY=… \
+#   MANAGER_IHEP_S3_ENDPOINT=… MANAGER_IHEP_S3_BUCKET=… \
+#   MANAGER_IHEP_S3_ACCESS_KEY_ID=… MANAGER_IHEP_S3_SECRET_ACCESS_KEY=… \
 #   bash ../../scripts/sync-mirror.sh dist
 ```
