@@ -266,7 +266,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       // install on disk; never treat it as a hard failure (would invite reinstall).
       const outcome = status.outcome;
       if (outcome?.primaryOk && outcome.recoveryActions.includes("record_provenance")) {
-        setNotice(t("install.partial.note"));
+        setNotice(t("install.partial.note", { action: t("install.partial.record") }));
         setJustInstalled(true);
       } else {
         setJustInstalled(true);
@@ -598,7 +598,9 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         <div className="scroll" ref={scopeRef}>
           {actionError ? <FailureBanner failure={actionError} /> : null}
           {notice || needsRecord ? (
-            <StatusBanner tone="warn">{notice ?? t("install.partial.note")}</StatusBanner>
+            <StatusBanner tone="warn">
+              {notice ?? t("install.partial.note", { action: t("install.partial.record") })}
+            </StatusBanner>
           ) : null}
           <section className="hero" style={{ marginTop: 16 }} key={scene}>
             <Ring icon="check" variant="success" />

@@ -24,8 +24,8 @@ use crate::app::mac_update::{
 use crate::app::op_phase::{OperationPhase, QuitPolicy};
 use crate::app::operation_outcome::{AncillaryRetryReport, AncillaryRetryRequest};
 use crate::app::oplock::{
-    OperationError, OperationGuard, OperationKind, OperationManager, OperationProgress,
-    OperationSnapshot, OperationToken,
+    OperationCompletion, OperationError, OperationGuard, OperationKind, OperationManager,
+    OperationProgress, OperationSnapshot, OperationToken,
 };
 use crate::app::paths;
 use crate::app::provenance::ProvenanceStore;
@@ -41,7 +41,7 @@ use crate::app::win_update::{
     retry_windows_ancillary, stage_windows_update_with_install_mode_and_network,
     uninstall_windows_codex, win_adopt as adopt_windows_install,
     win_adopt_path as adopt_windows_path, win_install_status,
-    DownloadProgress as WinDownloadProgress, WinAutoStageReport, WinInstallStatus,
+    DownloadProgress as WinDownloadProgress, OperationEvidence, WinAutoStageReport, WinInstallStatus,
     WinPerformExpectation, WinPerformReport, WinStageReport, WinUninstallReport, WinUpdateReport,
 };
 use crate::domain::settings::AppSettings as DomainAppSettings;
@@ -289,18 +289,34 @@ fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGua
 }
 
 struct DetachedGuard {
+    completion_tracking: bool,
     operations: OperationManager,
+    succeeded: bool,
     token: Option<OperationToken>,
 }
 
 impl DetachedGuard {
     fn validate(state: &ManagerState, token: OperationToken) -> Result<Self, CommandError> {
+        Self::validate_inner(state, token, false)
+    }
+
+    fn validate_tracked(state: &ManagerState, token: OperationToken) -> Result<Self, CommandError> {
+        Self::validate_inner(state, token, true)
+    }
+
+    fn validate_inner(
+        state: &ManagerState,
+        token: OperationToken,
+        completion_tracking: bool,
+    ) -> Result<Self, CommandError> {
         let operations = state.operations.clone();
         operations
             .validate(&token)
             .map_err(destructive_token_error)?;
         Ok(Self {
+            completion_tracking,
             operations,
+            succeeded: false,
             token: Some(token),
         })
     }
@@ -315,9 +331,15 @@ impl DetachedGuard {
             .validate_with_phase(&token, phase)
             .map_err(destructive_token_error)?;
         Ok(Self {
+            completion_tracking: false,
             operations,
+            succeeded: false,
             token: Some(token),
         })
+    }
+
+    fn mark_succeeded(&mut self) {
+        self.succeeded = true;
     }
 
     fn set_phase(&self, phase: OperationPhase) {
@@ -379,6 +401,11 @@ fn emit_op_download_progress(
 impl Drop for DetachedGuard {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
+            if self.completion_tracking {
+                if let Err(error) = self.operations.record_completion(&token, self.succeeded) {
+                    log::error!("failed to record terminal operation outcome: {error}");
+                }
+            }
             let _ = self.operations.end(token);
         }
     }
@@ -1196,6 +1223,17 @@ pub fn get_operation_snapshot(
     Ok(state.operations.snapshot())
 }
 
+/// Token-keyed terminal evidence for a renderer that lost the original invoke
+/// promise. `failed-before-commit` and `rolled-back` prove that retrying a fresh
+/// install is safe; unresolved committing/finishing failures remain outcome-unknown.
+#[tauri::command]
+pub fn get_operation_completion(
+    state: State<'_, ManagerState>,
+    token: OperationToken,
+) -> Result<Option<OperationCompletion>, CommandError> {
+    Ok(state.operations.completion(&token))
+}
+
 /// The user confirmed quitting from the close dialog — flag it and exit so the
 /// CloseRequested / ExitRequested guards stop intercepting and let it go.
 /// Still refuses when the backend is in a non-interruptible install phase.
@@ -1750,7 +1788,7 @@ pub async fn win_perform_update(
             AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
         );
     }
-    let op = DetachedGuard::validate(&state, token)?;
+    let mut op = DetachedGuard::validate_tracked(&state, token)?;
     op.set_phase(OperationPhase::Preparing);
     let endpoints = windows_endpoints_for_settings(&state)?;
     let mut settings = windows_domain_settings_for_persisted(&state);
@@ -1793,6 +1831,20 @@ pub async fn win_perform_update(
                 let _ = ops.set_phase(token, phase);
             }
         };
+        let evidence_hook = |evidence: OperationEvidence| {
+            if let Some(token) = phase_token.as_ref() {
+                let result = match evidence {
+                    OperationEvidence::MutationStarted => ops.mark_mutation_started(token),
+                    OperationEvidence::MutationRolledBack => {
+                        ops.mark_mutation_rolled_back(token)
+                    }
+                    OperationEvidence::OutcomeAmbiguous => ops.mark_outcome_ambiguous(token),
+                };
+                if let Err(error) = result {
+                    log::error!("failed to record Windows operation evidence: {error}");
+                }
+            }
+        };
         perform_windows_update_with_install_mode_network_and_phase(
             &endpoints,
             &settings,
@@ -1802,6 +1854,7 @@ pub async fn win_perform_update(
             &report,
             &network,
             Some(&phase_hook),
+            Some(&evidence_hook),
         )
     })
     .await
@@ -1823,6 +1876,7 @@ pub async fn win_perform_update(
         // must not turn a successful install into an error.
         let _ = crate::app::staging::clear_download_cache();
     }
+    op.mark_succeeded();
     Ok(report)
 }
 

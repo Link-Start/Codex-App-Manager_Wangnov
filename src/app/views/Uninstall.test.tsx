@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { managerApi } from "../../services/managerApi";
 import { emptyOperationOutcome } from "../../shared/types";
-import { I18nProvider } from "../i18n";
+import { CATALOG, I18nProvider, type Lang } from "../i18n";
 import { Uninstall } from "./Uninstall";
 
 vi.mock("../../services/managerApi", () => ({
@@ -24,6 +24,7 @@ const winStatus = vi.mocked(managerApi.winStatus);
 const macUninstall = vi.mocked(managerApi.macUninstall);
 const winUninstall = vi.mocked(managerApi.winUninstall);
 const retryAncillary = vi.mocked(managerApi.retryAncillary);
+const SAFETY_FLOW_LANGS = ["fr", "ar", "es", "zh-TW"] as const satisfies readonly Lang[];
 
 function setPlatform(platform: string) {
   Object.defineProperty(navigator, "platform", { configurable: true, value: platform });
@@ -236,4 +237,134 @@ describe("Uninstall", () => {
       ),
     );
   });
+
+  it("keeps both an unattempted action and the attempted action when retry still fails", async () => {
+    const user = userEvent.setup();
+    setPlatform("MacIntel");
+    macUninstall.mockResolvedValue({
+      removed: true,
+      keptCodexHome: true,
+      message: "removed with two ancillary failures",
+      outcome: emptyOperationOutcome({
+        primaryOk: true,
+        appState: "absent",
+        installClass: "none",
+        provenance: { state: "failed", detail: "record failed" },
+        cleanup: { state: "failed", detail: "cleanup failed" },
+        recoveryActions: ["cleanup_metadata", "record_provenance"],
+      }),
+    });
+    // Deliberately omit recoveryActions: the failed step status must still keep
+    // the attempted CTA, while the untouched cleanup action is merged back in.
+    retryAncillary.mockResolvedValue({
+      message: "record still failed",
+      outcome: emptyOperationOutcome({
+        primaryOk: true,
+        appState: "present",
+        installClass: "external",
+        provenance: { state: "failed", detail: "disk full" },
+        recoveryActions: [],
+      }),
+    });
+
+    renderUninstall();
+    await screen.findByText("Data location");
+    await user.click(screen.getByRole("button", { name: "Uninstall" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(
+      screen.getByRole("button", { name: "Retry writing managed record only" }),
+    );
+
+    expect(
+      await screen.findByText(/some recovery steps are still incomplete/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Retry cleanup only (shortcuts / uninstall entry)" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Retry writing managed record only" }),
+    ).toBeInTheDocument();
+  });
+
+  it.each(SAFETY_FLOW_LANGS)(
+    "preserves unattempted recovery actions after one successful retry in %s",
+    async (lang) => {
+      const user = userEvent.setup();
+      localStorage.setItem("cam.lang", lang);
+      setPlatform("MacIntel");
+      macUninstall.mockResolvedValue({
+        removed: true,
+        keptCodexHome: true,
+        message: "removed with recovery actions",
+        outcome: emptyOperationOutcome({
+          primaryOk: true,
+          appState: "absent",
+          installClass: "none",
+          cleanup: { state: "failed", detail: "ancillary cleanup failed" },
+          recoveryActions: [
+            "cleanup_metadata",
+            "clear_provenance",
+            "purge_user_data",
+            "record_provenance",
+          ],
+          warnings: ["ancillary cleanup failed"],
+        }),
+      });
+
+      renderUninstall();
+
+      await screen.findByText(CATALOG[lang]["uninstall.dataPath"]);
+      await user.click(screen.getByRole("button", { name: CATALOG[lang]["uninstall.confirm"] }));
+      await user.click(screen.getByRole("button", { name: CATALOG[lang]["uninstall.continue"] }));
+
+      expect(
+        await screen.findByText(CATALOG[lang]["uninstall.partial.title"]),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(CATALOG[lang]["uninstall.partial.summary"], { selector: ".desc" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText("removed with recovery actions", { selector: ".errdetails" }),
+      ).toBeInTheDocument();
+      const recoveryKeys = [
+        "uninstall.partial.retryCleanup",
+        "uninstall.partial.retryProvenance",
+        "uninstall.partial.retryPurge",
+        "uninstall.partial.retryRecord",
+      ] as const;
+      for (const key of recoveryKeys) {
+        expect(screen.getByRole("button", { name: CATALOG[lang][key] })).toBeInTheDocument();
+      }
+
+      await user.click(
+        screen.getByRole("button", {
+          name: CATALOG[lang]["uninstall.partial.retryProvenance"],
+        }),
+      );
+      await waitFor(() =>
+        expect(retryAncillary).toHaveBeenCalledWith(
+          expect.objectContaining({ actions: ["clear_provenance"], purgeUserData: false }),
+        ),
+      );
+      expect(
+        await screen.findByText(CATALOG[lang]["uninstall.partial.retryPending"], {
+          selector: ".desc",
+        }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", {
+          name: CATALOG[lang]["uninstall.partial.retryProvenance"],
+        }),
+      ).not.toBeInTheDocument();
+      for (const key of [
+        "uninstall.partial.retryCleanup",
+        "uninstall.partial.retryPurge",
+        "uninstall.partial.retryRecord",
+      ] as const) {
+        expect(screen.getByRole("button", { name: CATALOG[lang][key] })).toBeInTheDocument();
+      }
+      expect(screen.getByText("cleanup ok", { selector: ".errdetails" })).toBeInTheDocument();
+      expect(document.documentElement.dir).toBe(lang === "ar" ? "rtl" : "ltr");
+    },
+  );
 });

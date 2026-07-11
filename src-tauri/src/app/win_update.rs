@@ -39,6 +39,19 @@ use crate::errors::AppError;
 /// Optional hook for the command layer to publish operation phases (quit policy).
 pub type PhaseHook<'a> = dyn Fn(OperationPhase) + Send + Sync + 'a;
 
+/// Completion evidence is intentionally separate from `OperationPhase`.
+/// `Committing` blocks app exit before the first rename/platform call, while
+/// these events describe whether a rejected command can still prove that the
+/// installed app was left unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationEvidence {
+    MutationStarted,
+    MutationRolledBack,
+    OutcomeAmbiguous,
+}
+
+pub type EvidenceHook<'a> = dyn Fn(OperationEvidence) + Send + Sync + 'a;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WinUpdateReport {
@@ -1024,6 +1037,7 @@ pub fn perform_windows_update_with_install_mode_and_network(
         progress,
         network,
         None,
+        None,
     )
 }
 
@@ -1037,6 +1051,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
     phase: Option<&PhaseHook<'_>>,
+    evidence: Option<&EvidenceHook<'_>>,
 ) -> Result<WinPerformReport, AppError> {
     let set_phase = |p: OperationPhase| {
         if let Some(hook) = phase {
@@ -1100,6 +1115,8 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
     // Point of no return. Honor a cancel one last time BEFORE closing Codex or
     // sideloading — closes the gap after staging where a fully-cached MSIX skips
     // the download loop (so its cancel flag never arms) yet still reaches here.
+    // Completion classification remains independent from this quit phase and
+    // changes only when the evidence hook records a real or ambiguous mutation.
     set_phase(OperationPhase::Committing);
     // Linearized with every native/window quit path by OperationManager.
     check_win_update_abort()?;
@@ -1107,7 +1124,15 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
     if stage.route == "portable-fallback" {
         log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
         close_existing_codex_before_portable_fallback(settings, current_installed.as_ref())?;
-        return install_portable_after_stage(settings, stage, None, None, current_installed, phase);
+        return install_portable_after_stage(
+            settings,
+            stage,
+            None,
+            None,
+            current_installed,
+            phase,
+            evidence,
+        );
     }
 
     let staged_path = stage
@@ -1136,8 +1161,15 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
             "Skipped MSIX sideload before attempting it: {}. Routed to the portable build, which carries its own runtime and does not need these framework packages.",
             precheck.reason
         ));
-        let mut report =
-            install_portable_after_stage(settings, stage, None, None, current_installed, phase)?;
+        let mut report = install_portable_after_stage(
+            settings,
+            stage,
+            None,
+            None,
+            current_installed,
+            phase,
+            evidence,
+        )?;
         report.action = WinPerformAction::PortableFallbackMissingFramework;
         return Ok(report);
     }
@@ -1158,6 +1190,13 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
             close_codex_gracefully_for_root(30, PathBuf::from(&previous.path).as_path())
                 .map_err(engine_err)?;
         }
+    }
+    // Add-AppxPackage is the first operation on the MSIX route that can mutate
+    // installed package state. From here an error cannot prove the old state is
+    // intact, so renderer recovery must treat the outcome as ambiguous.
+    set_phase(OperationPhase::Committing);
+    if let Some(hook) = evidence {
+        hook(OperationEvidence::OutcomeAmbiguous);
     }
     let sideload =
         install_msix_sideload(PathBuf::from(&staged_path).as_path()).map_err(engine_err)?;
@@ -1196,6 +1235,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
                 Some(health),
                 current_installed,
                 phase,
+                evidence,
             )?;
             match remove_msix_package() {
                 Ok(remove) if remove.success => {
@@ -1294,7 +1334,15 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
         return Ok(report);
     }
 
-    install_portable_after_stage(settings, stage, Some(sideload), None, current_installed, phase)
+    install_portable_after_stage(
+        settings,
+        stage,
+        Some(sideload),
+        None,
+        current_installed,
+        phase,
+        evidence,
+    )
 }
 
 fn install_portable_after_stage(
@@ -1304,10 +1352,8 @@ fn install_portable_after_stage(
     health: Option<MsixHealthReport>,
     previous_installed: Option<InstalledWindowsCodex>,
     phase: Option<&PhaseHook<'_>>,
+    evidence: Option<&EvidenceHook<'_>>,
 ) -> Result<WinPerformReport, AppError> {
-    if let Some(hook) = phase {
-        hook(OperationPhase::Committing);
-    }
     let staged_path = stage
         .staged_path
         .as_ref()
@@ -1319,10 +1365,31 @@ fn install_portable_after_stage(
         .unwrap_or_else(|| settings.install_root.clone());
     let install_root_path = PathBuf::from(&install_root);
     let msix_path = PathBuf::from(staged_path);
-    // Persist the transaction log on BeforeMoveOld (first destructive rename)
-    // using the real paths chosen by the engine.
+    // Persist the transaction log before the first possible rename using the
+    // real paths chosen by the engine. Once that journal is durable, publish
+    // `Committing` before the first rename so the app cannot exit in the narrow
+    // gap between the boundary callback and the filesystem call. Completion
+    // remains pre-write until a later boundary proves a rename succeeded.
     let mut tx: Option<ActiveInstallTx> = None;
     let mut observer = |boundary: PortableBoundary| -> Result<(), codex_win_engine::EngineError> {
+        if matches!(&boundary, PortableBoundary::RollbackCompleted { .. }) {
+            // Disk rollback is already complete. Persist and clear the durable
+            // journal first; only then publish evidence that permits a retry.
+            if let Some(active) = tx.take() {
+                active
+                    .mark_rolled_back()
+                    .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
+            }
+            if let Some(hook) = evidence {
+                hook(OperationEvidence::MutationRolledBack);
+            }
+            return Ok(());
+        }
+        if portable_boundary_mutated_install_root(&boundary) {
+            if let Some(hook) = evidence {
+                hook(OperationEvidence::MutationStarted);
+            }
+        }
         match boundary {
             PortableBoundary::BeforeMoveOld {
                 install_root,
@@ -1340,6 +1407,9 @@ fn install_portable_after_stage(
                 )
                 .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
                 tx = Some(started);
+                if let Some(hook) = phase {
+                    hook(OperationPhase::Committing);
+                }
                 Ok(())
             }
             PortableBoundary::AfterMoveOld { .. } => {
@@ -1359,6 +1429,7 @@ fn install_portable_after_stage(
                 }
                 Ok(())
             }
+            PortableBoundary::RollbackCompleted { .. } => unreachable!("handled above"),
         }
     };
     let portable = install_portable_from_msix_with_observer(
@@ -1462,6 +1533,22 @@ fn install_portable_after_stage(
         .unwrap_or("none");
     log::info!("Windows perform success action={action} installed_version={installed_version}");
     Ok(report)
+}
+
+/// Whether a completed portable-engine boundary proves the install root was
+/// mutated. An upgrade crosses this boundary after moving the old tree; a fresh
+/// install has no old tree, so it crosses only after moving the new payload in.
+fn portable_boundary_mutated_install_root(boundary: &PortableBoundary) -> bool {
+    matches!(
+        boundary,
+        PortableBoundary::AfterMoveOld {
+            had_previous: true,
+            ..
+        } | PortableBoundary::AfterMoveNew {
+            had_previous: false,
+            ..
+        }
+    )
 }
 
 pub fn win_install_status(settings: &AppSettings) -> WinInstallStatus {
@@ -1726,6 +1813,20 @@ pub fn retry_windows_ancillary(
     path: Option<&str>,
     purge_user_data: bool,
 ) -> Result<AncillaryRetryReport, AppError> {
+    retry_windows_ancillary_with_detector(actions, path, purge_user_data, || {
+        win_install_status(settings)
+    })
+}
+
+fn retry_windows_ancillary_with_detector<F>(
+    actions: &[String],
+    path: Option<&str>,
+    purge_user_data: bool,
+    detect_status: F,
+) -> Result<AncillaryRetryReport, AppError>
+where
+    F: FnOnce() -> WinInstallStatus,
+{
     let mut outcome = OperationOutcome {
         primary_ok: true,
         app_state: "unknown".to_string(),
@@ -1739,7 +1840,7 @@ pub fn retry_windows_ancillary(
     let mut messages = Vec::new();
 
     if actions.iter().any(|a| a == recovery::RECORD_PROVENANCE) {
-        let status = win_install_status(settings);
+        let status = detect_status();
         match status.installed {
             Some(installed) => {
                 let recorded =
@@ -1766,6 +1867,9 @@ pub fn retry_windows_ancillary(
                 messages.push("未检测到 Codex，无法写入托管记录".to_string());
             }
         }
+        // A failed record attempt is always retryable. In particular, the
+        // no-install-detected branch must not strand the UI without its CTA.
+        outcome.retain_failed_provenance_recovery(recovery::RECORD_PROVENANCE);
     }
 
     if actions.iter().any(|a| a == recovery::CLEAR_PROVENANCE) {
@@ -1841,13 +1945,14 @@ pub fn retry_windows_ancillary(
 mod tests {
     use super::{
         bind_manifest_checksums, check_win_update_abort, detect_existing_windows_install_at_path,
-        detect_managed_codex, outcome_from_portable_uninstall, WinAbortGuard, WinPerformAction,
-        WIN_UPDATE_ABORT,
+        detect_managed_codex, outcome_from_portable_uninstall,
+        portable_boundary_mutated_install_root, retry_windows_ancillary_with_detector,
+        WinAbortGuard, WinPerformAction, WinInstallStatus, WIN_UPDATE_ABORT,
     };
     use crate::app::operation_outcome::{recovery, StepOutcome};
     use crate::app::provenance::ProvenanceStore;
     use crate::domain::settings::AppSettings;
-    use codex_win_engine::{PortableUninstallReport, WindowsRelease};
+    use codex_win_engine::{PortableBoundary, PortableUninstallReport, WindowsRelease};
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
@@ -1899,6 +2004,60 @@ mod tests {
             check_win_update_abort().is_ok(),
             "guard drop must reset the latch for the next op"
         );
+    }
+
+    #[test]
+    fn portable_mutation_evidence_requires_a_successful_install_root_rename() {
+        let install_root = PathBuf::from(r"C:\Codex");
+        let payload = PathBuf::from(r"C:\staging\Codex");
+        let backup = PathBuf::from(r"C:\Codex.rollback");
+
+        assert!(!portable_boundary_mutated_install_root(
+            &PortableBoundary::BeforeMoveOld {
+                install_root: install_root.clone(),
+                payload: payload.clone(),
+                backup: backup.clone(),
+                had_previous: false,
+            }
+        ));
+        assert!(!portable_boundary_mutated_install_root(
+            &PortableBoundary::AfterMoveOld {
+                install_root: install_root.clone(),
+                payload: payload.clone(),
+                backup: backup.clone(),
+                had_previous: false,
+            }
+        ));
+        assert!(portable_boundary_mutated_install_root(
+            &PortableBoundary::AfterMoveOld {
+                install_root: install_root.clone(),
+                payload: payload.clone(),
+                backup: backup.clone(),
+                had_previous: true,
+            }
+        ));
+        assert!(!portable_boundary_mutated_install_root(
+            &PortableBoundary::BeforeMoveNew {
+                install_root: install_root.clone(),
+                payload: payload.clone(),
+                backup: backup.clone(),
+                had_previous: false,
+            }
+        ));
+        assert!(portable_boundary_mutated_install_root(
+            &PortableBoundary::AfterMoveNew {
+                install_root: install_root.clone(),
+                backup: backup.clone(),
+                had_previous: false,
+            }
+        ));
+        assert!(!portable_boundary_mutated_install_root(
+            &PortableBoundary::RollbackCompleted {
+                install_root,
+                backup,
+                had_previous: false,
+            }
+        ));
     }
 
     #[test]
@@ -2130,5 +2289,27 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
         assert!(!outcome.primary_ok);
         assert!(!outcome.is_partial());
         assert_eq!(outcome.app_state, "present");
+    }
+
+    #[test]
+    fn retry_record_provenance_without_detected_install_keeps_retry_action() {
+        let report = retry_windows_ancillary_with_detector(
+            &[recovery::RECORD_PROVENANCE.to_string()],
+            None,
+            false,
+            || WinInstallStatus {
+                installed: None,
+                status: "none".to_string(),
+            },
+        )
+        .expect("a missing install is a retryable ancillary result");
+
+        assert!(report.outcome.provenance.is_failed());
+        assert!(report
+            .outcome
+            .recovery_actions
+            .iter()
+            .any(|action| action == recovery::RECORD_PROVENANCE));
+
     }
 }
