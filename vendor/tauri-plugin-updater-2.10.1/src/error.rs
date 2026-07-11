@@ -102,6 +102,48 @@ pub enum Error {
     Tauri(#[from] tauri::Error),
 }
 
+impl Error {
+    pub(crate) fn sanitized_reqwest(
+        operation: &'static str,
+        resource: &'static str,
+        error: reqwest::Error,
+    ) -> Self {
+        // Request and response-body errors can retain the final redirect URL.
+        // Object-store redirects commonly put credentials in that URL's query,
+        // so reduce the error to stable diagnostics before it reaches Display.
+        let error = error.without_url();
+        let category = if error.is_timeout() {
+            "timeout"
+        } else if error.is_connect() {
+            "connect"
+        } else if error.is_redirect() {
+            "redirect"
+        } else if error.is_status() {
+            "status"
+        } else if error.is_body() {
+            "body"
+        } else if error.is_decode() {
+            "decode"
+        } else if error.is_request() {
+            "request"
+        } else if error.is_builder() {
+            "builder"
+        } else {
+            "transport"
+        };
+        let status = error
+            .status()
+            .map(|status| format!("; HTTP {status}"))
+            .unwrap_or_default();
+        let diagnostic = if error.is_timeout() {
+            format!("network timeout (timed out; {category}{status})")
+        } else {
+            format!("network error ({category}{status})")
+        };
+        Self::Network(format!("{operation} {resource}: {diagnostic}"))
+    }
+}
+
 impl Serialize for Error {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where

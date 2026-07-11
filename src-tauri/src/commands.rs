@@ -318,14 +318,55 @@ fn manager_update_identity_client() -> Result<reqwest::Client, AppError> {
         ProxyMode::Custom => {
             let normalized =
                 validated_custom_proxy_for_settings(&saved.custom_proxy_url, "manager updater")?;
-            let proxy = reqwest::Proxy::all(&normalized)
-                .map_err(|e| AppError::Engine(format!("configure manager updater proxy: {e}")))?;
+            let proxy = reqwest::Proxy::all(&normalized).map_err(|error| {
+                manager_update_reqwest_error("configure", "manager updater proxy", error)
+            })?;
             builder = builder.proxy(proxy);
         }
     }
-    builder
-        .build()
-        .map_err(|e| AppError::Engine(format!("build manager updater identity client: {e}")))
+    builder.build().map_err(|error| {
+        manager_update_reqwest_error("build", "manager updater identity client", error)
+    })
+}
+
+fn manager_update_reqwest_error(
+    operation: &'static str,
+    resource: &'static str,
+    error: reqwest::Error,
+) -> AppError {
+    // reqwest associates the final URL with request, redirect, status, and
+    // response-body errors. That URL can be an object-store presigned URL, so
+    // never let its path or query cross the AppError/CommandError boundary.
+    let error = error.without_url();
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_status() {
+        "status"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_builder() {
+        "builder"
+    } else {
+        "transport"
+    };
+    let status = error
+        .status()
+        .map(|status| format!("; HTTP {status}"))
+        .unwrap_or_default();
+    let diagnostic = if error.is_timeout() {
+        format!("network timeout (timed out; {category}{status})")
+    } else {
+        format!("network error ({category}{status})")
+    };
+    AppError::Engine(format!("{operation} {resource}: {diagnostic}"))
 }
 
 async fn fetch_manager_update_file_limited(
@@ -338,7 +379,7 @@ async fn fetch_manager_update_file_limited(
         .get(url)
         .send()
         .await
-        .map_err(|e| AppError::Engine(format!("fetch {resource}: {e}")))?;
+        .map_err(|error| manager_update_reqwest_error("fetch", resource, error))?;
     if !response.status().is_success() {
         return Err(AppError::Engine(format!(
             "fetch {resource}: HTTP {}",
@@ -361,7 +402,7 @@ async fn fetch_manager_update_file_limited(
     let mut observed = 0_u64;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError::Engine(format!("read {resource}: {e}")))?;
+        let chunk = chunk.map_err(|error| manager_update_reqwest_error("read", resource, error))?;
         observed = observed.checked_add(chunk.len() as u64).ok_or_else(|| {
             AppError::Engine(format!("{resource} exceeds {max_bytes}-byte limit"))
         })?;
@@ -2629,11 +2670,11 @@ pub async fn win_uninstall(
 mod tests {
     use super::{
         check_with_manager_fallback, download_then_install_manager_update,
-        install_root_from_picked_dir, manager_update_matches_confirmation, manager_update_root_url,
-        manager_update_versioned_url, normalize_windows_source_base, sha256_hex,
-        validate_install_root_path, validate_manager_update_identity_claim,
-        validated_custom_proxy_for_settings, ManagerReleaseChannel, ManagerReleaseIdentity,
-        ManagerReleaseIdentityPlatform,
+        install_root_from_picked_dir, manager_update_matches_confirmation,
+        manager_update_reqwest_error, manager_update_root_url, manager_update_versioned_url,
+        normalize_windows_source_base, sha256_hex, validate_install_root_path,
+        validate_manager_update_identity_claim, validated_custom_proxy_for_settings,
+        ManagerReleaseChannel, ManagerReleaseIdentity, ManagerReleaseIdentityPlatform,
     };
     use crate::errors::AppError;
     use std::collections::HashMap;
@@ -2698,6 +2739,50 @@ mod tests {
             url::Url::parse("https://github.com/example/releases/latest/download/latest.json")
                 .unwrap(),
         ]
+    }
+
+    #[test]
+    fn manager_identity_fetch_error_does_not_expose_associated_url() {
+        use reqwest::ResponseBuilderExt;
+
+        let secret_path = "/private/identity";
+        let secret_query = "X-Amz-Credential=private-credential&X-Amz-Signature=private-signature";
+        let url = url::Url::parse(&format!(
+            "https://secret-host.example{secret_path}?{secret_query}"
+        ))
+        .unwrap();
+        let response = tauri::http::Response::builder()
+            .status(tauri::http::StatusCode::FORBIDDEN)
+            .url(url)
+            .body("")
+            .unwrap();
+        let reqwest_error = reqwest::Response::from(response)
+            .error_for_status()
+            .unwrap_err();
+        let error =
+            manager_update_reqwest_error("fetch", "manager release identity", reqwest_error);
+        let message = error.to_string();
+
+        assert!(message.contains("status"), "missing category: {message}");
+        assert!(
+            message.contains("403 Forbidden"),
+            "missing status: {message}"
+        );
+
+        for sensitive in [
+            "https://".to_string(),
+            "secret-host.example".to_string(),
+            secret_path.to_string(),
+            "X-Amz-Credential".to_string(),
+            "private-credential".to_string(),
+            "X-Amz-Signature".to_string(),
+            "private-signature".to_string(),
+        ] {
+            assert!(
+                !message.contains(&sensitive),
+                "network error exposed {sensitive:?}: {message}"
+            );
+        }
     }
 
     fn manager_release_identity(

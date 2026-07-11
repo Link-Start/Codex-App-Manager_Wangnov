@@ -20,7 +20,9 @@ cannot impose a response-body limit. This vendor adds:
 - an explicit `ResponseTooLarge` error before an oversized chunk is retained;
 - the selected static-manifest platform key on `Update`;
 - public reuse of the plugin's exact minisign verification routine for signed
-  release identity files; and
+  release identity files;
+- URL-free request and response-stream diagnostics, including fixed proxy and
+  endpoint debug messages so presigned URL credentials cannot enter logs; and
 - regression tests for header-declared and chunked/no-header oversized bodies.
 
 No installer, extraction, proxy, TLS, or minisign artifact semantics are
@@ -42,6 +44,8 @@ candidate upstream version is verified to provide all of these properties:
    signed release identity before trusting a mirror manifest.
 5. The tests in this vendor and the Manager replay/fallback tests have been
    ported and pass against the replacement.
+6. Manifest and artifact request/stream errors discard associated URLs before
+   logging or display while retaining transport category and HTTP status.
 
 When upgrading, diff this directory against the exact new crate source, retain
 the upstream license files, update the checksum/version above, regenerate

@@ -42,6 +42,7 @@ use crate::{
 };
 
 const UPDATER_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+const CONFIGURED_PROXY_LOG_MESSAGE: &str = "using configured proxy";
 
 /// Safe defaults for callers that do not override the response limits.
 ///
@@ -66,16 +67,24 @@ pub enum Installer {
 #[cfg(test)]
 mod response_limit_tests {
     use super::{
-        read_response_limited, UpdaterBuilder, DEFAULT_MAX_DOWNLOAD_SIZE, DEFAULT_MAX_MANIFEST_SIZE,
+        read_response_limited, UpdaterBuilder, CONFIGURED_PROXY_LOG_MESSAGE,
+        DEFAULT_MAX_DOWNLOAD_SIZE, DEFAULT_MAX_MANIFEST_SIZE,
     };
     use crate::{Config, Error};
+    use futures_util::StreamExt;
+    use reqwest::ResponseBuilderExt;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
 
     fn serve_once(parts: Vec<&'static [u8]>) -> (String, thread::JoinHandle<()>) {
+        serve_once_at("/body", parts.into_iter().map(<[u8]>::to_vec).collect())
+    }
+
+    fn serve_once_at(target: &str, parts: Vec<Vec<u8>>) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let target = target.to_string();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
@@ -88,13 +97,22 @@ mod response_limit_tests {
                 request.extend_from_slice(&buffer[..count]);
             }
             for part in parts {
-                if stream.write_all(part).is_err() {
+                if stream.write_all(&part).is_err() {
                     break;
                 }
                 let _ = stream.flush();
             }
         });
-        (format!("http://{address}/body"), handle)
+        (format!("http://{address}{target}"), handle)
+    }
+
+    fn assert_no_sensitive_url(message: &str, sensitive: &[&str]) {
+        for value in sensitive {
+            assert!(
+                !message.contains(value),
+                "network error exposed {value:?}: {message}"
+            );
+        }
     }
 
     fn install_test_crypto_provider() {
@@ -119,6 +137,204 @@ mod response_limit_tests {
         assert_eq!(builder.max_download_size, DEFAULT_MAX_DOWNLOAD_SIZE);
         assert!(builder.max_manifest_size > 0);
         assert!(builder.max_download_size > 0);
+    }
+
+    #[test]
+    fn configured_proxy_debug_message_cannot_embed_proxy_url() {
+        assert_eq!(CONFIGURED_PROXY_LOG_MESSAGE, "using configured proxy");
+        assert_no_sensitive_url(
+            CONFIGURED_PROXY_LOG_MESSAGE,
+            &["https://", "/private", "?token=", "private-secret"],
+        );
+    }
+
+    #[test]
+    fn sanitized_status_error_preserves_status_without_associated_url() {
+        let secret_url = url::Url::parse(
+            "https://secret-host.example/private/artifact?X-Amz-Credential=private-credential&X-Amz-Signature=private-signature",
+        )
+        .unwrap();
+        let response = http::Response::builder()
+            .status(http::StatusCode::FORBIDDEN)
+            .url(secret_url)
+            .body("")
+            .unwrap();
+        let raw = reqwest::Response::from(response)
+            .error_for_status()
+            .unwrap_err();
+        let error = Error::sanitized_reqwest("fetch", "updater artifact", raw);
+        let message = error.to_string();
+
+        assert!(message.contains("status"), "missing category: {message}");
+        assert!(
+            message.contains("403 Forbidden"),
+            "missing status: {message}"
+        );
+        assert_no_sensitive_url(
+            &message,
+            &[
+                "https://",
+                "secret-host.example",
+                "/private/artifact",
+                "X-Amz-Credential",
+                "private-credential",
+                "X-Amz-Signature",
+                "private-signature",
+            ],
+        );
+    }
+
+    #[test]
+    fn sanitized_stream_error_drops_associated_url_and_keeps_body_category() {
+        let secret_url = url::Url::parse(
+            "https://secret-host.example/private/artifact?X-Amz-Signature=private-signature",
+        )
+        .unwrap();
+        let body = reqwest::Body::wrap_stream(futures_util::stream::once(async {
+            Err::<Vec<u8>, std::io::Error>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "forced stream reset",
+            ))
+        }));
+        let response = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .url(secret_url.clone())
+            .body(body)
+            .unwrap();
+        let response = reqwest::Response::from(response);
+        let raw = tauri::async_runtime::block_on(async move {
+            response.bytes_stream().next().await.unwrap().unwrap_err()
+        })
+        .with_url(secret_url);
+        let error = Error::sanitized_reqwest("read", "updater artifact", raw);
+        let message = error.to_string();
+
+        assert!(
+            message.contains("body") || message.contains("decode"),
+            "missing stream category: {message}"
+        );
+        assert_no_sensitive_url(
+            &message,
+            &[
+                "https://",
+                "secret-host.example",
+                "/private/artifact",
+                "X-Amz-Signature",
+                "private-signature",
+            ],
+        );
+    }
+
+    #[test]
+    fn manifest_send_error_does_not_expose_endpoint_url() {
+        install_test_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint = url::Url::parse(&format!(
+            "http://{address}/private/latest.json?X-Amz-Signature=private-signature"
+        ))
+        .unwrap();
+        let app = tauri::test::mock_app();
+        let updater = UpdaterBuilder::new(
+            app.handle(),
+            Config {
+                dangerous_insecure_transport_protocol: true,
+                endpoints: vec![endpoint],
+                ..Default::default()
+            },
+        )
+        .target("test-target")
+        .no_proxy()
+        .build()
+        .unwrap();
+
+        let error = match tauri::async_runtime::block_on(updater.check()) {
+            Err(error) => error,
+            Ok(_) => panic!("unavailable manifest endpoint unexpectedly succeeded"),
+        };
+        let message = error.to_string();
+
+        assert!(
+            message.contains("connect") || message.contains("request"),
+            "missing request category: {message}"
+        );
+        assert_no_sensitive_url(
+            &message,
+            &[
+                "http://",
+                &address.to_string(),
+                "/private/latest.json",
+                "X-Amz-Signature",
+                "private-signature",
+            ],
+        );
+    }
+
+    #[test]
+    fn artifact_send_error_does_not_expose_download_url() {
+        install_test_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let artifact_address = listener.local_addr().unwrap();
+        drop(listener);
+        let artifact_url = format!(
+            "http://{artifact_address}/private/artifact?X-Amz-Credential=private-credential&X-Amz-Signature=private-signature"
+        );
+        let manifest = serde_json::json!({
+            "version": "999.0.0",
+            "platforms": {
+                "test-target": {
+                    "url": artifact_url,
+                    "signature": "not-reached"
+                }
+            }
+        })
+        .to_string();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            manifest.len()
+        );
+        let (manifest_url, server) = serve_once_at(
+            "/latest.json",
+            vec![headers.into_bytes(), manifest.into_bytes()],
+        );
+        let app = tauri::test::mock_app();
+        let updater = UpdaterBuilder::new(
+            app.handle(),
+            Config {
+                dangerous_insecure_transport_protocol: true,
+                endpoints: vec![url::Url::parse(&manifest_url).unwrap()],
+                ..Default::default()
+            },
+        )
+        .target("test-target")
+        .no_proxy()
+        .build()
+        .unwrap();
+        let update = tauri::async_runtime::block_on(updater.check())
+            .unwrap()
+            .unwrap();
+        server.join().unwrap();
+
+        let error = tauri::async_runtime::block_on(update.download(|_, _| {}, || {})).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("connect") || message.contains("request"),
+            "missing request category: {message}"
+        );
+        assert_no_sensitive_url(
+            &message,
+            &[
+                "http://",
+                &artifact_address.to_string(),
+                "/private/artifact",
+                "X-Amz-Credential",
+                "private-credential",
+                "X-Amz-Signature",
+                "private-signature",
+            ],
+        );
     }
 
     #[test]
@@ -608,7 +824,7 @@ impl Updater {
                 .replace("{{bundle_type}}", installer)
                 .parse()?;
 
-            log::debug!("checking for updates {url}");
+            log::debug!("checking for updates at configured endpoint");
 
             #[cfg(feature = "rustls-tls")]
             if rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -630,8 +846,10 @@ impl Updater {
                 log::debug!("disabling proxy");
                 request = request.no_proxy();
             } else if let Some(ref proxy) = self.proxy {
-                log::debug!("using proxy {proxy}");
-                let proxy = reqwest::Proxy::all(proxy.as_str())?;
+                log::debug!("{CONFIGURED_PROXY_LOG_MESSAGE}");
+                let proxy = reqwest::Proxy::all(proxy.as_str()).map_err(|error| {
+                    Error::sanitized_reqwest("configure", "updater manifest proxy", error)
+                })?;
                 request = request.proxy(proxy);
             }
 
@@ -640,11 +858,15 @@ impl Updater {
             }
 
             let response = request
-                .build()?
+                .build()
+                .map_err(|error| {
+                    Error::sanitized_reqwest("build", "updater manifest client", error)
+                })?
                 .get(url)
                 .headers(headers.clone())
                 .send()
-                .await;
+                .await
+                .map_err(|error| Error::sanitized_reqwest("fetch", "updater manifest", error));
 
             match response {
                 Ok(res) => {
@@ -663,13 +885,16 @@ impl Updater {
                         )
                         .await?;
                         let update_response: serde_json::Value = serde_json::from_slice(&manifest)?;
-                        log::debug!("update response: {update_response:?}");
+                        log::debug!("received updater response");
                         raw_json = Some(update_response.clone());
                         match serde_json::from_value::<RemoteRelease>(update_response)
                             .map_err(Into::into)
                         {
                             Ok(release) => {
-                                log::debug!("parsed release response {release:?}");
+                                log::debug!(
+                                    "parsed updater release response version={}",
+                                    release.version
+                                );
                                 last_error = None;
                                 remote_release = Some(release);
                                 // we found a release, break the loop
@@ -688,7 +913,7 @@ impl Updater {
                 }
                 Err(err) => {
                     log::error!("failed to check for updates: {err}");
-                    last_error = Some(err.into())
+                    last_error = Some(err)
                 }
             }
         }
@@ -857,18 +1082,22 @@ impl Update {
         if self.no_proxy {
             request = request.no_proxy();
         } else if let Some(ref proxy) = self.proxy {
-            let proxy = reqwest::Proxy::all(proxy.as_str())?;
+            let proxy = reqwest::Proxy::all(proxy.as_str()).map_err(|error| {
+                Error::sanitized_reqwest("configure", "updater artifact proxy", error)
+            })?;
             request = request.proxy(proxy);
         }
         if let Some(ref configure_client) = self.configure_client {
             request = configure_client(request);
         }
         let response = request
-            .build()?
+            .build()
+            .map_err(|error| Error::sanitized_reqwest("build", "updater artifact client", error))?
             .get(self.download_url.clone())
             .headers(headers)
             .send()
-            .await?;
+            .await
+            .map_err(|error| Error::sanitized_reqwest("fetch", "updater artifact", error))?;
 
         if !response.status().is_success() {
             return Err(Error::Network(format!(
@@ -939,7 +1168,7 @@ where
     let mut observed = 0_u64;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|error| Error::sanitized_reqwest("read", resource, error))?;
         observed = observed
             .checked_add(chunk.len() as u64)
             .ok_or(Error::ResponseTooLarge {
