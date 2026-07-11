@@ -13,7 +13,12 @@ import type {
   MacUpdateReport,
 } from "../../shared/types";
 import { DEFAULT_SETTINGS } from "../../shared/types";
-import { resolveFailure, userErrorMessage, type FailureSurface } from "../errorCopy";
+import {
+  contextualFailure,
+  resolveFailure,
+  userErrorMessage,
+  type FailureSurface,
+} from "../errorCopy";
 import { Icon, CodexGlyph } from "../icons";
 import { useI18n, dirOf, type TKey } from "../i18n";
 import { Ring, TopBar, ResultBanner, ErrorHero, FailureBanner, StatusBanner } from "../components";
@@ -76,6 +81,8 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // A paused download: the progress screen stays up (not routed home) offering
   // 〔继续〕/〔取消〕. `dl` is the byte snapshot captured at the moment of pause.
   const [paused, setPaused] = useState<PausedDownload | null>(null);
+  const [pausedDiscardBusy, setPausedDiscardBusy] = useState(false);
+  const pausedDiscardBusyRef = useRef(false);
   const scopeRef = useRef<HTMLDivElement>(null);
   const confirmTitleId = useId();
   const confirmBodyId = useId();
@@ -99,9 +106,9 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     resetStop,
   } = useDownloadProgress({
     eventName: "mac://download-progress",
-    pauseDownload: () => managerApi.macPauseDownload(),
-    cancelDownload: () => managerApi.macCancelDownload(),
-    cannotCancelMessage: t("progress.cannotCancel"),
+    pauseDownload: (operationId) => managerApi.macPauseDownload(operationId),
+    cancelDownload: (operationId) => managerApi.macCancelDownload(operationId),
+    getOperationSnapshot: () => managerApi.getOperationSnapshot(),
     onError: setActionError,
   });
 
@@ -344,6 +351,7 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // stopped instead of at 0.
   const resumeDownload = useCallback(() => {
     const kind = paused?.kind;
+    setActionError(null);
     setPaused(null);
     if (kind === "install") void runInstall();
     else void runPerform();
@@ -353,15 +361,29 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // cached partial and route home. (An in-flight cancel is handled by
   // requestDownloadStop instead.)
   const cancelPausedDownload = useCallback(async () => {
-    setPaused(null);
+    if (pausedDiscardBusyRef.current) return;
+    pausedDiscardBusyRef.current = true;
+    setActionError(null);
+    setPausedDiscardBusy(true);
     try {
       // Only claim "已取消" once the cached partial is actually gone — otherwise
       // a failed discard would leave a `.part` that the next update silently
       // resumes, contradicting the cancel.
       await managerApi.macDiscardDownload();
+      setPaused(null);
       setNotice(t("progress.cancelled"));
     } catch (cause) {
-      setActionError(resolveFailure(cause, t));
+      setActionError(
+        contextualFailure(
+          cause,
+          t,
+          t("progress.discardFailed"),
+          "paused_discard_failed",
+        ),
+      );
+    } finally {
+      pausedDiscardBusyRef.current = false;
+      setPausedDiscardBusy(false);
     }
   }, [t]);
 
@@ -553,7 +575,8 @@ function MacHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         dlSpeed={dlSpeed}
         installing={paused ? paused.kind === "install" : busy === "install"}
         downloadStop={downloadStop}
-        downloadStopBusy={downloadStopBusy}
+        downloadStopBusy={downloadStopBusy || pausedDiscardBusy}
+        failure={actionError}
         onResume={resumeDownload}
         onPause={() => void requestDownloadStop("pause")}
         onCancel={() => {

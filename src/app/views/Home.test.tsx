@@ -12,6 +12,7 @@ import type {
   MacInstallStatus,
   MacPerformReport,
   MacUpdateReport,
+  OperationSnapshot,
   UpdatePlan,
 } from "../../shared/types";
 import { DEFAULT_SETTINGS } from "../../shared/types";
@@ -83,6 +84,15 @@ const REPORT_UPTODATE: MacUpdateReport = {
 
 const STATUS_MANAGED: MacInstallStatus = { installed: INSTALLED, status: "managed" };
 const STATUS_NONE: MacInstallStatus = { installed: null, status: "none" };
+const ACTIVE_OPERATION: OperationSnapshot = {
+  id: "op-active",
+  kind: "update",
+  phase: "downloading",
+  progress: { downloaded: 10, total: 100, source: "mirror.example" },
+  paused: false,
+  cancellable: true,
+  interruptible: true,
+};
 
 const PERFORM_OK: MacPerformReport = {
   upToDate: false,
@@ -127,6 +137,7 @@ describe("MacHome state machine", () => {
     api.macPauseDownload.mockResolvedValue(true);
     api.macCancelDownload.mockResolvedValue(true);
     api.macDiscardDownload.mockResolvedValue(undefined);
+    api.getOperationSnapshot.mockResolvedValue(null);
   });
 
   it("offers install when nothing is detected", async () => {
@@ -245,7 +256,14 @@ describe("MacHome state machine", () => {
     // Bytes arrive → the pause button becomes actionable.
     await waitFor(() => expect(onProgress).toBeDefined());
     act(() => {
-      onProgress?.({ payload: { downloaded: 512, total: 1024, source: "mirror.example" } });
+      onProgress?.({
+        payload: {
+          downloaded: 512,
+          total: 1024,
+          source: "mirror.example",
+          operationId: "op-active",
+        },
+      });
     });
 
     // The progress bar exposes progressbar semantics to assistive tech. The
@@ -260,6 +278,7 @@ describe("MacHome state machine", () => {
     await waitFor(() => expect(pause).toBeEnabled());
     await user.click(pause);
     await waitFor(() => expect(api.macPauseDownload).toHaveBeenCalledTimes(1));
+    expect(api.macPauseDownload).toHaveBeenCalledWith("op-active");
 
     // The backend acknowledges the pause by failing the in-flight perform.
     act(() => rejectPerform?.(new Error("download cancelled")));
@@ -287,13 +306,114 @@ describe("MacHome state machine", () => {
     renderHome();
     await user.click(await screen.findByRole("button", { name: /立即更新/ }));
     await waitFor(() => expect(onProgress).toBeDefined());
-    act(() => onProgress?.({ payload: { downloaded: 10, total: 100, source: "s" } }));
+    act(() =>
+      onProgress?.({
+        payload: { downloaded: 10, total: 100, source: "s", operationId: "op-active" },
+      }),
+    );
     await user.click(await screen.findByRole("button", { name: /^暂停$/ }));
     act(() => rejectPerform?.(new Error("download cancelled")));
     await screen.findByText("下载已暂停");
 
     await user.click(screen.getByRole("button", { name: /取消/ }));
     await waitFor(() => expect(api.macDiscardDownload).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("下载已取消。")).toBeInTheDocument();
+  });
+
+  it.each([
+    { intent: "pause" as const, outcome: "false" as const },
+    { intent: "pause" as const, outcome: "reject" as const },
+    { intent: "cancel" as const, outcome: "false" as const },
+    { intent: "cancel" as const, outcome: "reject" as const },
+  ])(
+    "keeps the macOS progress flow recoverable when $intent returns $outcome",
+    async ({ intent, outcome }) => {
+      const user = userEvent.setup();
+      api.getSettings.mockResolvedValue(settings({ askBefore: false }));
+      api.macPerformUpdate.mockImplementationOnce(() => new Promise<MacPerformReport>(() => {}));
+
+      let onProgress: ((event: { payload: DownloadProgress }) => void) | undefined;
+      listenMock.mockImplementation((event: string, cb: unknown) => {
+        if (event === "mac://download-progress") onProgress = cb as typeof onProgress;
+        return Promise.resolve(() => {});
+      });
+
+      const stop = intent === "pause" ? api.macPauseDownload : api.macCancelDownload;
+      if (outcome === "false") {
+        stop.mockResolvedValue(false);
+      } else {
+        stop.mockRejectedValue(new Error("invoke bridge unavailable"));
+      }
+
+      renderHome();
+      await user.click(await screen.findByRole("button", { name: /立即更新/ }));
+      if (intent === "pause") {
+        await waitFor(() => expect(onProgress).toBeDefined());
+        act(() =>
+          onProgress?.({
+            payload: { downloaded: 10, total: 100, source: "mirror.example" },
+          }),
+        );
+      }
+
+      const action = intent === "pause" ? "暂停" : "取消";
+      const button = await screen.findByRole("button", { name: action });
+      await waitFor(() => expect(button).toBeEnabled());
+      api.getOperationSnapshot.mockResolvedValue(ACTIVE_OPERATION);
+      await user.click(button);
+
+      const expected =
+        outcome === "false"
+          ? `${action}请求被后端拒绝。任务仍在继续，可重试。`
+          : `${action}请求未送达。任务仍在继续，可重试。`;
+      expect(await screen.findByRole("alert")).toHaveTextContent(expected);
+      expect(screen.getByText("正在更新…")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: action })).toBeEnabled();
+
+      // The same control becomes actionable again rather than staying pending.
+      await user.click(screen.getByRole("button", { name: action }));
+      await waitFor(() => expect(stop).toHaveBeenCalledTimes(2));
+    },
+  );
+
+  it("keeps the macOS paused screen and both recovery actions when discard rejects", async () => {
+    const user = userEvent.setup();
+    api.getSettings.mockResolvedValue(settings({ askBefore: false }));
+    api.macDiscardDownload.mockRejectedValueOnce(new Error("cache locked"));
+
+    let rejectPerform: ((cause: unknown) => void) | undefined;
+    let onProgress: ((event: { payload: DownloadProgress }) => void) | undefined;
+    listenMock.mockImplementation((event: string, cb: unknown) => {
+      if (event === "mac://download-progress") onProgress = cb as typeof onProgress;
+      return Promise.resolve(() => {});
+    });
+    api.macPerformUpdate.mockImplementationOnce(
+      () => new Promise<MacPerformReport>((_resolve, reject) => (rejectPerform = reject)),
+    );
+
+    renderHome();
+    await user.click(await screen.findByRole("button", { name: /立即更新/ }));
+    await waitFor(() => expect(onProgress).toBeDefined());
+    act(() =>
+      onProgress?.({
+        payload: { downloaded: 10, total: 100, source: "s", operationId: "op-active" },
+      }),
+    );
+    await user.click(await screen.findByRole("button", { name: /^暂停$/ }));
+    act(() => rejectPerform?.(new Error("download cancelled")));
+    await screen.findByText("下载已暂停");
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "取消未完成。下载仍处于暂停状态；你可以继续下载或重试取消。",
+    );
+    expect(screen.getByText("下载已暂停")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "取消" })).toBeEnabled();
+
+    // The failed discard is retryable; only the successful retry leaves pause.
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(api.macDiscardDownload).toHaveBeenCalledTimes(2));
     expect(await screen.findByText("下载已取消。")).toBeInTheDocument();
   });
 });

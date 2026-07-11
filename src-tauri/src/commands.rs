@@ -14,8 +14,9 @@ use crate::app::disk::available_space;
 use crate::app::logging::redact_url;
 use crate::app::mac_update::{
     cancel_macos_download, detect_existing_install_at_path as detect_macos_install_at_path,
-    discard_macos_download, install_macos_with_network, mac_adopt_path as adopt_macos_path,
-    pause_macos_download, perform_macos_update_with_network_and_phase,
+    discard_macos_download, install_macos_with_network_and_phase,
+    mac_adopt_path as adopt_macos_path, pause_macos_download,
+    perform_macos_update_with_network_and_phase,
     plan_macos_update_with_network, retry_macos_ancillary, stage_macos_update_with_network,
     uninstall_macos, InstalledCodex, MacInstallStatus, MacPerformReport, MacStageReport,
     MacUninstallReport, MacUpdateReport, PerformExpectation,
@@ -314,6 +315,23 @@ impl DetachedGuard {
             .map_err(destructive_token_error)?;
         Ok(Self {
             completion_tracking,
+            operations,
+            succeeded: false,
+            token: Some(token),
+        })
+    }
+
+    fn validate_with_phase(
+        state: &ManagerState,
+        token: OperationToken,
+        phase: OperationPhase,
+    ) -> Result<Self, CommandError> {
+        let operations = state.operations.clone();
+        operations
+            .validate_with_phase(&token, phase)
+            .map_err(destructive_token_error)?;
+        Ok(Self {
+            completion_tracking: false,
             operations,
             succeeded: false,
             token: Some(token),
@@ -831,6 +849,8 @@ pub async fn mac_install(
     let network = mac_network_config_for_settings()?;
     let progress_token = token.clone();
     let progress_ops = ops.clone();
+    let phase_token = token.clone();
+    let phase_ops = ops.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: crate::app::mac_update::DownloadProgress| {
             emit_op_download_progress(
@@ -843,7 +863,10 @@ pub async fn mac_install(
                 p.source,
             );
         };
-        install_macos_with_network(&report, &network)
+        let phase_hook = |phase: OperationPhase| {
+            let _ = phase_ops.set_phase(&phase_token, phase);
+        };
+        install_macos_with_network_and_phase(&report, &network, Some(&phase_hook))
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -853,26 +876,31 @@ pub async fn mac_install(
 /// macOS-only: request pausing an active package download.
 /// Partial bytes are left in place for the next resume-capable run.
 #[tauri::command]
-pub fn mac_pause_download(state: State<'_, ManagerState>) -> Result<bool, CommandError> {
+pub fn mac_pause_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    if let Some(snap) = state.operations.snapshot() {
-        let _ = state
-            .operations
-            .set_paused(&OperationToken(snap.id), true);
-    }
-    Ok(pause_macos_download())
+    Ok(state
+        .operations
+        .request_pause(&OperationToken(operation_id), pause_macos_download))
 }
 
 /// macOS-only: request cancellation of an active package download.
 /// Partial bytes are discarded.
 #[tauri::command]
-pub fn mac_cancel_download() -> Result<bool, CommandError> {
+pub fn mac_cancel_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    Ok(cancel_macos_download())
+    Ok(state
+        .operations
+        .request_cancellation(&OperationToken(operation_id), cancel_macos_download))
 }
 
 /// macOS-only: discard a PAUSED download. After a pause the curl process is gone
@@ -1115,7 +1143,9 @@ pub fn retry_ancillary(
                 "清除用户数据需要破坏性令牌（先 arm_destructive uninstall）".to_string(),
             )
         })?;
-        RetryGuard::Detached(DetachedGuard::validate(&state, token)?)
+        let guard =
+            DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+        RetryGuard::Detached(guard)
     } else {
         RetryGuard::Scoped(begin_guard(&state, OperationKind::Adopt)?)
     };
@@ -1210,9 +1240,17 @@ pub fn get_operation_completion(
 #[tauri::command]
 pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Result<(), CommandError> {
     let confirm_close = crate::app::settings_store::AppSettings::load().confirm_close;
-    // Evaluate as if force_quit is not yet set so a point-of-no-return phase
-    // still blocks even after the user clicks the confirm dialog.
-    let policy = state.operations.quit_policy(false, confirm_close);
+    // Decide and arm exit under the SAME operation mutex used by phase changes.
+    // If the worker already reached commit this returns Block. Otherwise both app
+    // abort latches and force_quit are set before it can cross that boundary, so
+    // the final pre-commit checkpoint observes the cancellation.
+    let policy = state.operations.prepare_quit(confirm_close, true, || {
+        let _ = cancel_macos_download();
+        let _ = cancel_windows_download();
+        state
+            .force_quit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    });
     if let QuitPolicy::Block {
         phase,
         reason_code,
@@ -1228,12 +1266,6 @@ pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Re
         let _ = app.emit("app://quit-blocked", &policy);
         return Err(AppError::Busy(reason.clone()).into());
     }
-    // Interruptible phases: best-effort cancel so partial downloads settle cleanly.
-    let _ = codex_mac_engine::cancel_active_download();
-    let _ = codex_win_engine::cancel_active_download();
-    state
-        .force_quit
-        .store(true, std::sync::atomic::Ordering::SeqCst);
     app.exit(0);
     Ok(())
 }
@@ -1380,7 +1412,10 @@ pub async fn mac_uninstall(
     if !confirm {
         return Err(AppError::Internal("拒绝执行：卸载必须带显式 confirm".to_string()).into());
     }
-    let _op = DetachedGuard::validate(&state, token)?;
+    let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+    // Uninstall has no resumable cancellation protocol. Treat the whole worker
+    // as point-of-no-return so every native/window quit path blocks until the
+    // removal and ancillary bookkeeping have settled.
     tauri::async_runtime::spawn_blocking(move || uninstall_macos(keep_codex_home))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -1431,26 +1466,31 @@ pub async fn win_auto_stage_update(
 /// Windows-only: request pausing an active background/manual download.
 /// Partial bytes are left in place for the next resume-capable staging run.
 #[tauri::command]
-pub fn win_pause_download(state: State<'_, ManagerState>) -> Result<bool, CommandError> {
+pub fn win_pause_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    if let Some(snap) = state.operations.snapshot() {
-        let _ = state
-            .operations
-            .set_paused(&OperationToken(snap.id), true);
-    }
-    Ok(pause_windows_download())
+    Ok(state
+        .operations
+        .request_pause(&OperationToken(operation_id), pause_windows_download))
 }
 
 /// Windows-only: request cancellation of an active background/manual download.
 /// Partial bytes are discarded.
 #[tauri::command]
-pub fn win_cancel_download(state: State<'_, ManagerState>) -> Result<bool, CommandError> {
+pub fn win_cancel_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    Ok(cancel_windows_download())
+    Ok(state
+        .operations
+        .request_cancellation(&OperationToken(operation_id), cancel_windows_download))
 }
 
 /// Windows-only: discard a PAUSED download. Drops the cached `.part` left for
@@ -1857,7 +1897,8 @@ pub async fn win_uninstall(
             AppError::Internal("拒绝执行：Windows 卸载必须带显式 confirm".to_string()).into(),
         );
     }
-    let _op = DetachedGuard::validate(&state, token)?;
+    let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+    // Remove-AppxPackage / portable tree removal must not be killed mid-call.
     let settings = windows_domain_settings_for_persisted(&state);
     tauri::async_runtime::spawn_blocking(move || {
         uninstall_windows_codex(&settings, confirm, purge_user_data)
