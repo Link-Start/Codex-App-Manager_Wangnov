@@ -26,6 +26,20 @@ export interface OperationSnapshot {
   interruptible: boolean;
 }
 
+export type OperationCompletionState =
+  | "succeeded"
+  | "failed-before-commit"
+  | "rolled-back"
+  | "outcome-unknown";
+
+/** Terminal backend evidence retained after the active lease disappears. */
+export interface OperationCompletion {
+  id: string;
+  kind: OperationKind;
+  phase: OperationPhase;
+  state: OperationCompletionState;
+}
+
 /**
  * Serialized error returned by failing Tauri commands. Mirrors the backend
  * `CommandError` struct (src-tauri/src/errors.rs), which serializes

@@ -18,6 +18,45 @@ function hasTauriRuntime(): boolean {
   );
 }
 
+const PROVENANCE_RECOVERY_ACTIONS = new Set(["record_provenance", "clear_provenance"]);
+const CLEANUP_RECOVERY_ACTIONS = new Set(["cleanup_metadata", "purge_user_data"]);
+
+/** Merge a scoped ancillary retry back into the original partial outcome.
+ * The backend reports only the actions attempted in this request; actions the
+ * user has not retried yet must remain visible, and a failed attempted action
+ * remains available even if a backend forgets to echo its recovery key. */
+function mergeAncillaryRetryOutcome(
+  previous: OperationOutcome,
+  attempted: string[],
+  retried: OperationOutcome,
+): OperationOutcome {
+  const attemptedSet = new Set(attempted);
+  const unattempted = previous.recoveryActions.filter((action) => !attemptedSet.has(action));
+  const failedAttempted = attempted.filter((action) => {
+    if (PROVENANCE_RECOVERY_ACTIONS.has(action)) return retried.provenance.state === "failed";
+    if (CLEANUP_RECOVERY_ACTIONS.has(action)) return retried.cleanup.state === "failed";
+    return false;
+  });
+  const recoveryActions = [
+    ...new Set([...unattempted, ...retried.recoveryActions, ...failedAttempted]),
+  ];
+  const hasUnattemptedProvenance = unattempted.some((action) =>
+    PROVENANCE_RECOVERY_ACTIONS.has(action),
+  );
+  const hasUnattemptedCleanup = unattempted.some((action) =>
+    CLEANUP_RECOVERY_ACTIONS.has(action),
+  );
+
+  return {
+    ...retried,
+    path: retried.path ?? previous.path,
+    provenance: hasUnattemptedProvenance ? previous.provenance : retried.provenance,
+    cleanup: hasUnattemptedCleanup ? previous.cleanup : retried.cleanup,
+    warnings: [...new Set([...previous.warnings, ...retried.warnings])],
+    recoveryActions,
+  };
+}
+
 export function Uninstall({ onBack }: { onBack: () => void }) {
   const { t } = useI18n();
   const platform = currentPlatform();
@@ -28,6 +67,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
   const [keepData, setKeepData] = useState(true);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
+  const [doneDetail, setDoneDetail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pathCopied, setPathCopied] = useState(false);
   // Install probe: Loading / Managed / External / None / Error — never treat a
@@ -68,6 +108,7 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
     setBusy(true);
     setError(null);
     setPartialOutcome(null);
+    setDoneDetail(null);
     try {
       // mac keeps ~/.codex via keepCodexHome; win purges via purgeUserData (the
       // inverse) — both surface the backend message as the source of truth.
@@ -75,7 +116,8 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         const r = await managerApi.winUninstall(true, !keepData);
         if (r.success && outcomeIsPartial(r.outcome)) {
           setPartialOutcome(r.outcome);
-          setDone(r.message);
+          setDone(t("uninstall.partial.summary"));
+          setDoneDetail(r.message);
           return;
         }
         if (!r.success) {
@@ -87,7 +129,8 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         const r = await managerApi.macUninstall(keepData);
         if (r.removed && outcomeIsPartial(r.outcome)) {
           setPartialOutcome(r.outcome);
-          setDone(r.message);
+          setDone(t("uninstall.partial.summary"));
+          setDoneDetail(r.message);
           return;
         }
         if (!r.removed) {
@@ -113,12 +156,17 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         path: partialOutcome?.path ?? null,
         purgeUserData: actions.includes("purge_user_data"),
       });
-      setDone(report.message);
-      if (outcomeIsPartial(report.outcome)) {
-        setPartialOutcome(report.outcome);
+      const mergedOutcome = partialOutcome
+        ? mergeAncillaryRetryOutcome(partialOutcome, actions, report.outcome)
+        : report.outcome;
+      if (mergedOutcome.recoveryActions.length > 0 || outcomeIsPartial(mergedOutcome)) {
+        setDone(t("uninstall.partial.retryPending"));
+        setPartialOutcome(mergedOutcome);
       } else {
+        setDone(t("uninstall.partial.retryDone"));
         setPartialOutcome(null);
       }
+      setDoneDetail(report.message);
     } catch (cause) {
       setError(userErrorMessage(cause, t));
     } finally {
@@ -162,6 +210,12 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
               <div className="headline">{t("uninstall.heading")}</div>
               <div className="desc">{done}</div>
             </section>
+            {doneDetail ? (
+              <details className="manual-existing-meta">
+                <summary>{t("home.error.details")}</summary>
+                <pre className="errdetails">{doneDetail}</pre>
+              </details>
+            ) : null}
             {partialOutcome ? (
               <>
                 <StatusBanner tone="warn">{t("uninstall.partial.title")}</StatusBanner>

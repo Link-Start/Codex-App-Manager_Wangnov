@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use crate::app::op_phase::{OperationPhase, QuitPolicy};
 
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_STALE_AFTER_SECS: u64 = 5 * 60;
+const COMPLETION_HISTORY_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -57,6 +59,7 @@ pub struct OperationManager {
 
 struct Inner {
     active: Option<ActiveOp>,
+    completed: VecDeque<OperationCompletion>,
     lock_file: Result<File, String>,
 }
 
@@ -87,6 +90,28 @@ pub struct OperationSnapshot {
     pub interruptible: bool,
 }
 
+/// Terminal backend evidence retained across renderer reloads. The frontend
+/// may release a fresh-install safety guard only for `FailedBeforeCommit` or a
+/// positively proven `RolledBack`; once an unresolved mutation is observed (or
+/// an ambiguous platform call starts), an invoke rejection cannot prove disk state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationCompletionState {
+    Succeeded,
+    FailedBeforeCommit,
+    RolledBack,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationCompletion {
+    pub id: String,
+    pub kind: OperationKind,
+    pub phase: OperationPhase,
+    pub state: OperationCompletionState,
+}
+
 struct ActiveOp {
     token: String,
     kind: OperationKind,
@@ -101,6 +126,17 @@ struct ActiveOp {
     holders: u32,
     /// Progress through the op lifecycle; drives quit policy.
     phase: OperationPhase,
+    /// True once the operation has definitely changed installed app state.
+    /// Completion classification must use this evidence, not the quit phase:
+    /// `Committing` may be published before the first write so closing the app
+    /// is blocked across the final pre-write crash window.
+    mutation_started: bool,
+    /// True only after a mutation was observed and the engine subsequently
+    /// proved that the install root was restored to its pre-operation state.
+    mutation_rolled_back: bool,
+    /// True once a platform call has begun whose failure cannot prove that the
+    /// installed app is unchanged (for example Add-AppxPackage).
+    outcome_ambiguous: bool,
     /// Last reported download progress (if any).
     progress: Option<OperationProgress>,
     /// True after a pause was requested while the lease is still held.
@@ -155,6 +191,7 @@ impl OperationManager {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 active: None,
+                completed: VecDeque::new(),
                 lock_file,
             })),
             stale_after_secs,
@@ -313,6 +350,87 @@ impl OperationManager {
         Ok(())
     }
 
+    /// Record positive evidence that installed app state has changed.
+    pub fn mark_mutation_started(&self, token: &OperationToken) -> Result<(), OperationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationError::Lock("operation mutex poisoned".to_string()))?;
+        let Some(active) = inner.active.as_mut() else {
+            return Err(OperationError::InvalidToken);
+        };
+        if active.token != token.0 {
+            return Err(OperationError::InvalidToken);
+        }
+        if !active.mutation_started {
+            log::info!(
+                "operation mutation started kind={} token_prefix={}",
+                active.kind.as_str(),
+                token_prefix(&token.0)
+            );
+            active.mutation_started = true;
+        }
+        // Any later mutation invalidates rollback evidence from an earlier
+        // attempt in the same operation.
+        active.mutation_rolled_back = false;
+        Ok(())
+    }
+
+    /// Record positive evidence that every observed portable install-root
+    /// mutation was restored. This does not clear `outcome_ambiguous`: a prior
+    /// platform call such as Add-AppxPackage may still have changed system state.
+    pub fn mark_mutation_rolled_back(
+        &self,
+        token: &OperationToken,
+    ) -> Result<(), OperationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationError::Lock("operation mutex poisoned".to_string()))?;
+        let Some(active) = inner.active.as_mut() else {
+            return Err(OperationError::InvalidToken);
+        };
+        if active.token != token.0 {
+            return Err(OperationError::InvalidToken);
+        }
+        // Some rollback callbacks also clear a Prepared journal before the
+        // first rename. They are safe failures, but not "rolled back" unless
+        // this operation actually recorded a mutation first.
+        if active.mutation_started {
+            log::info!(
+                "operation mutation rolled back kind={} token_prefix={}",
+                active.kind.as_str(),
+                token_prefix(&token.0)
+            );
+            active.mutation_rolled_back = true;
+        }
+        Ok(())
+    }
+
+    /// Record that a platform mutation call has started and its eventual error
+    /// cannot establish the pre-call disk state.
+    pub fn mark_outcome_ambiguous(&self, token: &OperationToken) -> Result<(), OperationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationError::Lock("operation mutex poisoned".to_string()))?;
+        let Some(active) = inner.active.as_mut() else {
+            return Err(OperationError::InvalidToken);
+        };
+        if active.token != token.0 {
+            return Err(OperationError::InvalidToken);
+        }
+        if !active.outcome_ambiguous {
+            log::info!(
+                "operation outcome became ambiguous kind={} token_prefix={}",
+                active.kind.as_str(),
+                token_prefix(&token.0)
+            );
+            active.outcome_ambiguous = true;
+        }
+        Ok(())
+    }
+
     /// Unified quit/close policy for window close, menu quit, and quit command.
     ///
     /// Reads busy/phase/kind under a **single** mutex hold so a concurrent
@@ -380,6 +498,59 @@ impl OperationManager {
                 interruptible,
             }
         })
+    }
+
+    /// Record the terminal outcome before the lease is released. Keeping a
+    /// small token-keyed history lets a replacement renderer distinguish a
+    /// true no-mutation failure from an ambiguous platform/mutation error.
+    pub fn record_completion(
+        &self,
+        token: &OperationToken,
+        succeeded: bool,
+    ) -> Result<OperationCompletion, OperationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationError::Lock("operation mutex poisoned".to_string()))?;
+        let Some(active) = inner.active.as_ref() else {
+            return Err(OperationError::InvalidToken);
+        };
+        if active.token != token.0 {
+            return Err(OperationError::InvalidToken);
+        }
+        let completion = OperationCompletion {
+            id: active.token.clone(),
+            kind: active.kind,
+            phase: active.phase,
+            state: if succeeded {
+                OperationCompletionState::Succeeded
+            } else if active.outcome_ambiguous {
+                OperationCompletionState::OutcomeUnknown
+            } else if active.mutation_started && active.mutation_rolled_back {
+                OperationCompletionState::RolledBack
+            } else if active.mutation_started {
+                OperationCompletionState::OutcomeUnknown
+            } else {
+                OperationCompletionState::FailedBeforeCommit
+            },
+        };
+        inner.completed.push_back(completion.clone());
+        while inner.completed.len() > COMPLETION_HISTORY_LIMIT {
+            inner.completed.pop_front();
+        }
+        Ok(completion)
+    }
+
+    pub fn completion(&self, token: &OperationToken) -> Option<OperationCompletion> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        inner
+            .completed
+            .iter()
+            .rev()
+            .find(|completion| completion.id == token.0)
+            .cloned()
     }
 
     /// Record the latest download progress for a validated token.
@@ -470,6 +641,9 @@ impl OperationManager {
             claimed,
             holders: 0,
             phase: OperationPhase::Preparing,
+            mutation_started: false,
+            mutation_rolled_back: false,
+            outcome_ambiguous: false,
             progress: None,
             paused: false,
         });
@@ -580,7 +754,9 @@ fn write_lock_diagnostics(
 
 #[cfg(test)]
 mod tests {
-    use super::{OperationError, OperationKind, OperationManager, OperationToken};
+    use super::{
+        OperationCompletionState, OperationError, OperationKind, OperationManager, OperationToken,
+    };
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -894,6 +1070,123 @@ mod tests {
 
         manager.end(token).unwrap();
         assert!(manager.snapshot().is_none());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn terminal_completion_uses_mutation_evidence_independently_of_quit_phase() {
+        use crate::app::op_phase::OperationPhase;
+
+        let path = lock_path("completion");
+        let manager = OperationManager::new(path.clone());
+
+        let before_commit = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&before_commit).unwrap();
+        manager
+            .set_phase(&before_commit, OperationPhase::Downloading)
+            .unwrap();
+        let completion = manager.record_completion(&before_commit, false).unwrap();
+        assert_eq!(
+            completion.state,
+            OperationCompletionState::FailedBeforeCommit
+        );
+        manager.end(before_commit.clone()).unwrap();
+        assert_eq!(manager.completion(&before_commit), Some(completion));
+
+        let committing_without_write = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&committing_without_write).unwrap();
+        manager
+            .set_phase(&committing_without_write, OperationPhase::Committing)
+            .unwrap();
+        let completion = manager
+            .record_completion(&committing_without_write, false)
+            .unwrap();
+        assert_eq!(
+            completion.state,
+            OperationCompletionState::FailedBeforeCommit
+        );
+        manager.end(committing_without_write).unwrap();
+
+        let after_mutation = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&after_mutation).unwrap();
+        manager.mark_mutation_started(&after_mutation).unwrap();
+        let completion = manager.record_completion(&after_mutation, false).unwrap();
+        assert_eq!(completion.state, OperationCompletionState::OutcomeUnknown);
+        manager.end(after_mutation.clone()).unwrap();
+        assert_eq!(manager.completion(&after_mutation), Some(completion));
+
+        let rolled_back = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&rolled_back).unwrap();
+        manager.mark_mutation_started(&rolled_back).unwrap();
+        assert!(matches!(
+            manager.mark_mutation_rolled_back(&OperationToken("wrong".to_string())),
+            Err(OperationError::InvalidToken)
+        ));
+        manager.mark_mutation_rolled_back(&rolled_back).unwrap();
+        let completion = manager.record_completion(&rolled_back, false).unwrap();
+        assert_eq!(completion.state, OperationCompletionState::RolledBack);
+        manager.end(rolled_back.clone()).unwrap();
+        assert_eq!(manager.completion(&rolled_back), Some(completion));
+
+        let rollback_before_mutation = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&rollback_before_mutation).unwrap();
+        manager
+            .mark_mutation_rolled_back(&rollback_before_mutation)
+            .unwrap();
+        let completion = manager
+            .record_completion(&rollback_before_mutation, false)
+            .unwrap();
+        assert_eq!(
+            completion.state,
+            OperationCompletionState::FailedBeforeCommit
+        );
+        manager.end(rollback_before_mutation).unwrap();
+
+        let ambiguous_rollback = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&ambiguous_rollback).unwrap();
+        manager
+            .mark_outcome_ambiguous(&ambiguous_rollback)
+            .unwrap();
+        manager.mark_mutation_started(&ambiguous_rollback).unwrap();
+        manager
+            .mark_mutation_rolled_back(&ambiguous_rollback)
+            .unwrap();
+        let completion = manager
+            .record_completion(&ambiguous_rollback, false)
+            .unwrap();
+        assert_eq!(completion.state, OperationCompletionState::OutcomeUnknown);
+        manager.end(ambiguous_rollback).unwrap();
+
+        let mutation_after_rollback = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&mutation_after_rollback).unwrap();
+        manager.mark_mutation_started(&mutation_after_rollback).unwrap();
+        manager
+            .mark_mutation_rolled_back(&mutation_after_rollback)
+            .unwrap();
+        manager.mark_mutation_started(&mutation_after_rollback).unwrap();
+        let completion = manager
+            .record_completion(&mutation_after_rollback, false)
+            .unwrap();
+        assert_eq!(completion.state, OperationCompletionState::OutcomeUnknown);
+        manager.end(mutation_after_rollback).unwrap();
+
+        let ambiguous_call = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&ambiguous_call).unwrap();
+        manager
+            .mark_outcome_ambiguous(&ambiguous_call)
+            .unwrap();
+        let completion = manager.record_completion(&ambiguous_call, false).unwrap();
+        assert_eq!(completion.state, OperationCompletionState::OutcomeUnknown);
+        manager.end(ambiguous_call.clone()).unwrap();
+        assert_eq!(manager.completion(&ambiguous_call), Some(completion));
+
+        let succeeded = manager.begin_detached(OperationKind::Update).unwrap();
+        manager.validate(&succeeded).unwrap();
+        let completion = manager.record_completion(&succeeded, true).unwrap();
+        assert_eq!(completion.state, OperationCompletionState::Succeeded);
+        manager.end(succeeded.clone()).unwrap();
+        assert_eq!(manager.completion(&succeeded), Some(completion));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
