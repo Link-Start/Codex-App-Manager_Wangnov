@@ -429,6 +429,17 @@ impl FrontendGate {
         }
     }
 
+    /// Whether the current renderer generation can safely own window
+    /// presentation. A timed-out generation is also presentable because native
+    /// degraded mode must be able to surface its fallback dialogs.
+    pub fn can_present_window(&self) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        inner.ready || inner.degraded
+    }
+
     pub fn mark_ready(&self, generation: u64, token: &str) -> FrontendReadyResult {
         let mut inner = self
             .inner
@@ -594,11 +605,13 @@ mod tests {
     #[test]
     fn events_emit_immediately_after_frontend_is_ready() {
         let gate = FrontendGate::default();
+        assert!(!gate.can_present_window());
         let (_, token) = start_load(&gate);
         assert!(matches!(
             gate.mark_ready(1, &token),
             FrontendReadyResult::Accepted(ref ready) if ready.first_ready && ready.pending.is_empty()
         ));
+        assert!(gate.can_present_window());
         assert!(matches!(
             gate.mark_ready(1, &token),
             FrontendReadyResult::Accepted(ref ready) if !ready.first_ready && ready.pending.is_empty()
@@ -653,6 +666,7 @@ mod tests {
         let degraded = gate
             .mark_degraded(generation)
             .expect("current load degrades");
+        assert!(gate.can_present_window());
         assert!(degraded.activation_pending);
         assert!(matches!(
             degraded.next_native_event,

@@ -5,18 +5,23 @@ import { listen } from "@tauri-apps/api/event";
 
 import type { Diagnostics, OperationSnapshot } from "../shared/types";
 import { managerApi } from "../services/managerApi";
-import { CATALOG } from "./i18n";
+import { CATALOG, I18nProvider } from "./i18n";
 import {
   crashBodyForSnapshot,
   ErrorBoundary,
   type CrashStrings,
 } from "./ErrorBoundary";
-import { I18nProvider } from "./i18n";
-import { ThemeProvider } from "./theme";
 import { QuitConfirm } from "./components";
+import { ThemeProvider } from "./theme";
 
 vi.mock("../services/managerApi", () => ({
-  errorMessage: (cause: unknown) => (cause instanceof Error ? cause.message : String(cause)),
+  errorMessage: (cause: unknown) => {
+    if (cause instanceof Error) return cause.message;
+    if (cause && typeof cause === "object" && "message" in cause) {
+      return String((cause as { message: unknown }).message);
+    }
+    return String(cause);
+  },
   managerApi: {
     getDiagnostics: vi.fn(),
     reportFrontendError: vi.fn(() => Promise.resolve()),
@@ -397,7 +402,7 @@ describe("ErrorBoundary", () => {
     consoleError.mockRestore();
   });
 
-  it("keeps QuitConfirm available outside the boundary so crash-path quit works", async () => {
+  it("uses the backend phase-aware quit command without depending on QuitConfirm", async () => {
     const user = userEvent.setup();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     delete (
@@ -405,29 +410,36 @@ describe("ErrorBoundary", () => {
     ).__TAURI_INTERNALS__;
 
     render(
-      <ThemeProvider>
-        <I18nProvider>
-          <ErrorBoundary>
-            <Boom />
-          </ErrorBoundary>
-          <QuitConfirm />
-        </I18nProvider>
-      </ThemeProvider>,
+      <ErrorBoundary>
+        <Boom />
+      </ErrorBoundary>,
     );
 
     expect(screen.getByRole("button", { name: CATALOG.en["crash.quit"] })).toBeInTheDocument();
 
-    // Browser path: Quit dispatches cam:confirm-quit → QuitConfirm opens.
     await user.click(screen.getByRole("button", { name: CATALOG.en["crash.quit"] }));
-
-    await waitFor(() => {
-      expect(screen.getByText(/Close the manager/i)).toBeInTheDocument();
-    });
-
-    // Confirm sheet primary action is "Close" (not the crash-page Quit).
-    await user.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => expect(confirmQuit).toHaveBeenCalled());
 
+    consoleError.mockRestore();
+  });
+
+  it("surfaces a serialized backend refusal message", async () => {
+    const user = userEvent.setup();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    confirmQuit.mockRejectedValueOnce({
+      code: "operation_not_interruptible",
+      message: "install is committing",
+    });
+
+    render(
+      <ErrorBoundary>
+        <Boom />
+      </ErrorBoundary>,
+    );
+    await user.click(screen.getByRole("button", { name: CATALOG.en["crash.quit"] }));
+
+    await waitFor(() => expect(screen.getByText("install is committing")).toBeInTheDocument());
+    expect(screen.queryByText("[object Object]")).not.toBeInTheDocument();
     consoleError.mockRestore();
   });
 });

@@ -1,6 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 
-import { managerApi } from "../services/managerApi";
+import { errorMessage, managerApi } from "../services/managerApi";
 import type { OperationSnapshot } from "../shared/types";
 import { Ring } from "./components";
 import { formatDiagnostics } from "./diagnostics";
@@ -13,6 +13,8 @@ interface State {
   /** Backend operation lease, if any — drives crash-page copy. */
   opSnapshot: OperationSnapshot | null;
   opLoaded: boolean;
+  quitPending: boolean;
+  quitFailure: string | null;
 }
 
 const CRASH_KEYS = [
@@ -61,13 +63,6 @@ export function crashBodyForSnapshot(
   return strings["crash.body"];
 }
 
-function isTauri(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__)
-  );
-}
-
 export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
   state: State = {
     error: null,
@@ -75,6 +70,8 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
     showDetails: false,
     opSnapshot: null,
     opLoaded: false,
+    quitPending: false,
+    quitFailure: null,
   };
 
   static getDerivedStateFromError(error: Error): Partial<State> {
@@ -149,17 +146,23 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
     }
   };
 
-  /** Ask the shared QuitConfirm (mounted outside this boundary) to handle exit. */
+  /**
+   * The crash page itself is an explicit confirmation. Ask the backend command
+   * directly so quitting remains phase-aware even when QuitConfirm was the
+   * component that crashed. The backend refuses point-of-no-return phases.
+   */
   private requestQuit = () => {
-    if (isTauri()) {
-      void import("@tauri-apps/api/window")
-        .then(({ getCurrentWindow }) => getCurrentWindow().close())
-        .catch(() => {
-          void managerApi.confirmQuit().catch(() => undefined);
+    if (this.state.quitPending) return;
+    this.setState({ quitPending: true, quitFailure: null });
+    void managerApi
+      .confirmQuit()
+      .catch((cause) => {
+        const message = errorMessage(cause);
+        this.setState({
+          quitFailure: message || crashStrings()["crash.bodyCritical"],
         });
-    } else {
-      window.dispatchEvent(new Event("cam:confirm-quit"));
-    }
+      })
+      .finally(() => this.setState({ quitPending: false }));
   };
 
   render() {
@@ -207,9 +210,18 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
             <button className="btn ghost" onClick={this.copy}>
               {this.state.copied ? strings["crash.copied"] : strings["crash.copy"]}
             </button>
-            <button className="btn ghost" onClick={this.requestQuit}>
+            <button
+              className="btn ghost"
+              onClick={this.requestQuit}
+              disabled={this.state.quitPending}
+            >
               {strings["crash.quit"]}
             </button>
+            {this.state.quitFailure ? (
+              <div role="alert" className="desc">
+                {this.state.quitFailure}
+              </div>
+            ) : null}
           </div>
         </div>
       </div>

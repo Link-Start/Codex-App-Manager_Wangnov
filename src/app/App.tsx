@@ -94,9 +94,10 @@ function Shell() {
 }
 
 export function App() {
-  // QuitConfirm sits *outside* ErrorBoundary so a render crash that replaces
-  // Shell still leaves a live listener for app://confirm-quit / quit-blocked.
-  // Theme + i18n wrap both so the confirm sheet keeps working on the crash path.
+  // Keep QuitConfirm outside the rich boundary so native close / Cmd+Q events
+  // still have a listener when Shell is replaced by its crash page. The
+  // dependency-light RootCrashBoundary in bootstrap.tsx wraps this whole tree,
+  // so a provider or QuitConfirm failure still reaches the final fallback.
   return (
     <ThemeProvider>
       <I18nProvider>

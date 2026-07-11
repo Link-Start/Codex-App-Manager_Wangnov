@@ -15,6 +15,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Codex App Manager",
         "width": 400,
         "height": 640,
@@ -27,7 +28,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https://codexapp.agentsmirror.com https://github.com https://persistent.oaistatic.com"
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'",
+      "devCsp": "default-src 'self'; script-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 ws://localhost:1420; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {
