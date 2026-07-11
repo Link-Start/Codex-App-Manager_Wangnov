@@ -110,7 +110,9 @@ export function assertReleaseSourceVersions(releaseTag, sourceRoot) {
 
 export function assertLocalReleaseArtifactNames(releaseTag, artifactsDir) {
   const version = releaseVersionFromTag(releaseTag);
-  const expected = requiredReleaseAssetNames(releaseTag).filter((name) => name !== "latest.json");
+  const expected = requiredReleaseAssetNames(releaseTag).filter(
+    (name) => name !== "latest.json" && name !== "release-binding.json",
+  );
   const dir = resolve(artifactsDir);
   const files = readdirSync(dir, { withFileTypes: true })
     .filter((entry) => entry.isFile())

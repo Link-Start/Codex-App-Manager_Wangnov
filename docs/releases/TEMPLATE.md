@@ -1,6 +1,7 @@
 <!--
   Release-notes template. Copy to docs/releases/v<X.Y.Z>.md inside the
-  version-bump PR; release.yml picks it up by tag name when the tag is pushed
+  version-bump PR; the unprivileged tag signal asks the default-branch
+  release.yml to pick it up by tag name
   (and appends GitHub's auto-generated "What's Changed" + Full Changelog).
   If the file is missing the workflow falls back to a minimal install table,
   so a release is never published with an empty body.
