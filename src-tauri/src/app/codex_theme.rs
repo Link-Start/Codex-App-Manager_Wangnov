@@ -7,7 +7,7 @@
 //! `--remote-debugging-port` needs `open -n`); the commands report
 //! `supported: false` elsewhere so the UI can say so instead of erroring.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use codex_theme_engine::daemon::{run_daemon, DaemonStatus, Directive};
@@ -59,14 +59,32 @@ pub struct ThemeStatusReport {
     pub codex_running: bool,
     /// A pristine config.toml appearance backup exists (full restore possible).
     pub native_backup_present: bool,
+    /// Where managed skins currently live (downloads/imports land here).
+    pub store_dir: Option<PathBuf>,
 }
 
 fn theme_supported() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// Managed theme root (downloads land here later) + optional dev root from
-/// settings. Dev packages shadow managed ones by id.
+/// Where managed skins live: the user-chosen store from settings, else the
+/// platform default (macOS: Application Support; Windows: LOCALAPPDATA —
+/// megabytes of re-downloadable content must not roam with a domain profile).
+pub fn store_dir(settings: &AppSettings) -> Result<PathBuf, AppError> {
+    if let Some(dir) = settings
+        .codex_theme_store_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    paths::default_skins_store_dir()
+        .ok_or_else(|| AppError::Internal("无法定位主题存储目录".to_string()))
+}
+
+/// Managed skin store + optional dev root from settings. Dev packages shadow
+/// managed ones by id.
 fn theme_roots(settings: &AppSettings) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(dir) = settings
@@ -76,10 +94,77 @@ fn theme_roots(settings: &AppSettings) -> Vec<PathBuf> {
     {
         roots.push(PathBuf::from(dir));
     }
-    if let Some(data) = paths::data_dir() {
-        roots.push(data.join("themes"));
+    if let Ok(store) = store_dir(settings) {
+        roots.push(store);
     }
     roots
+}
+
+/// Move one directory across an arbitrary boundary: fast rename first,
+/// recursive copy + delete when the rename crosses filesystems.
+fn move_dir(src: &Path, dst: &Path) -> Result<(), AppError> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let target = dst.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), &target)?;
+            }
+        }
+        Ok(())
+    }
+    copy_tree(src, dst).map_err(|e| AppError::Internal(format!("迁移 {} 失败: {e}", src.display())))?;
+    std::fs::remove_dir_all(src)
+        .map_err(|e| AppError::Internal(format!("清理旧目录失败: {e}")))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreMigrationReport {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub moved: Vec<String>,
+    /// Ids skipped because the destination already had them.
+    pub skipped: Vec<String>,
+}
+
+/// Migrate every valid skin package from `old` to `new`. Conflicting ids are
+/// left in place (destination wins — never destroy what the user already has
+/// at the target). Leftover staging debris is not migrated.
+pub fn migrate_store(old: &Path, new: &Path) -> Result<StoreMigrationReport, AppError> {
+    std::fs::create_dir_all(new)
+        .map_err(|e| AppError::Internal(format!("创建主题目录失败: {e}")))?;
+    let mut report = StoreMigrationReport {
+        from: old.to_path_buf(),
+        to: new.to_path_buf(),
+        moved: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return Ok(report); // old store never materialized — nothing to move
+    };
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if !src.is_dir() || load_theme(&src).is_err() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let dst = new.join(&name);
+        if dst.exists() {
+            report.skipped.push(name);
+            continue;
+        }
+        move_dir(&src, &dst)?;
+        report.moved.push(name);
+    }
+    Ok(report)
 }
 
 fn native_paths() -> Result<NativeThemePaths, AppError> {
@@ -121,6 +206,169 @@ pub fn resolve_theme_for_keep(settings: &AppSettings, theme_ref: &str) -> Result
     let dir = resolve_theme(settings, theme_ref)?;
     let theme = load_theme(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
     Ok(theme.config.id)
+}
+
+// ── Online catalog (skins.agentsmirror.com) ────────────────────────────────
+// The catalog is published by awesome-codex-skins' CI; URLs inside it are
+// relative and resolved ONLY against this fixed base — a hostile catalog
+// cannot redirect downloads elsewhere. All transfers go through the system
+// curl (the repo's networking idiom; Windows 10+ ships curl.exe) with https
+// pinned, size caps, and a sha256 gate before anything reaches the importer.
+
+const SKINS_BASE: &str = "https://skins.agentsmirror.com";
+const CATALOG_MAX_BYTES: &str = "1048576"; // 1 MB index.json cap
+const PACK_MAX_BYTES: &str = "52428800"; // 50 MB archive cap (importer re-checks)
+
+#[derive(Debug, Clone, serde::Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSkin {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub appearance: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub codex_verified: Option<String>,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub pack: String,
+    #[serde(default)]
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CatalogIndex {
+    #[serde(default)]
+    skins: Vec<CatalogSkin>,
+}
+
+/// A catalog-relative path is plain (`packs/x.codexskin`) — no scheme, no
+/// authority, no parent hops. Everything else is rejected before URL joining.
+fn safe_catalog_path(rel: &str) -> Result<String, AppError> {
+    let ok = !rel.is_empty()
+        && !rel.contains("://")
+        && !rel.starts_with('/')
+        && !rel.contains("..")
+        && rel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b));
+    if ok {
+        Ok(format!("{SKINS_BASE}/{rel}"))
+    } else {
+        Err(AppError::Engine(format!("目录条目路径非法: {rel}")))
+    }
+}
+
+fn curl_bin() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "curl.exe"
+    } else {
+        "/usr/bin/curl"
+    }
+}
+
+/// Fetch a URL to stdout via system curl: https only, no retries into other
+/// protocols, hard timeout and size cap.
+fn curl_fetch(url: &str, max_bytes: &str, timeout_secs: &str) -> Result<Vec<u8>, AppError> {
+    let output = std::process::Command::new(curl_bin())
+        .args([
+            "-sfL",
+            "--proto",
+            "=https",
+            "--max-time",
+            timeout_secs,
+            "--max-filesize",
+            max_bytes,
+            url,
+        ])
+        .output()
+        .map_err(|e| AppError::Engine(format!("curl 不可用: {e}")))?;
+    if !output.status.success() {
+        return Err(AppError::Engine(format!(
+            "下载失败 ({}): {}",
+            output.status,
+            crate::app::logging::redact_url(url)
+        )));
+    }
+    Ok(output.stdout)
+}
+
+pub fn fetch_catalog() -> Result<Vec<CatalogSkin>, AppError> {
+    let bytes = curl_fetch(&format!("{SKINS_BASE}/index.json"), CATALOG_MAX_BYTES, "15")?;
+    let index: CatalogIndex = serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Engine(format!("皮肤目录解析失败: {e}")))?;
+    let mut skins: Vec<CatalogSkin> = index
+        .skins
+        .into_iter()
+        .filter(|s| !s.id.is_empty() && !s.pack.is_empty() && s.sha256.len() == 64)
+        .collect();
+    skins.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(skins)
+}
+
+/// Catalog cover preview as a data URL (WebP, ≤ 2 MB by convention).
+pub fn catalog_preview_data_url(preview_rel: &str) -> Result<String, AppError> {
+    use base64::Engine as _;
+    let url = safe_catalog_path(preview_rel)?;
+    let bytes = curl_fetch(&url, "2097152", "15")?;
+    Ok(format!(
+        "data:image/webp;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+/// Download + sha256-gate + install one catalog skin. Returns the installed
+/// summary (the importer re-validates everything structurally).
+pub fn install_from_catalog(skin_id: &str) -> Result<codex_theme_engine::theme::ThemeSummary, AppError> {
+    use sha2::Digest as _;
+    let skin = fetch_catalog()?
+        .into_iter()
+        .find(|s| s.id == skin_id)
+        .ok_or_else(|| AppError::Engine(format!("目录中没有该皮肤: {skin_id}")))?;
+    let url = safe_catalog_path(&skin.pack)?;
+    let bytes = curl_fetch(&url, PACK_MAX_BYTES, "120")?;
+
+    let digest = sha2::Sha256::digest(&bytes);
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    if !hex.eq_ignore_ascii_case(&skin.sha256) {
+        return Err(AppError::Engine(format!(
+            "校验失败：{skin_id} 的 sha256 与目录不符"
+        )));
+    }
+
+    let staging = std::env::temp_dir().join(format!(
+        "codexskin-online-{}-{}.codexskin",
+        std::process::id(),
+        skin_id
+    ));
+    std::fs::write(&staging, &bytes)
+        .map_err(|e| AppError::Internal(format!("写入临时包失败: {e}")))?;
+    let themes_root = store_dir(&AppSettings::load())?;
+    let outcome = codex_theme_engine::import::import_codexskin(&staging, &themes_root)
+        .map_err(|e| AppError::Engine(e.to_string()));
+    let _ = std::fs::remove_file(&staging);
+    log::info!(
+        "online skin install id={skin_id} version={} ok={}",
+        skin.version,
+        outcome.is_ok()
+    );
+    outcome
 }
 
 /// Cover preview as a data URL; None when the theme has no preview, can't be
@@ -177,6 +425,7 @@ impl ThemeService {
             cdp_ready,
             codex_running: codex_running(),
             native_backup_present: native_backup,
+            store_dir: store_dir(settings).ok(),
         }
     }
 
@@ -209,6 +458,25 @@ impl ThemeService {
             let _ = tx.send(None);
         }
         Ok(())
+    }
+
+    /// After a store migration, re-point a live directive whose theme dir
+    /// moved with the store (the daemon rebuilds its payload from the new
+    /// path on the next tick; injected renderers are untouched either way).
+    pub async fn rebase_directive(&self, old_root: &Path, new_root: &Path) {
+        let inner = self.inner.lock().await;
+        let Some(tx) = &inner.directive_tx else {
+            return;
+        };
+        let current = tx.borrow().clone();
+        if let Some(dir) = current {
+            if let Ok(rel) = dir.strip_prefix(old_root) {
+                let rebased = new_root.join(rel);
+                if rebased.join("theme.json").is_file() {
+                    let _ = tx.send(Some(rebased));
+                }
+            }
+        }
     }
 
     /// Full apply: quiesce Codex, write the native appearance sections, then
