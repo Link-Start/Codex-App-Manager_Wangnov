@@ -111,7 +111,7 @@ pub struct MsixHealthReport {
     /// Machine-stable failure class for UI / fallback routing. Empty when healthy.
     /// Values: `not-registered` | `status-bad` | `aumid-unresolved` |
     /// `missing-dependencies` | `activation-failed` | `immediate-exit` |
-    /// `timeout` | `probe-failed` | `policy`.
+    /// `timeout` | `probe-failed` | `policy` | `cleanup-failed`.
     #[serde(default)]
     pub failure_kind: String,
     /// Human-facing reason when unhealthy; empty when healthy.
@@ -129,6 +129,7 @@ pub mod msix_failure {
     pub const TIMEOUT: &str = "timeout";
     pub const PROBE_FAILED: &str = "probe-failed";
     pub const POLICY: &str = "policy";
+    pub const CLEANUP_FAILED: &str = "cleanup-failed";
 }
 
 /// Result of the framework-dependency PRE-check run BEFORE attempting an MSIX
@@ -793,8 +794,12 @@ fn best_effort_close_msix_after_probe() {
     }
 }
 
-#[cfg(windows)]
 pub fn verify_msix_health() -> MsixHealthReport {
+    verify_msix_health_with_options(false)
+}
+
+#[cfg(windows)]
+pub fn verify_msix_health_with_options(keep_running: bool) -> MsixHealthReport {
     log::info!("MSIX health check start");
     // Activation is the expensive step — budget deps probe + cold-start window +
     // continuous liveness + cleanup + slack.
@@ -833,6 +838,7 @@ $appId = ''
 $installLoc = ''
 $targetIds = @()
 $activationAttempted = $false
+$keepRunning = {keep_running}
 function Convert-ToVersion($value) {{
   try {{
     $text = [string]$value
@@ -890,12 +896,23 @@ function Get-PackageProcesses([string]$root) {{
   return $found
 }}
 function Stop-PackageProcesses([string]$root, $ids) {{
-  foreach ($id in @($ids)) {{
-    try {{ Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }} catch {{}}
-  }}
-  foreach ($p in @(Get-PackageProcesses $root)) {{
-    try {{ Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }} catch {{}}
-  }}
+  $pendingIds = @($ids)
+  $deadline = (Get-Date).AddSeconds(5)
+  do {{
+    foreach ($id in $pendingIds) {{
+      try {{ Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }} catch {{}}
+    }}
+    foreach ($p in @(Get-PackageProcesses $root)) {{
+      try {{ Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }} catch {{}}
+    }}
+    Start-Sleep -Milliseconds 200
+    $remaining = @(Get-PackageProcesses $root)
+    if ($remaining.Count -eq 0) {{ return $true }}
+    # Electron may replace a process while shutting down. Follow the replacement
+    # PIDs and retry until the bounded cleanup deadline.
+    $pendingIds = @($remaining | ForEach-Object {{ $_.Id }} | Select-Object -Unique)
+  }} while ((Get-Date) -lt $deadline)
+  return (@(Get-PackageProcesses $root).Count -eq 0)
 }}
 try {{
   $manifest = Get-AppxPackageManifest $pkg -ErrorAction Stop
@@ -984,6 +1001,17 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
     }}
     if ($stillAlive) {{
       $activationOk = $true
+      if (-not $keepRunning) {{
+        if (Stop-PackageProcesses $installLoc $targetIds) {{
+          $targetIds = @()
+        }} else {{
+          # A health check is not successful if it changes a previously-closed
+          # app into a running one. Fail closed so the caller can report/fallback.
+          $activationOk = $false
+          $failureKind = 'cleanup-failed'
+          $activationDetail = 'package process remained running after health-check cleanup'
+        }}
+      }}
     }} elseif ($sawProcess) {{
       $failureKind = 'immediate-exit'
       $activationDetail = 'package process started then exited during the liveness window'
@@ -1003,7 +1031,7 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
   # Unhealthy activation must not leave Codex holding package files open for
   # the subsequent portable fallback / Remove-AppxPackage.
   if (-not $activationOk -and $activationAttempted) {{
-    Stop-PackageProcesses $installLoc $targetIds
+    $null = Stop-PackageProcesses $installLoc $targetIds
   }}
 }}
 
@@ -1020,7 +1048,8 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
 "#,
         name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY),
         activation_window = MSIX_ACTIVATION_WINDOW_SECS,
-        liveness_window = MSIX_LIVENESS_WINDOW_SECS
+        liveness_window = MSIX_LIVENESS_WINDOW_SECS,
+        keep_running = if keep_running { "$true" } else { "$false" }
     );
 
     let run_result = run_powershell_json_with_limits(&script, limits);
@@ -1174,7 +1203,7 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
 }
 
 #[cfg(not(windows))]
-pub fn verify_msix_health() -> MsixHealthReport {
+pub fn verify_msix_health_with_options(_keep_running: bool) -> MsixHealthReport {
     // Non-Windows builds never sideload, so there is nothing to verify; report
     // healthy so this can never be the thing that blocks a (non-existent) path,
     // but leave verified = false since no real check was performed.
@@ -1781,6 +1810,7 @@ function Get-AppxPackage {
         assert_eq!(super::msix_failure::IMMEDIATE_EXIT, "immediate-exit");
         assert_eq!(super::msix_failure::TIMEOUT, "timeout");
         assert_eq!(super::msix_failure::POLICY, "policy");
+        assert_eq!(super::msix_failure::CLEANUP_FAILED, "cleanup-failed");
     }
 
     #[test]

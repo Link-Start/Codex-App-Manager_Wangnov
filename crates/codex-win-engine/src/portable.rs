@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -385,6 +385,12 @@ pub fn close_codex_gracefully_for_root(timeout_secs: u64, root: &Path) -> Result
     crate::windows_process::close_codex_processes_for_root(timeout_secs, root)
 }
 
+/// Whether Codex currently has any process running from this exact install
+/// root. The same native, path-pinned discovery is used by the close gate.
+pub fn codex_running_for_root(root: &Path) -> Result<bool, EngineError> {
+    crate::windows_process::codex_processes_running_for_root(root)
+}
+
 #[cfg(windows)]
 fn create_start_menu_shortcut(install_root: &Path) -> Result<bool, EngineError> {
     let Some(exe) = installed_app_exe(install_root) else {
@@ -596,7 +602,11 @@ fn rollback_install_error(
     }
 }
 
-fn health_check_portable_install(install_root: &Path, launch: bool) -> Result<bool, EngineError> {
+fn health_check_portable_install(
+    install_root: &Path,
+    launch: bool,
+    keep_running: bool,
+) -> Result<bool, EngineError> {
     let exe = installed_app_exe(install_root).ok_or_else(|| {
         EngineError::Install(format!(
             "portable health check failed: no app entry executable (ChatGPT.exe / Codex.exe) in {}",
@@ -611,10 +621,35 @@ fn health_check_portable_install(install_root: &Path, launch: bool) -> Result<bo
     // process running (this path is the post-install relaunch).
     match spawn_and_require_liveness(hidden_command(&exe), PORTABLE_LIVENESS_WINDOW) {
         Ok(LivenessResult::Survived { child }) => {
-            // Intentionally leak the Child handle so the relaunched app keeps
-            // running after the manager drops the wait loop.
-            std::mem::forget(child);
-            Ok(true)
+            if keep_running {
+                // Intentionally leak the Child handle so the relaunched app
+                // keeps running after the manager drops the wait loop.
+                std::mem::forget(child);
+                Ok(true)
+            } else {
+                // The launch was only a health check. Close the whole Electron
+                // process tree so an update cannot open an app that was closed
+                // beforehand.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(EngineError::Install(format!(
+                            "portable health check cleanup failed: Codex is still running from {}",
+                            install_root.display()
+                        )));
+                    }
+                    // A closing Electron parent may replace itself with another
+                    // process. Use bounded close slices and rescan the exact root
+                    // between them instead of trusting one PID snapshot.
+                    close_codex_gracefully_for_root(remaining.as_secs().clamp(1, 5), install_root)?;
+                    if !codex_running_for_root(install_root)? {
+                        break;
+                    }
+                }
+                drop(child);
+                Ok(false)
+            }
         }
         Ok(LivenessResult::ExitedEarly { code }) => Err(EngineError::Install(format!(
             "portable health check failed: entry executable exited immediately after launch (exit={})",
@@ -854,7 +889,11 @@ pub fn install_portable_from_msix_with_observer(
         ));
     }
 
-    let relaunched = match health_check_portable_install(install_root, manage_process && relaunch) {
+    let relaunched = match health_check_portable_install(
+        install_root,
+        manage_process,
+        manage_process && relaunch,
+    ) {
         Ok(relaunched) => relaunched,
         Err(err) => {
             let _ = fs::remove_dir_all(&work_dir);
@@ -1398,7 +1437,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = health_check_portable_install(&root, true).unwrap_err();
+        let err = health_check_portable_install(&root, true, true).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("exited immediately"),

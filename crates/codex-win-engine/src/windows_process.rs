@@ -218,6 +218,12 @@ mod imp {
         Ok(targets)
     }
 
+    pub(crate) fn codex_processes_running_for_root(root: &Path) -> Result<bool, EngineError> {
+        Ok(target_processes_under_root(root)?
+            .iter()
+            .any(TargetProcess::is_running))
+    }
+
     unsafe extern "system" fn post_close_to_pid(hwnd: HWND, target_pid: LPARAM) -> i32 {
         let mut window_pid = 0u32;
         // SAFETY: EnumWindows supplied a live top-level HWND; `window_pid` is a
@@ -356,6 +362,7 @@ mod imp {
                 }
                 thread::sleep(Duration::from_millis(50));
             }
+            assert!(codex_processes_running_for_root(&root).unwrap());
 
             let result = close_codex_processes_for_root(0, &root);
             if result.is_err() {
@@ -363,13 +370,14 @@ mod imp {
             }
             result.unwrap();
             assert!(child.wait().unwrap().code().is_some());
+            assert!(!codex_processes_running_for_root(&root).unwrap());
             let _ = std::fs::remove_dir_all(root);
         }
     }
 }
 
 #[cfg(windows)]
-pub(crate) use imp::close_codex_processes_for_root;
+pub(crate) use imp::{close_codex_processes_for_root, codex_processes_running_for_root};
 
 #[cfg(not(windows))]
 pub(crate) fn close_codex_processes_for_root(
@@ -377,6 +385,11 @@ pub(crate) fn close_codex_processes_for_root(
     _root: &Path,
 ) -> Result<(), EngineError> {
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn codex_processes_running_for_root(_root: &Path) -> Result<bool, EngineError> {
+    Ok(false)
 }
 
 #[cfg(test)]
