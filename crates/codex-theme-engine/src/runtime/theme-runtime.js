@@ -34,6 +34,12 @@
   if (previous?.appliedVars) {
     for (const name of previous.appliedVars) document.documentElement?.style.removeProperty(name);
   }
+  // A hot theme switch reuses the live DOM. Clear semantic annotations from
+  // the previous payload before the new theme decides which glyphs it can
+  // actually render; otherwise partial icon sets inherit stale hidden paths.
+  document.querySelectorAll("[data-cts-glyph]").forEach((node) => node.removeAttribute("data-cts-glyph"));
+  document.querySelectorAll("[data-cts-icon]").forEach((node) => node.removeAttribute("data-cts-icon"));
+  document.querySelectorAll("[data-cts-logo]").forEach((node) => node.removeAttribute("data-cts-logo"));
 
   // Split the chrome fragment into its layers: "overlay" floats above the UI
   // (fixed, z31), "stage" is scenery mounted inside main UNDER the content.
@@ -102,34 +108,137 @@
   const SIDEBAR_ICONS = [
     { icon: "new-task", texts: ["新建任务", "New task"] },
     { icon: "scheduled", texts: ["已安排", "Scheduled"] },
-    { icon: "plugins", texts: ["插件", "Plugins"] },
+    { icon: "plugins", texts: ["插件", "Plugins", "技能", "Skills"] },
     { icon: "sites", texts: ["站点", "Sites"] },
     { icon: "pull-request", texts: ["拉取请求", "Pull request"] },
     { icon: "chat", texts: ["聊天", "Chat"] },
+    { icon: "settings", texts: ["设置", "Settings"] },
   ];
   const CARD_ICONS = ["explore", "build", "review", "fix"];
+  const EXTENDED_ICONS = new Set(["settings", "folder"]);
+  const PROJECT_ROW_SELECTOR = "[data-project-row], [data-app-action-sidebar-project-row]";
 
-  // The glyph attribute lands on the FIRST svg inside the control, so sibling
-  // svgs (dropdown chevrons etc.) keep their native artwork.
+  // settings/folder annotation was added after the original 14-glyph runtime.
+  // Gate those two on an explicit theme rule so older themes that hide native
+  // paths without mapping the new glyphs never render blank controls.
+  const hasExplicitGlyphStyle = (icon) => {
+    const escaped = icon.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`data-cts-glyph\\s*=\\s*["']${escaped}["']`).test(cssText);
+  };
+  const SUPPORTED_EXTENDED_ICONS = new Set(
+    [...EXTENDED_ICONS].filter((icon) => hasExplicitGlyphStyle(icon))
+  );
+
+  const glyphTarget = (container, icon) => {
+    if (!container) return null;
+    // Current Codex project rows expose a stable icon slot. Prefer it over the
+    // generic first-svg fallback so disclosure/menu glyphs are never themed.
+    if (icon === "folder") {
+      const projectGlyph = container.querySelector(
+        '[data-sidebar-project-drop-zone="project-icon"] svg'
+      );
+      if (projectGlyph) return projectGlyph;
+    }
+    return container.querySelector("svg");
+  };
+
+  // React may replace the svg inside an otherwise-stable control (project
+  // expand/collapse does exactly this). Treat the container annotation as a
+  // cache, not proof: repair it whenever the current glyph lost its marker.
   const tagGlyph = (container, icon) => {
-    if (!container || container.dataset.ctsIcon) return;
-    const svg = container.querySelector("svg");
+    if (!container) return;
+    if (EXTENDED_ICONS.has(icon) && !SUPPORTED_EXTENDED_ICONS.has(icon)) return;
+    const svg = glyphTarget(container, icon);
     if (!svg) return;
-    container.dataset.ctsIcon = icon;
-    svg.dataset.ctsGlyph = icon;
+    const tagged = [...container.querySelectorAll("svg[data-cts-glyph]")];
+    const healthy = container.dataset.ctsIcon === icon
+      && svg.dataset.ctsGlyph === icon
+      && tagged.every((candidate) => candidate === svg);
+    if (healthy) return;
+    for (const candidate of tagged) {
+      if (candidate !== svg) candidate.removeAttribute("data-cts-glyph");
+    }
+    if (container.dataset.ctsIcon !== icon) container.dataset.ctsIcon = icon;
+    if (svg.dataset.ctsGlyph !== icon) svg.dataset.ctsGlyph = icon;
+  };
+
+  const clearGlyph = (container) => {
+    if (!container) return;
+    if (container.dataset.ctsIcon) delete container.dataset.ctsIcon;
+    for (const svg of container.querySelectorAll("svg[data-cts-glyph]")) {
+      svg.removeAttribute("data-cts-glyph");
+    }
+  };
+
+  const projectSemantic = (control) => {
+    const className = typeof control?.className === "string" ? control.className : "";
+    return [
+      control?.getAttribute?.("aria-label") || "",
+      control?.getAttribute?.("data-testid") || "",
+      control?.getAttribute?.("title") || "",
+      className,
+    ].join(" ");
+  };
+
+  const isProjectControl = (control) => Boolean(
+    control?.matches?.(PROJECT_ROW_SELECTOR) ||
+    control?.closest?.(PROJECT_ROW_SELECTOR) ||
+    /(?:folder|project[-_\s]?(?:row|item|link|button)|文件夹)/i.test(projectSemantic(control))
+  );
+
+  // Project expand/collapse replaces its inner SVG during React's commit.
+  // MutationObserver callbacks run before Chromium paints that commit, so
+  // repair just this cheap annotation synchronously and avoid one native-icon
+  // frame. The full ensure() pass remains debounced below for heavier work.
+  const repairProjectGlyphs = (node) => {
+    const element = node?.nodeType === 1 ? node : node?.parentElement;
+    if (!element) return;
+    const rows = new Set();
+    const closest = element.closest?.(PROJECT_ROW_SELECTOR);
+    if (closest) rows.add(closest);
+    if (element.matches?.(PROJECT_ROW_SELECTOR)) rows.add(element);
+    for (const row of element.querySelectorAll?.(PROJECT_ROW_SELECTOR) || []) rows.add(row);
+    for (const row of rows) tagGlyph(row, "folder");
   };
 
   const annotateIcons = () => {
     const aside = document.querySelector(".app-shell-left-panel");
     if (aside) {
       for (const button of aside.querySelectorAll("button:not([data-cts-icon])")) {
-        const text = button.textContent || "";
-        const rule = SIDEBAR_ICONS.find((entry) => entry.texts.some((t) => text.includes(t)));
+        const text = (button.textContent || "").replace(/\s+/g, " ").trim();
+        const isWorkspace = text === "Codex" || /^ChatGPT ?(工作|Work)$/i.test(text);
+        if (isWorkspace) {
+          clearGlyph(button);
+          continue;
+        }
+        if (isProjectControl(button)) continue;
+        const rule = SIDEBAR_ICONS.find((entry) => entry.texts.some((t) =>
+          text === t || text.startsWith(`${t} `) || text.startsWith(`${t}⌘`)
+        ));
         if (rule) tagGlyph(button, rule.icon);
       }
-      const search = aside.querySelector('[aria-label="搜索"]:not([data-cts-icon]), [aria-label="Search"]:not([data-cts-icon])');
+      const search = [...aside.querySelectorAll(
+        '[aria-label="搜索"]:not([data-cts-icon]), [aria-label="Search"]:not([data-cts-icon])'
+      )].find((control) => !isProjectControl(control));
       if (search) tagGlyph(search, "search");
-      // Workspace title → tokusatsu logo. The title text is split across
+      const settings = [...aside.querySelectorAll(
+        '[aria-label="设置"]:not([data-cts-icon]), [aria-label="Settings"]:not([data-cts-icon])'
+      )].find((control) => !isProjectControl(control));
+      if (settings) tagGlyph(settings, "settings");
+      // Project rows have changed element type across Codex releases (button,
+      // anchor and role=button have all shipped). Match their stable semantic
+      // attributes instead of project names or SVG path data, then decorate
+      // only the first glyph so disclosure chevrons remain native.
+      for (const control of aside.querySelectorAll(
+        'button, a, [role="button"], [data-project-row], [data-app-action-sidebar-project-row]'
+      )) {
+        const controlText = (control.textContent || "").replace(/\s+/g, " ").trim();
+        if (controlText === "Codex" || /^ChatGPT ?(工作|Work)$/i.test(controlText)) continue;
+        const row = control.closest(PROJECT_ROW_SELECTOR);
+        if (row && row !== control) continue;
+        if (isProjectControl(control)) tagGlyph(control, "folder");
+      }
+      // Workspace title → theme-specific logo. The title text is split across
       // child spans ("ChatGPT" + "工作"), so match on the whole button and
       // re-evaluate every pass (the same button swaps text on switch).
       for (const button of aside.querySelectorAll("button")) {
@@ -140,6 +249,7 @@
           if (button.dataset.ctsLogo) delete button.dataset.ctsLogo;
           continue;
         }
+        clearGlyph(button);
         const want = isCodex ? "codex" : "chatgpt-work";
         if (button.dataset.ctsLogo !== want) button.dataset.ctsLogo = want;
       }
@@ -323,6 +433,10 @@
       const target = mutation.target;
       if (chrome && (target === chrome || chrome.contains(target))) continue;
       if (target === document.documentElement && mutation.type === "attributes" && mutation.attributeName === "style") continue;
+      if (mutation.type === "childList") {
+        repairProjectGlyphs(target);
+        for (const added of mutation.addedNodes) repairProjectGlyphs(added);
+      }
       scheduleEnsure();
       return;
     }
