@@ -1379,6 +1379,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_portable_after_stage(
     settings: &AppSettings,
     stage: WinStageReport,
