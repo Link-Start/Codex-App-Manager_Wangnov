@@ -13,12 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use codex_win_engine::{
     cancel_active_download, cleanup_portable_metadata, close_codex_gracefully_for_root,
-    close_msix_codex_processes, detect_installed_codex, detect_portable_install,
+    close_msix_codex_processes, codex_running_for_root, detect_installed_codex,
+    detect_portable_install,
     download_to_with_progress_bounded_with_network, fetch_text_with_network, find_msix_sha256,
     install_msix_sideload, install_portable_from_msix_with_observer, limits::MAX_PACKAGE_BYTES,
     parse_manifest, pause_active_download, plan_update, precheck_msix_dependencies,
     probe_capabilities, purge_codex_user_data, read_msix_identity, remove_msix_package,
-    sha256_file, uninstall_portable, validate_codex_identity, verify_msix_health,
+    sha256_file, uninstall_portable, validate_codex_identity, verify_msix_health_with_options,
     verify_openai_authenticode, version_key, AuthenticodeReport, CapabilityState,
     InstalledWindowsCodex, MsixHealthReport, MsixIdentity, MsixRemoveReport, MsixSideloadReport,
     NetworkConfig, PortableBoundary, PortableInstallReport, PortableUninstallReport,
@@ -447,6 +448,30 @@ fn close_existing_codex_before_portable_fallback(
         }
     }
     Ok(())
+}
+
+fn existing_codex_was_running(
+    settings: &AppSettings,
+    previous_installed: Option<&InstalledWindowsCodex>,
+) -> Result<bool, AppError> {
+    let mut roots = Vec::new();
+    if let Some(installed) = detect_installed_codex(PathBuf::from(&settings.install_root).as_path())
+    {
+        roots.push(PathBuf::from(installed.path));
+    }
+    if let Some(previous) = previous_installed {
+        let root = PathBuf::from(&previous.path);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+
+    for root in roots {
+        if codex_running_for_root(&root).map_err(engine_err)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Detect the installed Codex, preferring a manager-managed PORTABLE build over
@@ -1112,6 +1137,11 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
         });
     }
 
+    // Capture the user's app state before any update path closes or probes
+    // Codex. Both MSIX and portable installs perform a real launch health check;
+    // this decides whether that checked process remains open afterward.
+    let was_running = existing_codex_was_running(settings, current_installed.as_ref())?;
+
     // Point of no return. Honor a cancel one last time BEFORE closing Codex or
     // sideloading — closes the gap after staging where a fully-cached MSIX skips
     // the download loop (so its cancel flag never arms) yet still reaches here.
@@ -1129,6 +1159,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
             stage,
             None,
             None,
+            was_running,
             current_installed,
             phase,
             evidence,
@@ -1166,6 +1197,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
             stage,
             None,
             None,
+            was_running,
             current_installed,
             phase,
             evidence,
@@ -1207,7 +1239,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
         // stripped Windows it can register yet fail to launch. If it's unhealthy,
         // first install the portable fallback so the user is never left without
         // a runnable build, then clean up the bad MSIX best-effort.
-        let health = verify_msix_health();
+        let health = verify_msix_health_with_options(was_running);
         if !health.healthy {
             log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
             // Activation probe may have started Codex (or left a half-started
@@ -1233,6 +1265,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
                 stage,
                 Some(sideload),
                 Some(health),
+                was_running,
                 current_installed,
                 phase,
                 evidence,
@@ -1339,17 +1372,20 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
         stage,
         Some(sideload),
         None,
+        was_running,
         current_installed,
         phase,
         evidence,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_portable_after_stage(
     settings: &AppSettings,
     stage: WinStageReport,
     sideload: Option<MsixSideloadReport>,
     health: Option<MsixHealthReport>,
+    relaunch: bool,
     previous_installed: Option<InstalledWindowsCodex>,
     phase: Option<&PhaseHook<'_>>,
     evidence: Option<&EvidenceHook<'_>>,
@@ -1436,7 +1472,7 @@ fn install_portable_after_stage(
         msix_path.as_path(),
         install_root_path.as_path(),
         true,
-        true,
+        relaunch,
         &mut observer,
     )
     .map_err(|err| {
