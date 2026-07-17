@@ -47,14 +47,15 @@ pub fn build_payload_from(theme: LoadedTheme) -> Result<BuiltPayload> {
         .map_err(|e| crate::ThemeEngineError::Theme(format!("config serialize: {e}")))?;
     let chrome_html = theme.chrome_html.clone();
 
-    // Fingerprint the PACKED artifacts (not the source files) so packaging
-    // changes also propagate to renderers that already carry the theme.
-    let mut hasher = Sha1::new();
-    hasher.update(css_with_assets.as_bytes());
-    hasher.update(chrome_html.as_deref().unwrap_or("").as_bytes());
-    hasher.update(config_json.as_bytes());
-    let digest = hasher.finalize();
-    let short = hex(&digest)[..12].to_string();
+    // Fingerprint the executable packed payload, including the renderer
+    // runtime. Without the runtime template, renderer-only bug fixes share the
+    // old stamp and the daemon cannot distinguish them from an installed copy.
+    let short = fingerprint(
+        RUNTIME_TEMPLATE,
+        &css_with_assets,
+        chrome_html.as_deref().unwrap_or(""),
+        &config_json,
+    );
     let stamp = format!("{ENGINE_VERSION}:{}:{short}", theme.config.id);
 
     let payload = RUNTIME_TEMPLATE
@@ -84,6 +85,16 @@ fn js_json(value: &str) -> Result<String> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn fingerprint(runtime: &str, css: &str, chrome: &str, config: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(runtime.as_bytes());
+    hasher.update(css.as_bytes());
+    hasher.update(chrome.as_bytes());
+    hasher.update(config.as_bytes());
+    let digest = hasher.finalize();
+    hex(&digest)[..12].to_string()
 }
 
 /// Tear the theme down in a renderer (idempotent; safe on stock pages).
@@ -208,6 +219,13 @@ mod tests {
         std::fs::write(dir.join("theme.css"), "html.codex-theme-studio body { color: red }\n")
             .unwrap();
         assert_ne!(first, build_payload(&dir).unwrap().stamp, "css change must re-stamp");
+    }
+
+    #[test]
+    fn fingerprint_tracks_runtime_changes() {
+        let first = fingerprint("runtime-a", "css", "chrome", "config");
+        let second = fingerprint("runtime-b", "css", "chrome", "config");
+        assert_ne!(first, second, "runtime change must re-stamp");
     }
 
     #[test]
