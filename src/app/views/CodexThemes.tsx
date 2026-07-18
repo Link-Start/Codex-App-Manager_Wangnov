@@ -6,6 +6,7 @@ import type {
   CatalogSkin,
   CodexThemeStatusReport,
   CodexThemeSummary,
+  SkinGroup,
 } from "../../shared/types";
 import { NavBar, Ring, Segmented, StatusBanner } from "../components";
 import { Icon } from "../icons";
@@ -91,11 +92,15 @@ function PhotoCover({
   onZoom,
   zoomLabel,
   className = "themecard-art themecard-art-photo",
+  reloadKey = 0,
 }: {
   load: () => Promise<string | null>;
   onZoom: (dataUrl: string) => void;
   zoomLabel: string;
   className?: string;
+  /** Bump to re-run load() on the same mounted card (e.g. a catalog refresh),
+   *  since load() otherwise only runs once on mount. */
+  reloadKey?: number;
 }) {
   const [dataUrl, setDataUrl] = useState<string | null>(null);
   const loadRef = useRef(load);
@@ -111,7 +116,7 @@ function PhotoCover({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadKey]);
   return (
     <button
       type="button"
@@ -160,6 +165,22 @@ type GalleryTab = "local" | "store";
 type ViewMode = "card" | "list";
 const VIEW_KEY = "cam.skins.view";
 const PAGE_SIZE: Record<ViewMode, number> = { card: 12, list: 20 };
+// Store theme categories, in display order. A skin with no (or an unknown)
+// category falls into "other".
+const STORE_CATEGORIES = ["anime", "stars", "tech", "guofeng", "games", "other"] as const;
+const CATEGORY_KEY = {
+  all: "themes.category.all",
+  anime: "themes.category.anime",
+  stars: "themes.category.stars",
+  tech: "themes.category.tech",
+  guofeng: "themes.category.guofeng",
+  games: "themes.category.games",
+  other: "themes.category.other",
+} as const;
+// Normalize an arbitrary catalog category to a known bucket ("other" for
+// unknown/missing) so an unrecognized value never hides a skin from grouping.
+const normCategory = (c?: string | null): string =>
+  (STORE_CATEGORIES as readonly string[]).includes(c ?? "") ? (c as string) : "other";
 
 /** One row in the gallery, normalized across a local package and a catalog
  *  entry so the card/list/detail chrome is shared. */
@@ -179,6 +200,7 @@ interface Item {
   loadPreview: () => Promise<string | null>;
   origin?: "dev" | "store"; // local only
   installedVersion?: string | null; // store only: version present in the store
+  category?: string | null; // store only: theme category for grouping
 }
 
 function localItem(theme: CodexThemeSummary): Item {
@@ -214,8 +236,9 @@ function storeItem(skin: CatalogSkin, installedVersion: string | null): Item {
     tags: skin.tags,
     colors: {},
     hasPreview: true,
-    loadPreview: () => managerApi.codexThemeCatalogPreview(skin.preview),
+    loadPreview: () => managerApi.codexThemeCatalogPreview(skin.preview, skin.version),
     installedVersion,
+    category: skin.category ?? null,
   };
 }
 
@@ -289,6 +312,21 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
   const [loaded, setLoaded] = useState(false);
   const [catalog, setCatalog] = useState<CatalogSkin[] | null>(null);
   const [catalogFailed, setCatalogFailed] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  // Bumped on each catalog (re)load so mounted preview covers re-fetch instead
+  // of keeping their mount-time image after a refresh.
+  const [catalogEpoch, setCatalogEpoch] = useState(0);
+  // Store-tab grouping: a selected theme category (null = all) plus optional tag
+  // sub-filters within it.
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
+  // Local-tab grouping: "all" | "store" | "dev" (derived source partitions) or a
+  // custom group id.
+  const [localGroup, setLocalGroup] = useState<string>("all");
+  const [groupModal, setGroupModal] = useState<{
+    mode: "create" | "rename" | "delete";
+    id?: string;
+  } | null>(null);
   const [storeNote, setStoreNote] = useState<string | null>(null);
   const [tab, setTab] = useState<GalleryTab>("local");
   const [query, setQuery] = useState("");
@@ -307,6 +345,9 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
   const [confirmIds, setConfirmIds] = useState<string[] | null>(null);
   const [refocusTick, setRefocusTick] = useState(0);
   const selectBtnRef = useRef<HTMLButtonElement>(null);
+  // Daemon errors come from polled status, so dismissing must remember the
+  // exact message and re-show only when a *different* error arrives.
+  const [dismissedDaemonError, setDismissedDaemonError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -333,20 +374,23 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
     return () => window.removeEventListener(SETTINGS_CHANGED_EVENT, onSettings);
   }, [refresh]);
 
-  useEffect(() => {
-    let cancelled = false;
-    void managerApi
-      .codexThemeCatalog()
-      .then((skins) => {
-        if (!cancelled) setCatalog(skins);
-      })
-      .catch(() => {
-        if (!cancelled) setCatalogFailed(true);
-      });
-    return () => {
-      cancelled = true;
-    };
+  const loadCatalog = useCallback(async () => {
+    setCatalogLoading(true);
+    try {
+      const skins = await managerApi.codexThemeCatalog();
+      setCatalog(skins);
+      setCatalogFailed(false);
+      setCatalogEpoch((e) => e + 1);
+    } catch {
+      setCatalogFailed(true);
+    } finally {
+      setCatalogLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void loadCatalog();
+  }, [loadCatalog]);
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -394,6 +438,8 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
     return themes.filter((theme) => (seen.has(theme.id) ? false : (seen.add(theme.id), true)));
   }, [themes]);
 
+  const groups = useMemo(() => settings?.skinGroups ?? [], [settings]);
+
   const storeVersionOf = useCallback(
     (id: string) => themes.find((th) => th.id === id && th.origin === "store")?.meta.version ?? null,
     [themes],
@@ -404,7 +450,7 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
     return (catalog ?? []).map((skin) => storeItem(skin, storeVersionOf(skin.id)));
   }, [tab, localThemes, catalog, storeVersionOf]);
 
-  const visible = useMemo(
+  const searched = useMemo(
     () =>
       items.filter((it) =>
         matches(query, [
@@ -421,12 +467,56 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
     [items, query],
   );
 
+  // Categories actually present in the catalog, in display order (store only).
+  const storeCategories = useMemo(() => {
+    if (tab !== "store") return [] as string[];
+    const present = new Set((catalog ?? []).map((s) => normCategory(s.category)));
+    return STORE_CATEGORIES.filter((c) => present.has(c));
+  }, [tab, catalog]);
+
+  // Tags offered as sub-filters: those matchable within the current category +
+  // search, PLUS any already-selected tag — so a selection never becomes an
+  // invisible, uncancelable filter once its tag drops out of the pool.
+  const storeTags = useMemo(() => {
+    if (tab !== "store") return [] as string[];
+    const set = new Set<string>(selectedTags);
+    searched
+      .filter((it) => !selectedCategory || normCategory(it.category) === selectedCategory)
+      .forEach((it) => it.tags.forEach((t) => set.add(t)));
+    return [...set].sort();
+  }, [tab, searched, selectedCategory, selectedTags]);
+
+  const visible = useMemo(() => {
+    if (tab === "store") {
+      return searched.filter((it) => {
+        if (selectedCategory && normCategory(it.category) !== selectedCategory) return false;
+        if (selectedTags.size && !it.tags.some((t) => selectedTags.has(t))) return false;
+        return true;
+      });
+    }
+    // Local: filter by derived source partition or a custom group's members.
+    if (localGroup === "store" || localGroup === "dev") {
+      return searched.filter((it) => it.origin === localGroup);
+    }
+    if (localGroup !== "all") {
+      const ids = new Set(groups.find((g) => g.id === localGroup)?.skinIds ?? []);
+      return searched.filter((it) => ids.has(it.id));
+    }
+    return searched;
+  }, [tab, searched, selectedCategory, selectedTags, localGroup, groups]);
+
   const pageSize = PAGE_SIZE[view];
   const pages = Math.max(1, Math.ceil(visible.length / pageSize));
   // Reset paging when the working set changes underfoot.
   useEffect(() => {
     setPage(0);
-  }, [tab, query, view]);
+  }, [tab, query, view, selectedCategory, selectedTags, localGroup]);
+  // Leaving a tab clears filters (store category/tags and the local group).
+  useEffect(() => {
+    setSelectedCategory(null);
+    setSelectedTags(new Set());
+    setLocalGroup("all");
+  }, [tab]);
   const clampedPage = Math.min(page, pages - 1);
   const paged = visible.slice(clampedPage * pageSize, clampedPage * pageSize + pageSize);
 
@@ -439,9 +529,17 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
     (it: Item) => it.kind === "local" && it.origin === "store" && it.id !== activeId,
     [activeId],
   );
-  const selectableOnPage = paged.filter(deletable);
+  // In select mode every local skin is selectable (so any can be grouped);
+  // deletion is later narrowed to the removable subset.
+  const selectableOnPage = paged.filter((it) => it.kind === "local");
   const allSelected =
     selectableOnPage.length > 0 && selectableOnPage.every((it) => selected.has(it.id));
+  // Only store-origin skins can actually be deleted; a selection that also holds
+  // dev checkouts still deletes just the removable subset.
+  const selectedDeletable = useMemo(
+    () => [...selected].filter((id) => items.some((it) => it.id === id && deletable(it))),
+    [selected, items, deletable],
+  );
 
   const toggleSelect = (id: string) =>
     setSelected((prev) => {
@@ -461,6 +559,71 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
     setSelecting(false);
     setSelected(new Set());
   };
+
+  // Store grouping: picking a category (toggle off to "all") resets tag filters;
+  // tags toggle independently.
+  const pickCategory = (c: string) => {
+    setSelectedCategory((cur) => (cur === c ? null : c));
+    setSelectedTags(new Set());
+  };
+  const toggleTag = (tag: string) =>
+    setSelectedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) next.delete(tag);
+      else next.add(tag);
+      return next;
+    });
+
+  // Custom-group CRUD, persisted through settings. Returns whether the write
+  // landed, so callers switch the active filter only on success (a rejected
+  // save must not point localGroup at a group that was never persisted).
+  const persistGroups = async (next: SkinGroup[]): Promise<boolean> => {
+    if (busy) return false;
+    setBusy("groups");
+    setActionError(null);
+    try {
+      const current = settings ?? (await managerApi.getSettings());
+      await managerApi.setSettings({ ...current, skinGroups: next });
+      await refresh();
+      return true;
+    } catch (cause) {
+      setActionError(errorMessage(cause));
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+  const createGroup = async (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed || busy !== null) return;
+    const id = crypto.randomUUID();
+    if (await persistGroups([...groups, { id, name: trimmed, skinIds: [] }])) {
+      setLocalGroup(id);
+    }
+  };
+  const renameGroup = (id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed || busy !== null) return;
+    void persistGroups(groups.map((g) => (g.id === id ? { ...g, name: trimmed } : g)));
+  };
+  const deleteGroup = async (id: string) => {
+    if (busy !== null) return;
+    if (await persistGroups(groups.filter((g) => g.id !== id))) {
+      setLocalGroup("all");
+    }
+  };
+  const addToGroup = (groupId: string, ids: string[]) =>
+    void persistGroups(
+      groups.map((g) =>
+        g.id === groupId ? { ...g, skinIds: [...new Set([...g.skinIds, ...ids])] } : g,
+      ),
+    );
+  const removeFromGroup = (groupId: string, ids: string[]) =>
+    void persistGroups(
+      groups.map((g) =>
+        g.id === groupId ? { ...g, skinIds: g.skinIds.filter((s) => !ids.includes(s)) } : g,
+      ),
+    );
 
   const doDelete = (ids: string[]) =>
     run("delete", async () => {
@@ -620,7 +783,7 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
   };
 
   const selBox = (it: Item) =>
-    selecting && deletable(it) ? (
+    selecting && it.kind === "local" ? (
       <label className="skin-check" title={t("themes.select")}>
         <input
           type="checkbox"
@@ -641,6 +804,7 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
         onZoom={setLightbox}
         zoomLabel={t("themes.zoom")}
         className={className ?? "themecard-art themecard-art-photo"}
+        reloadKey={it.kind === "store" ? catalogEpoch : 0}
       />
     ) : (
       <ThemeCardArt colors={it.colors} />
@@ -725,9 +889,18 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
         {status && !status.supported ? (
           <StatusBanner tone="info">{t("themes.status.unsupported")}</StatusBanner>
         ) : null}
-        {actionError ? <StatusBanner tone="err">{actionError}</StatusBanner> : null}
-        {status?.daemon?.lastError && !actionError ? (
-          <StatusBanner tone="warn">
+        {actionError ? (
+          <StatusBanner tone="err" onClose={() => setActionError(null)}>
+            {actionError}
+          </StatusBanner>
+        ) : null}
+        {status?.daemon?.lastError &&
+        !actionError &&
+        status.daemon.lastError !== dismissedDaemonError ? (
+          <StatusBanner
+            tone="warn"
+            onClose={() => setDismissedDaemonError(status.daemon?.lastError ?? null)}
+          >
             {t("themes.status.daemonError", { error: status.daemon.lastError })}
           </StatusBanner>
         ) : null}
@@ -869,7 +1042,93 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
               {selecting ? t("themes.select.done") : t("themes.select.manage")}
             </button>
           ) : null}
+          {tab === "store" ? (
+            <button
+              className="btn ghost sm"
+              onClick={() => void loadCatalog()}
+              disabled={catalogLoading}
+              title={t("themes.refresh")}
+            >
+              <Icon name="refresh" className={catalogLoading ? "spin" : undefined} />
+              {t("themes.refresh")}
+            </button>
+          ) : null}
         </div>
+
+        {tab === "local" && (localThemes.length > 0 || groups.length > 0) ? (
+          <div className="store-filters local-filters">
+            <div className="chip-row" role="group" aria-label={t("themes.group.label")}>
+              <button
+                type="button"
+                className={`chip${localGroup === "all" ? " active" : ""}`}
+                aria-pressed={localGroup === "all"}
+                onClick={() => setLocalGroup("all")}
+              >
+                {t("themes.group.all")}
+              </button>
+              {localThemes.some((it) => it.origin === "store") ? (
+                <button
+                  type="button"
+                  className={`chip${localGroup === "store" ? " active" : ""}`}
+                  aria-pressed={localGroup === "store"}
+                  onClick={() => setLocalGroup("store")}
+                >
+                  {t("themes.group.store")}
+                </button>
+              ) : null}
+              {localThemes.some((it) => it.origin === "dev") ? (
+                <button
+                  type="button"
+                  className={`chip${localGroup === "dev" ? " active" : ""}`}
+                  aria-pressed={localGroup === "dev"}
+                  onClick={() => setLocalGroup("dev")}
+                >
+                  {t("themes.group.dev")}
+                </button>
+              ) : null}
+              {groups.map((g) => (
+                <button
+                  key={g.id}
+                  type="button"
+                  className={`chip${localGroup === g.id ? " active" : ""}`}
+                  aria-pressed={localGroup === g.id}
+                  onClick={() => setLocalGroup(g.id)}
+                >
+                  {g.name}
+                  <span className="chip-count">{g.skinIds.length}</span>
+                </button>
+              ))}
+              <button
+                type="button"
+                className="chip chip-add"
+                disabled={busy !== null}
+                onClick={() => setGroupModal({ mode: "create" })}
+              >
+                {t("themes.group.new")}
+              </button>
+            </div>
+            {selecting && groups.some((g) => g.id === localGroup) ? (
+              <div className="chip-row">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  disabled={busy !== null}
+                  onClick={() => setGroupModal({ mode: "rename", id: localGroup })}
+                >
+                  {t("themes.group.rename")}
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost sm danger"
+                  disabled={busy !== null}
+                  onClick={() => setGroupModal({ mode: "delete", id: localGroup })}
+                >
+                  {t("themes.group.delete")}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         {selecting && tab === "local" ? (
           <div className="select-bar">
@@ -885,13 +1144,48 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
               </span>
             </label>
             <span className="select-count">{t("themes.select.count", { n: String(selected.size) })}</span>
+            {groups.length > 0 ? (
+              <select
+                className="group-add-select"
+                value=""
+                disabled={busy !== null || selected.size === 0}
+                onChange={(e) => {
+                  if (e.target.value) {
+                    addToGroup(e.target.value, [...selected]);
+                    exitSelect();
+                  }
+                }}
+                aria-label={t("themes.group.addTo")}
+              >
+                <option value="" disabled>
+                  {t("themes.group.addTo")}
+                </option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            ) : null}
             <span className="row-actions" style={{ marginInlineStart: "auto" }}>
+              {groups.some((g) => g.id === localGroup) ? (
+                <button
+                  className="btn ghost sm"
+                  disabled={busy !== null || selected.size === 0}
+                  onClick={() => {
+                    removeFromGroup(localGroup, [...selected]);
+                    exitSelect();
+                  }}
+                >
+                  {t("themes.group.removeFrom")}
+                </button>
+              ) : null}
               <button
                 className="btn danger sm"
-                disabled={busy !== null || selected.size === 0}
-                onClick={() => setConfirmIds([...selected])}
+                disabled={busy !== null || selectedDeletable.length === 0}
+                onClick={() => setConfirmIds(selectedDeletable)}
               >
-                {t("themes.select.delete", { n: String(selected.size) })}
+                {t("themes.select.delete", { n: String(selectedDeletable.length) })}
               </button>
               <button className="btn ghost sm" onClick={exitSelect}>
                 {t("themes.select.cancel")}
@@ -905,6 +1199,47 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
         ) : null}
         {tab === "store" && !catalogFailed && catalog === null ? (
           <p className="themes-noresult">{t("themes.online.loading")}</p>
+        ) : null}
+
+        {tab === "store" && catalog && catalog.length > 0 ? (
+          <div className="store-filters">
+            <div className="chip-row" role="group" aria-label={t("themes.category.label")}>
+              <button
+                type="button"
+                className={`chip${selectedCategory === null ? " active" : ""}`}
+                aria-pressed={selectedCategory === null}
+                onClick={() => setSelectedCategory(null)}
+              >
+                {t(CATEGORY_KEY.all)}
+              </button>
+              {storeCategories.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  className={`chip${selectedCategory === c ? " active" : ""}`}
+                  aria-pressed={selectedCategory === c}
+                  onClick={() => pickCategory(c)}
+                >
+                  {t(CATEGORY_KEY[c as keyof typeof CATEGORY_KEY])}
+                </button>
+              ))}
+            </div>
+            {storeTags.length > 0 ? (
+              <div className="chip-row chip-row-tags">
+                {storeTags.map((tag) => (
+                  <button
+                    key={tag}
+                    type="button"
+                    className={`chip chip-tag${selectedTags.has(tag) ? " active" : ""}`}
+                    aria-pressed={selectedTags.has(tag)}
+                    onClick={() => toggleTag(tag)}
+                  >
+                    {tag}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
         ) : null}
 
         {view === "card" ? (
@@ -1027,6 +1362,21 @@ export function CodexThemes({ onBack }: { onBack: () => void }) {
         onConfirm={() => confirmIds && doDelete(confirmIds)}
         t={t}
       />
+      <GroupModal
+        state={groupModal}
+        groups={groups}
+        busy={busy}
+        onClose={() => {
+          setGroupModal(null);
+          // Return focus to the stable toolbar button; the dialog's opener may
+          // be disabled/removed after a submit, which would drop focus to body.
+          setRefocusTick((tk) => tk + 1);
+        }}
+        onCreate={createGroup}
+        onRename={renameGroup}
+        onDelete={deleteGroup}
+        t={t}
+      />
       <Lightbox src={lightbox} onClose={() => setLightbox(null)} />
     </div>
   );
@@ -1064,7 +1414,12 @@ function DetailsSheet({
       ] as const)
     : [];
   return (
-    <Sheet open={item !== null} onDismiss={onClose} labelledBy="skin-detail-title">
+    <Sheet
+      open={item !== null}
+      onDismiss={onClose}
+      labelledBy="skin-detail-title"
+      centeredInExpanded
+    >
       {item ? (
         <div className="skin-detail">
           <div className="skin-detail-cover">
@@ -1176,6 +1531,97 @@ function ConfirmDelete({
           </button>
         </div>
       </div>
+    </Sheet>
+  );
+}
+
+/** Create / rename / delete a custom skin group. */
+function GroupModal({
+  state,
+  groups,
+  busy,
+  onClose,
+  onCreate,
+  onRename,
+  onDelete,
+  t,
+}: {
+  state: { mode: "create" | "rename" | "delete"; id?: string } | null;
+  groups: SkinGroup[];
+  busy: string | null;
+  onClose: () => void;
+  onCreate: (name: string) => void;
+  onRename: (id: string, name: string) => void;
+  onDelete: (id: string) => void;
+  t: TFn;
+}) {
+  const current = state?.id ? groups.find((g) => g.id === state.id) : undefined;
+  const [name, setName] = useState("");
+  useEffect(() => {
+    setName(state?.mode === "rename" ? (current?.name ?? "") : "");
+  }, [state, current]);
+  const isDelete = state?.mode === "delete";
+  const title =
+    state?.mode === "create"
+      ? t("themes.group.createTitle")
+      : state?.mode === "rename"
+        ? t("themes.group.renameTitle")
+        : t("themes.group.deleteTitle");
+  const submit = () => {
+    if (!state) return;
+    if (state.mode === "create") onCreate(name);
+    else if (state.mode === "rename" && state.id) onRename(state.id, name);
+    else if (state.mode === "delete" && state.id) onDelete(state.id);
+    onClose();
+  };
+  return (
+    <Sheet
+      open={state !== null}
+      onDismiss={onClose}
+      labelledBy="group-modal-title"
+      centeredInExpanded
+      initialFocus={isDelete ? "primary" : "first"}
+    >
+      {state ? (
+        <div className="group-modal">
+          <h2 id="group-modal-title">{title}</h2>
+          {isDelete ? (
+            <p className="group-modal-confirm">
+              {t("themes.group.deleteConfirm", { name: current?.name ?? "" })}
+            </p>
+          ) : (
+            <input
+              className="group-modal-input"
+              type="text"
+              value={name}
+              placeholder={t("themes.group.namePlaceholder")}
+              aria-label={t("themes.group.nameLabel")}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing && name.trim()) submit();
+              }}
+            />
+          )}
+          <div className="sheet-actions row-actions">
+            <button
+              className={`btn ${isDelete ? "danger" : "primary"}`}
+              disabled={busy !== null || (!isDelete && !name.trim())}
+              onClick={submit}
+            >
+              {isDelete
+                ? t("themes.group.delete")
+                : state.mode === "create"
+                  ? t("themes.group.create")
+                  : t("themes.group.save")}
+            </button>
+            <button className="btn ghost" onClick={onClose} style={{ marginInlineStart: "auto" }}>
+              {t("themes.detail.close")}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div />
+      )}
     </Sheet>
   );
 }

@@ -198,6 +198,13 @@ export interface SkippedCodexUpdate {
   skippedAt: number;
 }
 
+/** A user-defined grouping of local skins. */
+export interface SkinGroup {
+  id: string;
+  name: string;
+  skinIds: string[];
+}
+
 export interface AppSettings {
   source: UpdateSourceKind;
   customUrl: string;
@@ -232,6 +239,8 @@ export interface AppSettings {
   codexThemeDir: string | null;
   /** Managed skin store; null = platform default. */
   codexThemeStoreDir: string | null;
+  /** User-defined local skin groups, in display order. */
+  skinGroups: SkinGroup[];
 }
 
 export interface ConfigHealth {
@@ -280,6 +289,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   codexTheme: null,
   codexThemeDir: null,
   codexThemeStoreDir: null,
+  skinGroups: [],
 };
 
 export interface MacUninstallReport {
@@ -642,6 +652,9 @@ export interface CatalogSkin {
   /** Catalog-relative paths, resolved backend-side against the pinned origin. */
   pack: string;
   preview: string;
+  /** Theme category for store grouping (anime/stars/tech/guofeng/games);
+   *  absent → grouped under "other". */
+  category?: string | null;
 }
 
 /** Main-window form factor: `compact` is the fixed 400×640 dashboard,
