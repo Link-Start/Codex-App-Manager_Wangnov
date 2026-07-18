@@ -160,6 +160,17 @@ impl CdpSession {
         Ok(session)
     }
 
+    /// Lift the page's Content-Security-Policy for this session. Codex's app://
+    /// page ships `media-src 'self' app: blob: data:`, which blocks the loopback
+    /// `<video>` URL the motion runtime streams from; the daemon calls this only
+    /// before injecting a theme that actually has motion. The engine already
+    /// fully controls this page (it injects arbitrary JS), so lifting CSP is not
+    /// a new trust boundary — and it is transient (no DOM residue, restored on
+    /// reload). Best-effort: on failure the intro just falls back to art.
+    pub async fn bypass_csp(&self) -> Result<Value> {
+        self.send("Page.setBypassCSP", json!({ "enabled": true })).await
+    }
+
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }

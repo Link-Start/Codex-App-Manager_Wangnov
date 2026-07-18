@@ -18,13 +18,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::cdp::{is_theme_excluded_target, list_app_targets, probe_session, CdpSession};
-use crate::payload::{build_payload, BuiltPayload, CURRENT_STAMP_EXPRESSION, REMOVE_EXPRESSION};
+use crate::media_server::{CurrentTheme, MediaServer};
+use crate::payload::{
+    build_payload, build_payload_with_media, BuiltPayload, CURRENT_STAMP_EXPRESSION,
+    REMOVE_EXPRESSION,
+};
 
 const TICK: Duration = Duration::from_millis(900);
 
@@ -56,11 +61,34 @@ pub async fn run_daemon(
     let mut built: Option<BuiltPayload>;
     let mut last_error: Option<String> = None;
 
+    // Motion assets stream from a loopback HTTP server instead of bloating the
+    // injected payload with base64. It lives as long as the daemon; the shared
+    // `current` slot points it at whatever theme we are applying so a stale URL
+    // never resolves against the wrong package. A bind failure is non-fatal —
+    // themes still apply, motion just falls back to the static intro.
+    let current: CurrentTheme = Arc::new(RwLock::new(None));
+    let media = match MediaServer::start(current.clone()).await {
+        Ok(server) => Some(server),
+        Err(error) => {
+            log::warn!("motion media server unavailable, using static intros: {error}");
+            None
+        }
+    };
+    let media_base = media.as_ref().map(|server| server.base());
+
     // Build the initial payload for whatever directive we started with.
     let mut rebuild_for = directive_rx.borrow().clone();
     loop {
+        // Point the media server at the theme we are about to apply.
+        if let Ok(mut slot) = current.write() {
+            *slot = rebuild_for.clone();
+        }
         if let Some(dir) = &rebuild_for {
-            match build_payload(dir) {
+            let build_result = match &media_base {
+                Some(base) => build_payload_with_media(dir, base),
+                None => build_payload(dir),
+            };
+            match build_result {
                 Ok(payload) => {
                     log::info!(
                         "theme payload built id={} bytes={} assets={}",
@@ -166,10 +194,16 @@ pub async fn run_daemon(
                 };
                 let outcome = match (&expected, &current) {
                     (Some(stamp), Some(applied)) if stamp == applied => Ok(()),
-                    (Some(_), _) => session
-                        .evaluate(&built.as_ref().expect("built payload").payload)
-                        .await
-                        .map(|_| ()),
+                    (Some(_), _) => {
+                        let payload = built.as_ref().expect("built payload");
+                        // Lift CSP before the runtime's <video> requests the
+                        // loopback stream — Codex's media-src blocks it otherwise.
+                        // Best-effort: a failure just leaves the static intro.
+                        if payload.has_motion {
+                            let _ = session.bypass_csp().await;
+                        }
+                        session.evaluate(&payload.payload).await.map(|_| ())
+                    }
                     (None, Some(_)) => session.evaluate(REMOVE_EXPRESSION).await.map(|_| ()),
                     (None, None) => Ok(()),
                 };

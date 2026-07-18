@@ -29,6 +29,11 @@ pub const MAX_ASSET_BYTES: u64 = 1_400_000;
 /// text message to `Runtime.evaluate`; 24 MB raw ≈ 32 MB payload, safely
 /// under tungstenite's 64 MB default message cap.
 pub const MAX_TOTAL_ASSET_BYTES: u64 = 24 * 1024 * 1024;
+/// Per motion-asset ceiling. Motion (mp4/webm) streams from the loopback media
+/// server instead of riding the injected payload, so neither Chromium's ~2 MB
+/// data-URL cap nor the combined-asset/WebSocket budget above binds it — this
+/// is just a sanity limit on a single file (SPEC: ≤ 24 MB raw).
+pub const MAX_MOTION_ASSET_BYTES: u64 = 24 * 1024 * 1024;
 
 const NAME_MAX: usize = 64;
 
@@ -119,6 +124,10 @@ pub struct LoadedTheme {
     pub css: String,
     pub chrome_html: Option<String>,
     pub assets: BTreeMap<String, AssetRef>,
+    /// Motion assets (mp4/webm) served over the loopback media server — never
+    /// inlined into the payload and never CSS variables. Additive
+    /// schemaVersion-2 extension; packages without them stay fully static.
+    pub motion_assets: BTreeMap<String, AssetRef>,
     /// Optional native Codex appearance block, applied to ~/.codex/config.toml
     /// while Codex is stopped. Passed through as-is (validated on apply).
     pub codex_theme: Option<serde_json::Value>,
@@ -172,6 +181,8 @@ fn mime_for(path: &Path) -> Option<&'static str> {
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
         "webp" => Some("image/webp"),
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
         _ => None,
     }
 }
@@ -224,8 +235,8 @@ fn extract_meta(raw: &serde_json::Value, dir: &Path) -> ThemeMeta {
                 .filter_map(|v| v.as_str())
                 .filter_map(|rel| {
                     let path = resolve_inside(dir, rel, "preview").ok()?;
-                    let mime = mime_for(&path)?;
-                    let _ = mime;
+                    // Previews are screenshots — image mimes only, never motion.
+                    mime_for(&path).filter(|m| m.starts_with("image/"))?;
                     let meta = std::fs::metadata(&path).ok()?;
                     (meta.is_file() && meta.len() >= 1 && meta.len() <= MAX_PREVIEW_BYTES)
                         .then(|| rel.to_string())
@@ -327,7 +338,11 @@ pub fn load_theme(theme_dir: &Path) -> Result<LoadedTheme> {
                 .as_str()
                 .ok_or_else(|| err(format!("asset {key} path must be a string")))?;
             let asset_path = resolve_inside(&dir, rel, &format!("asset {key}"))?;
+            // Still-image assets only: they ride CSS `url()` variables, so a
+            // video mime here would smuggle a >2 MB data: URL into a background.
+            // Motion (mp4/webm) is declared separately under `motionAssets`.
             let mime = mime_for(&asset_path)
+                .filter(|m| m.starts_with("image/"))
                 .ok_or_else(|| err(format!("unsupported asset format for {key}: {rel}")))?;
             let meta = std::fs::metadata(&asset_path)
                 .map_err(|e| err(format!("asset {key} unreadable: {e}")))?;
@@ -352,6 +367,43 @@ pub fn load_theme(theme_dir: &Path) -> Result<LoadedTheme> {
         }
     }
 
+    // Motion assets (mp4/webm) are an additive extension. They stream from the
+    // loopback media server rather than riding the injected payload, so they
+    // are exempt from both the CSS 1.4 MB per-asset cap AND the combined-asset
+    // budget that guards the WebSocket message — the only ceiling is the
+    // per-file `MAX_MOTION_ASSET_BYTES` sanity limit. Unknown key, wrong format
+    // or oversize fails the load, matching the studio pack gate.
+    let mut motion_assets = BTreeMap::new();
+    if let Some(map) = raw.get("motionAssets").and_then(|v| v.as_object()) {
+        for (key, value) in map {
+            if !name_pattern(key) {
+                return Err(err(format!("invalid motion asset key: {key}")));
+            }
+            let rel = value
+                .as_str()
+                .ok_or_else(|| err(format!("motion asset {key} path must be a string")))?;
+            let asset_path = resolve_inside(&dir, rel, &format!("motion asset {key}"))?;
+            let mime = mime_for(&asset_path)
+                .filter(|m| m.starts_with("video/"))
+                .ok_or_else(|| err(format!("unsupported motion asset format for {key}: {rel}")))?;
+            let meta = std::fs::metadata(&asset_path)
+                .map_err(|e| err(format!("motion asset {key} unreadable: {e}")))?;
+            if !meta.is_file() || meta.len() < 1 || meta.len() > MAX_MOTION_ASSET_BYTES {
+                return Err(err(format!(
+                    "motion asset {key} must be a non-empty file up to {MAX_MOTION_ASSET_BYTES} bytes"
+                )));
+            }
+            motion_assets.insert(
+                key.clone(),
+                AssetRef {
+                    path: asset_path,
+                    mime,
+                    bytes: meta.len(),
+                },
+            );
+        }
+    }
+
     let codex_theme = raw.get("codexTheme").filter(|v| v.is_object()).cloned();
     let meta = extract_meta(&raw, &dir);
 
@@ -362,6 +414,7 @@ pub fn load_theme(theme_dir: &Path) -> Result<LoadedTheme> {
         css,
         chrome_html,
         assets,
+        motion_assets,
         codex_theme,
     })
 }
