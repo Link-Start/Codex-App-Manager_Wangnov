@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -9,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::app_version::read_codex_app_version_from_install_root;
 use crate::msix::{parse_appx_manifest_xml, MsixIdentity};
 use crate::process::{
-    hidden_command, run_capturing, spawn_and_require_liveness, LivenessResult, RunLimits,
-    PORTABLE_LIVENESS_WINDOW,
+    hidden_command, run_capturing, LivenessResult, RunLimits, PORTABLE_LIVENESS_WINDOW,
 };
 use crate::EngineError;
 
@@ -47,6 +47,19 @@ pub struct PortableUninstallReport {
 struct PreparedPortable {
     payload_dir: PathBuf,
     identity: MsixIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct BlockMapEntry {
+    logical_name: String,
+    output_path: PathBuf,
+    size: u64,
+}
+
+#[derive(Debug)]
+struct BlockMapPaths {
+    by_logical_name: HashMap<String, BlockMapEntry>,
+    remaining: HashSet<String>,
 }
 
 fn io_err(context: &str, err: impl ToString) -> EngineError {
@@ -179,23 +192,294 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+const MAX_BLOCK_MAP_BYTES: u64 = 32 * 1024 * 1024;
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+        || stem.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
+fn validate_windows_path_component(component: &str, source: &str) -> Result<(), EngineError> {
+    if component.is_empty() || component == "." || component == ".." {
+        return Err(EngineError::Msix(format!(
+            "unsafe MSIX path component {component:?} in {source}"
+        )));
+    }
+    if component.ends_with([' ', '.']) {
+        return Err(EngineError::Msix(format!(
+            "MSIX path component has a Windows-unsafe trailing space/dot in {source}: {component:?}"
+        )));
+    }
+    if component.chars().any(|ch| {
+        ch == '\0'
+            || ch.is_control()
+            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    }) {
+        return Err(EngineError::Msix(format!(
+            "MSIX path component contains a Windows-unsafe character in {source}: {component:?}"
+        )));
+    }
+    if is_windows_reserved_component(component) {
+        return Err(EngineError::Msix(format!(
+            "MSIX path uses a reserved Windows device name in {source}: {component:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn path_from_components(components: &[String]) -> PathBuf {
+    components.iter().fold(PathBuf::new(), |mut path, part| {
+        path.push(part);
+        path
+    })
+}
+
+fn windows_path_key(components: &[String]) -> String {
+    components
+        .iter()
+        .map(|component| component.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\\")
+}
+
+fn parse_logical_msix_path(name: &str) -> Result<Vec<String>, EngineError> {
+    if name.is_empty() || name.starts_with(['\\', '/']) || name.contains('/') {
+        return Err(EngineError::Msix(format!(
+            "invalid AppxBlockMap logical path: {name:?}"
+        )));
+    }
+    let components = name.split('\\').map(str::to_string).collect::<Vec<_>>();
+    for component in &components {
+        validate_windows_path_component(component, name)?;
+    }
+    Ok(components)
+}
+
+fn parse_appx_block_map(xml: &str) -> Result<BlockMapPaths, EngineError> {
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|err| EngineError::Msix(format!("AppxBlockMap.xml: {err}")))?;
+    let mut by_logical_name = HashMap::new();
+    let mut windows_names = HashMap::<String, String>::new();
+
+    for file in document
+        .descendants()
+        .filter(|node| node.has_tag_name("File"))
+    {
+        let logical_name = file
+            .attribute("Name")
+            .ok_or_else(|| EngineError::Msix("AppxBlockMap File missing Name".to_string()))?
+            .to_string();
+        let size = file
+            .attribute("Size")
+            .ok_or_else(|| {
+                EngineError::Msix(format!("AppxBlockMap File missing Size: {logical_name}"))
+            })?
+            .parse::<u64>()
+            .map_err(|err| {
+                EngineError::Msix(format!(
+                    "AppxBlockMap File has invalid Size for {logical_name}: {err}"
+                ))
+            })?;
+        let components = parse_logical_msix_path(&logical_name)?;
+        let windows_key = windows_path_key(&components);
+        if let Some(previous) = windows_names.insert(windows_key, logical_name.clone()) {
+            return Err(EngineError::Msix(format!(
+                "AppxBlockMap paths collide on Windows: {previous:?} and {logical_name:?}"
+            )));
+        }
+        let canonical_name = components.join("\\");
+        let entry = BlockMapEntry {
+            logical_name: logical_name.clone(),
+            output_path: path_from_components(&components),
+            size,
+        };
+        if by_logical_name.insert(canonical_name, entry).is_some() {
+            return Err(EngineError::Msix(format!(
+                "duplicate AppxBlockMap path: {logical_name}"
+            )));
+        }
+    }
+
+    if by_logical_name.is_empty() {
+        return Err(EngineError::Msix(
+            "AppxBlockMap.xml contains no payload files".to_string(),
+        ));
+    }
+    let remaining = by_logical_name.keys().cloned().collect();
+    Ok(BlockMapPaths {
+        by_logical_name,
+        remaining,
+    })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_zip_component(component: &str, source: &str) -> Result<(String, bool), EngineError> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = bytes.get(index + 1).and_then(|byte| hex_value(*byte));
+        let low = bytes.get(index + 2).and_then(|byte| hex_value(*byte));
+        let (Some(high), Some(low)) = (high, low) else {
+            return Err(EngineError::Msix(format!(
+                "invalid percent escape in MSIX ZIP path: {source:?}"
+            )));
+        };
+        let value = (high << 4) | low;
+        if matches!(value, 0 | b'/' | b'\\') {
+            return Err(EngineError::Msix(format!(
+                "encoded path separator/NUL is forbidden in MSIX ZIP path: {source:?}"
+            )));
+        }
+        decoded.push(value);
+        changed = true;
+        index += 3;
+    }
+    let decoded = String::from_utf8(decoded).map_err(|err| {
+        EngineError::Msix(format!(
+            "percent-decoded MSIX ZIP path is not UTF-8 ({source:?}): {err}"
+        ))
+    })?;
+    validate_windows_path_component(&decoded, source)?;
+    Ok((decoded, changed))
+}
+
+fn decode_zip_entry_path(name: &str) -> Result<(Vec<String>, bool), EngineError> {
+    if name.is_empty() || name.starts_with(['/', '\\']) || name.contains('\\') {
+        return Err(EngineError::Msix(format!(
+            "invalid MSIX ZIP entry path: {name:?}"
+        )));
+    }
+    let name = name.strip_suffix('/').unwrap_or(name);
+    let mut changed = false;
+    let mut components = Vec::new();
+    for component in name.split('/') {
+        let (decoded, component_changed) = decode_zip_component(component, name)?;
+        changed |= component_changed;
+        components.push(decoded);
+    }
+    Ok((components, changed))
+}
+
+fn read_appx_block_map(
+    zip: &mut zip::ZipArchive<fs::File>,
+) -> Result<Option<BlockMapPaths>, EngineError> {
+    let mut block_map = match zip.by_name("AppxBlockMap.xml") {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(EngineError::Msix(format!("read AppxBlockMap.xml: {err}"))),
+    };
+    if block_map.size() > MAX_BLOCK_MAP_BYTES {
+        return Err(EngineError::Msix(format!(
+            "AppxBlockMap.xml is unexpectedly large: {} bytes",
+            block_map.size()
+        )));
+    }
+    let mut xml = String::new();
+    block_map
+        .read_to_string(&mut xml)
+        .map_err(|err| EngineError::Msix(format!("decode AppxBlockMap.xml: {err}")))?;
+    parse_appx_block_map(&xml).map(Some)
+}
+
 fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
     let file = fs::File::open(msix_path).map_err(|e| io_err("open MSIX", e))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| EngineError::Msix(format!("open zip: {e}")))?;
+    let mut block_map = read_appx_block_map(&mut zip)?;
     let mut manifest_xml = None;
+    let mut written_paths = HashMap::<String, String>::new();
+    let mut logical_path_remaps = 0usize;
 
     for idx in 0..zip.len() {
         let mut file = zip
             .by_index(idx)
             .map_err(|e| EngineError::Msix(format!("read zip entry {idx}: {e}")))?;
-        let Some(enclosed) = file.enclosed_name() else {
-            continue;
-        };
-        let out_path = dest.join(&enclosed);
+        let zip_name = file.name().to_string();
+        let (decoded_components, was_percent_encoded) = decode_zip_entry_path(&zip_name)?;
         if file.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|e| io_err("create extracted dir", e))?;
             continue;
+        }
+
+        let decoded_name = decoded_components.join("\\");
+        let output_path = if let Some(paths) = block_map.as_mut() {
+            if let Some(entry) = paths.by_logical_name.get(&decoded_name) {
+                if file.size() != entry.size {
+                    return Err(EngineError::Msix(format!(
+                        "MSIX payload size disagrees with AppxBlockMap for {}: zip={} blockMap={}",
+                        entry.logical_name,
+                        file.size(),
+                        entry.size
+                    )));
+                }
+                paths.remaining.remove(&decoded_name);
+                if was_percent_encoded {
+                    logical_path_remaps += 1;
+                }
+                entry.output_path.clone()
+            } else {
+                if was_percent_encoded {
+                    return Err(EngineError::Msix(format!(
+                        "percent-encoded MSIX ZIP entry is not described by AppxBlockMap.xml: {zip_name}"
+                    )));
+                }
+                path_from_components(&decoded_components)
+            }
+        } else {
+            if was_percent_encoded {
+                return Err(EngineError::Msix(format!(
+                    "cannot safely map percent-encoded MSIX ZIP entry without AppxBlockMap.xml: {zip_name}"
+                )));
+            }
+            path_from_components(&decoded_components)
+        };
+        let output_components = output_path
+            .iter()
+            .map(|component| component.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let output_key = windows_path_key(&output_components);
+        if let Some(previous) = written_paths.insert(output_key, zip_name.clone()) {
+            return Err(EngineError::Msix(format!(
+                "MSIX entries collide on Windows after logical path mapping: {previous:?} and {zip_name:?}"
+            )));
+        }
+
+        let out_path = dest.join(&output_path);
+        if !out_path.starts_with(dest) {
+            return Err(EngineError::Msix(format!(
+                "MSIX logical path escaped extraction root: {}",
+                output_path.display()
+            )));
         }
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err("create extracted parent", e))?;
@@ -204,11 +488,11 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
             fs::File::create(&out_path).map_err(|e| io_err("create extracted file", e))?;
         std::io::copy(&mut file, &mut out).map_err(|e| io_err("extract file", e))?;
 
-        if enclosed
+        if output_path
             .file_name()
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.eq_ignore_ascii_case("AppxManifest.xml"))
-            && enclosed.components().count() == 1
+            && output_path.components().count() == 1
         {
             let mut xml = String::new();
             fs::File::open(&out_path)
@@ -216,6 +500,26 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
                 .map_err(|e| io_err("read extracted AppxManifest.xml", e))?;
             manifest_xml = Some(xml);
         }
+    }
+
+    if let Some(paths) = block_map {
+        if !paths.remaining.is_empty() {
+            let mut missing = paths.remaining.into_iter().collect::<Vec<_>>();
+            missing.sort();
+            let preview = missing
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(EngineError::Msix(format!(
+                "MSIX is missing {} payload file(s) declared by AppxBlockMap.xml: {preview}",
+                missing.len()
+            )));
+        }
+        log::info!(
+            "portable MSIX extraction used AppxBlockMap logical paths remapped_entries={logical_path_remaps}"
+        );
     }
 
     manifest_xml.ok_or_else(|| EngineError::Msix("MSIX missing AppxManifest.xml".to_string()))
@@ -328,11 +632,66 @@ fn prepare_portable_payload(
     copy_dir_all(exe_dir, &payload)?;
     fs::write(payload.join("AppxManifest.xml"), manifest_xml)
         .map_err(|e| io_err("write portable AppxManifest.xml", e))?;
+    ensure_portable_launcher(&payload)?;
 
     Ok(PreparedPortable {
         payload_dir: payload,
         identity,
     })
+}
+
+/// Materialize the Manager-owned native launcher without touching upstream files.
+/// Called inside staging for atomic update/rollback, and on launch to repair old installs.
+pub fn ensure_portable_launcher(root: &Path) -> Result<PathBuf, EngineError> {
+    let exe = installed_app_exe(root).ok_or_else(|| {
+        EngineError::Install(format!("no portable app executable in {}", root.display()))
+    })?;
+    // Validate a required CLI before committing a broken payload, even when no
+    // post-install launch was requested. Older fixture/legacy packages may omit it.
+    portable_launch_command(&exe)?;
+    #[cfg(windows)]
+    {
+        use crate::portable_command::{LAUNCHER_NAME, LAUNCH_TARGET_NAME};
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/LaunchCodex.exe"));
+        let target = exe
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| EngineError::Install("invalid portable executable name".into()))?;
+        let config_path = root.join(LAUNCH_TARGET_NAME);
+        if fs::read(&config_path).ok().as_deref() != Some(target.as_bytes()) {
+            fs::write(&config_path, target)
+                .map_err(|e| io_err("write portable launch target", e))?;
+        }
+        let launcher = root.join(LAUNCHER_NAME);
+        if fs::read(&launcher).ok().as_deref() != Some(BYTES) {
+            fs::write(&launcher, BYTES).map_err(|e| io_err("write portable launcher", e))?;
+        }
+        Ok(launcher)
+    }
+    #[cfg(not(windows))]
+    Ok(exe)
+}
+
+pub(crate) fn portable_launch_command(exe: &Path) -> Result<std::process::Command, EngineError> {
+    let root = exe
+        .parent()
+        .ok_or_else(|| EngineError::Install("missing portable directory".into()))?;
+    let mut command = hidden_command(exe);
+    crate::portable_command::configure(
+        &mut command,
+        exe,
+        crate::app_version::requires_portable_cli(root),
+    )
+    .map_err(|e| io_err("configure portable launch", e))?;
+    Ok(command)
+}
+
+pub(crate) fn repair_portable_launch_entry(root: &Path) -> Result<(), EngineError> {
+    ensure_portable_launcher(root)?;
+    if let Err(error) = create_start_menu_shortcut(root) {
+        log::warn!("portable shortcut repair failed: {error}");
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -411,7 +770,11 @@ $shortcut.IconLocation = {icon}
 $shortcut.Save()
 "#,
         shortcut = ps_quote(&shortcut.to_string_lossy()),
-        target = ps_quote(&exe.to_string_lossy()),
+        target = ps_quote(
+            &install_root
+                .join(crate::portable_command::LAUNCHER_NAME)
+                .to_string_lossy()
+        ),
         workdir = ps_quote(&install_root.to_string_lossy()),
         icon = ps_quote(&format!("{},0", exe.to_string_lossy()))
     );
@@ -628,7 +991,10 @@ fn health_check_portable_install(
     // Spawn alone is not enough: a broken payload can exit immediately after
     // CreateProcess succeeds. Require a short liveness window, then leave the
     // process running (this path is the post-install relaunch).
-    match spawn_and_require_liveness(hidden_command(&exe), PORTABLE_LIVENESS_WINDOW) {
+    match crate::process::spawn_and_check_startup(
+        portable_launch_command(&exe)?, PORTABLE_LIVENESS_WINDOW,
+        crate::app_version::requires_portable_cli(install_root),
+    ) {
         Ok(LivenessResult::Survived { child }) => {
             if keep_running {
                 // Intentionally leak the Child handle so the relaunched app
@@ -1090,6 +1456,166 @@ mod tests {
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn packaged_core_requires_cli_before_install_is_committed() {
+        let root = temp_test_dir("required-cli");
+        fs::create_dir_all(root.join("resources")).unwrap();
+        fs::write(root.join("ChatGPT.exe"), b"app").unwrap();
+        crate::app_version::write_test_asar(&root.join("resources/app.asar"),
+            br#"{"version":"26.915.31029","name":"openai-codex-electron","codexWindowsAppContainedCore":"1"}"#);
+        assert!(crate::app_version::requires_portable_cli(&root));
+        // Explicit user overrides intentionally need no bundled executable.
+        if std::env::var_os("CODEX_CLI_PATH").is_none_or(|v| v.to_string_lossy().trim().is_empty())
+        {
+            assert!(ensure_portable_launcher(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("missing its bundled CLI"));
+        }
+        fs::write(root.join("resources/codex.exe"), b"cli").unwrap();
+        assert!(ensure_portable_launcher(&root).unwrap().is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an isolated payload copy via CODEX_REAL_PORTABLE"]
+    fn real_portable_bootstrap_uses_bundled_cli() {
+        let root =
+            PathBuf::from(std::env::var_os("CODEX_REAL_PORTABLE").expect("CODEX_REAL_PORTABLE"));
+        assert!(
+            root.join(".codex-manager-smoke").is_file(),
+            "use a marked, disposable copy"
+        );
+        let profile = temp_test_dir("isolated-bootstrap");
+        let exe = installed_app_exe(&root).unwrap();
+        ensure_portable_launcher(&root).unwrap();
+        let mut command = portable_launch_command(&exe).unwrap();
+        command
+            .env("CODEX_HOME", profile.join("home"))
+            .env("CODEX_ELECTRON_USER_DATA_PATH", profile.join("profile"))
+            .env("CODEX_SPARKLE_ENABLED", "false")
+            .arg(format!(
+                "--user-data-dir={}",
+                profile.join("profile").display()
+            ));
+        let result =
+            crate::process::spawn_and_check_startup(command, PORTABLE_LIVENESS_WINDOW, true);
+        let cleanup = close_codex_gracefully_for_root(30, &root);
+        cleanup.unwrap();
+        assert!(
+            matches!(result, Ok(LivenessResult::Survived { .. })),
+            "{result:?}"
+        );
+        let _ = fs::remove_dir_all(profile);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an isolated affected 26.915.31029 payload via CODEX_REAL_PORTABLE"]
+    fn real_portable_bootstrap_dialog_is_rejected() {
+        let root =
+            PathBuf::from(std::env::var_os("CODEX_REAL_PORTABLE").expect("CODEX_REAL_PORTABLE"));
+        assert!(
+            root.join(".codex-manager-smoke").is_file(),
+            "use a marked, disposable copy"
+        );
+        let profile = temp_test_dir("isolated-baseline");
+        let mut command = hidden_command(installed_app_exe(&root).unwrap());
+        command
+            .env_remove("CODEX_CLI_PATH")
+            .env_remove("CODEX_WINDOWS_REGISTERED_CORE")
+            .env("CODEX_HOME", profile.join("home"))
+            .env("CODEX_ELECTRON_USER_DATA_PATH", profile.join("profile"))
+            .env("CODEX_SPARKLE_ENABLED", "false")
+            .arg(format!(
+                "--user-data-dir={}",
+                profile.join("profile").display()
+            ));
+        let result =
+            crate::process::spawn_and_check_startup(command, PORTABLE_LIVENESS_WINDOW, true);
+        let cleanup = close_codex_gracefully_for_root(30, &root);
+        cleanup.unwrap();
+        assert!(
+            matches!(result, Err(ref e) if e.message().contains("startup dialog") || e.message().contains("did not open its main window")),
+            "{result:?}"
+        );
+        let _ = fs::remove_dir_all(profile);
+    }
+
+    // Invoked only by the compiled launcher roundtrip below; no test harness flags
+    // are interpreted by our launcher, and all child environment state is isolated.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process fixture for portable_launcher_survives_directory_move"]
+    fn portable_launcher_child() {
+        let Some(output) = std::env::var_os("CODEX_TEST_LAUNCH_REPORT") else {
+            return;
+        };
+        let report = serde_json::json!({
+            "cli": std::env::var("CODEX_CLI_PATH").ok(),
+            "registered": std::env::var("CODEX_WINDOWS_REGISTERED_CORE").ok(),
+            "cwd": std::env::current_dir().unwrap(),
+            "args": std::env::args().collect::<Vec<_>>(),
+        });
+        fs::write(output, serde_json::to_vec(&report).unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_launcher_survives_directory_move() {
+        let parent = temp_test_dir("launcher-roundtrip");
+        let original = parent.join("before");
+        fs::create_dir_all(original.join("resources")).unwrap();
+        fs::copy(
+            std::env::current_exe().unwrap(),
+            original.join("ChatGPT.exe"),
+        )
+        .unwrap();
+        fs::write(original.join("resources/codex.exe"), b"cli fixture").unwrap();
+        let launcher = ensure_portable_launcher(&original).unwrap();
+        assert!(launcher.is_file());
+        assert_eq!(
+            fs::read_to_string(original.join(crate::portable_command::LAUNCH_TARGET_NAME)).unwrap(),
+            "ChatGPT.exe"
+        );
+        let moved = parent.join("便携 测试's & folder");
+        fs::rename(&original, &moved).unwrap();
+        let output = parent.join("result.json");
+        let marker = "参数 with spaces & \"quotes\"";
+        let mut command = hidden_command(moved.join(crate::portable_command::LAUNCHER_NAME));
+        command
+            .env_remove("CODEX_CLI_PATH")
+            .env("CODEX_WINDOWS_REGISTERED_CORE", "1")
+            .env("CODEX_TEST_LAUNCH_REPORT", &output)
+            .args([
+                "--exact",
+                "portable::tests::portable_launcher_child",
+                "--ignored",
+                "--skip",
+                marker,
+            ]);
+        assert!(command.status().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !output.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(output).expect("launcher child report")).unwrap();
+        assert_eq!(
+            report["cli"],
+            moved.join("resources/codex.exe").to_string_lossy().as_ref()
+        );
+        assert!(report["registered"].is_null());
+        assert_eq!(report["cwd"], moved.to_string_lossy().as_ref());
+        assert!(report["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == marker));
+        remove_directory_all_with_retry("remove launcher test", &parent).unwrap();
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
@@ -1258,6 +1784,284 @@ mod tests {
         zip.start_file("app/resources/app.asar", opts).unwrap();
         zip.write_all(b"fake asar").unwrap();
         zip.finish().unwrap();
+    }
+
+    fn write_block_mapped_msix(
+        path: &Path,
+        block_map_files: &[(&str, u64)],
+        zip_files: &[(&str, &[u8])],
+    ) {
+        let block_map_files = block_map_files
+            .iter()
+            .map(|(name, size)| format!(r#"  <File Name="{name}" Size="{size}" LfhSize="30" />"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block_map = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap" HashMethod="http://www.w3.org/2001/04/xmlenc#sha256">
+{block_map_files}
+</BlockMap>"#
+        );
+        let manifest = br#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="OpenAI.Codex" Publisher="CN=OpenAI OpCo, LLC" Version="26.803.10989.0" ProcessorArchitecture="x64" />
+  <Applications>
+    <Application Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication" />
+  </Applications>
+</Package>"#;
+
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("AppxBlockMap.xml", opts).unwrap();
+        zip.write_all(block_map.as_bytes()).unwrap();
+        zip.start_file("AppxManifest.xml", opts).unwrap();
+        zip.write_all(manifest).unwrap();
+        for (name, data) in zip_files {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn extracts_percent_encoded_payload_to_block_map_logical_paths() {
+        let root = temp_test_dir("block-map-logical-paths");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        let sky = b"sky";
+        let statsig = b"statsig";
+        let chatgpt = b"fake entry";
+        let asar = b"fake asar";
+        write_block_mapped_msix(
+            &msix,
+            &[
+                (r"app\ChatGPT.exe", chatgpt.len() as u64),
+                (r"app\resources\app.asar", asar.len() as u64),
+                (
+                    r"app\resources\cua_node\bin\node_modules\@oai\sky\package.json",
+                    sky.len() as u64,
+                ),
+                (
+                    r"app\resources\cua_node\bin\node_modules\@statsig\client-core\src\$_StatsigGlobal.js",
+                    statsig.len() as u64,
+                ),
+            ],
+            &[
+                ("app/ChatGPT.exe", chatgpt),
+                ("app/resources/app.asar", asar),
+                (
+                    "app/resources/cua_node/bin/node_modules/%40oai/sky/package.json",
+                    sky,
+                ),
+                (
+                    "app/resources/cua_node/bin/node_modules/%40statsig/client-core/src/%24_StatsigGlobal.js",
+                    statsig,
+                ),
+            ],
+        );
+
+        extract_msix(&msix, &extracted).unwrap();
+
+        let modules = extracted.join("app/resources/cua_node/bin/node_modules");
+        assert!(modules.join("@oai/sky/package.json").is_file());
+        assert!(modules
+            .join("@statsig/client-core/src/$_StatsigGlobal.js")
+            .is_file());
+        assert!(!modules.join("%40oai").exists());
+        assert!(!modules.join("%40statsig").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires CODEX_REAL_MSIX pointing at a current official Codex MSIX"]
+    fn real_msix_uses_computer_use_logical_paths() {
+        let msix = std::env::var_os("CODEX_REAL_MSIX")
+            .map(PathBuf::from)
+            .expect("set CODEX_REAL_MSIX to an official Codex MSIX");
+        assert!(msix.is_file(), "MSIX does not exist: {}", msix.display());
+        #[cfg(windows)]
+        {
+            let signature = crate::authenticode::verify_openai_authenticode(&msix)
+                .expect("verify official MSIX Authenticode signature");
+            assert!(
+                signature.is_valid_openai(),
+                "MSIX is not validly signed by the trusted OpenAI publisher: status={} subject={}",
+                signature.status,
+                signature.subject
+            );
+        }
+        let root = temp_test_dir("real-msix-logical-paths");
+        let prepared = prepare_portable_payload(&msix, &root).unwrap();
+        let modules = prepared
+            .payload_dir
+            .join("resources/cua_node/bin/node_modules");
+
+        assert!(modules
+            .join("@oai/sky/dist/project/cua/sky_js/src/targets/windows/internal/computer_use_client_base.js")
+            .is_file());
+        assert!(modules
+            .join("@statsig/client-core/src/$_StatsigGlobal.js")
+            .is_file());
+        assert!(!modules.join("%40oai").exists());
+        assert!(!modules.join("%40statsig").exists());
+        assert!(!modules
+            .join("@statsig/client-core/src/%24_StatsigGlobal.js")
+            .exists());
+
+        #[cfg(windows)]
+        {
+            let node_bin = prepared.payload_dir.join("resources/cua_node/bin");
+            let node = node_bin.join("node.exe");
+            assert!(node.is_file(), "bundled cua_node is missing");
+            let output = std::process::Command::new(&node)
+                .arg("-e")
+                .arg(
+                    r#"const root=process.argv[1]; console.log(require.resolve('@oai/sky',{paths:[root]})); console.log(require.resolve('@statsig/client-core',{paths:[root]}));"#,
+                )
+                .arg(&node_bin)
+                .output()
+                .expect("launch bundled cua_node");
+            assert!(
+                output.status.success(),
+                "bundled cua_node module resolution failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("@oai"), "unexpected resolution: {stdout}");
+            assert!(
+                stdout.contains("@statsig"),
+                "unexpected resolution: {stdout}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires CODEX_REAL_MSIX pointing at an official Codex MSIX"]
+    fn real_historical_msix_block_map_round_trips() {
+        let msix = std::env::var_os("CODEX_REAL_MSIX")
+            .map(PathBuf::from)
+            .expect("set CODEX_REAL_MSIX to an official Codex MSIX");
+        assert!(msix.is_file(), "MSIX does not exist: {}", msix.display());
+        let root = temp_test_dir("real-historical-msix");
+        let prepared = prepare_portable_payload(&msix, &root).unwrap();
+
+        assert!(prepared.payload_dir.join("AppxManifest.xml").is_file());
+        assert!(
+            installed_app_exe(&prepared.payload_dir).is_some(),
+            "portable entry executable was not reconstructed"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_encoded_separator_and_traversal_components() {
+        for (name, expected) in [
+            ("app/resources/%2Fescape.txt", "encoded path separator"),
+            ("app/resources/%5Cescape.txt", "encoded path separator"),
+            (
+                "app/resources/%2E%2E/escape.txt",
+                "unsafe MSIX path component",
+            ),
+        ] {
+            let root = temp_test_dir("encoded-traversal");
+            let msix = root.join("codex.msix");
+            let extracted = root.join("extracted");
+            fs::create_dir_all(&extracted).unwrap();
+            write_block_mapped_msix(
+                &msix,
+                &[(r"app\resources\escape.txt", 6)],
+                &[(name, b"escape")],
+            );
+
+            let err = extract_msix(&msix, &extracted).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {name}: {err}"
+            );
+            assert!(!root.join("escape.txt").exists());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn rejects_decoded_output_collisions_instead_of_overwriting() {
+        let root = temp_test_dir("decoded-collision");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        write_block_mapped_msix(
+            &msix,
+            &[(r"app\node_modules\@oai\file.js", 4)],
+            &[
+                ("app/node_modules/%40oai/file.js", b"safe"),
+                ("app/node_modules/@oai/file.js", b"evil"),
+            ],
+        );
+
+        let err = extract_msix(&msix, &extracted).unwrap_err();
+        assert!(
+            err.to_string().contains("collide on Windows"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_percent_encoded_payload_without_a_block_map() {
+        let root = temp_test_dir("encoded-without-block-map");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        let file = fs::File::create(&msix).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("AppxManifest.xml", opts).unwrap();
+        zip.write_all(
+            br#"<Package><Identity Name="OpenAI.Codex" Publisher="CN=X" Version="1.0.0.0" ProcessorArchitecture="x64" /></Package>"#,
+        )
+        .unwrap();
+        zip.start_file("app/node_modules/%40oai/file.js", opts)
+            .unwrap();
+        zip.write_all(b"payload").unwrap();
+        zip.finish().unwrap();
+
+        let err = extract_msix(&msix, &extracted).unwrap_err();
+        assert!(
+            err.to_string().contains("without AppxBlockMap.xml"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_missing_or_size_mismatched_block_map_payloads() {
+        for (files, expected) in [
+            (
+                vec![("app/present.txt", b"data".as_slice())],
+                "missing 1 payload file",
+            ),
+            (
+                vec![("app/missing.txt", b"short".as_slice())],
+                "payload size disagrees",
+            ),
+        ] {
+            let root = temp_test_dir("block-map-integrity");
+            let msix = root.join("codex.msix");
+            let extracted = root.join("extracted");
+            fs::create_dir_all(&extracted).unwrap();
+            write_block_mapped_msix(&msix, &[(r"app\missing.txt", 10)], &files);
+
+            let err = extract_msix(&msix, &extracted).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error: {err}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
