@@ -56,6 +56,29 @@
 进一步修复具体原因；不自动删除用户缓存、不重置 WSL 设置、不写全局 CLI 覆盖。
 在报告者验证恢复前，issue 保持打开。
 
+## 9 月 23 日最新评论：版本列表、日志和降级提示
+
+[另一位用户的回复](https://github.com/Wangnov/Codex-App-Manager/issues/353#issuecomment-5796259353)
+报告三个独立现象：`0x80073D28` 后 Codex 能打开但提示冗长且乱码、运行中删除日志后不重建、
+历史版本选择出现 `curl: process exceeded total deadline`。
+
+- 截图显示便携安装完成，启动验证和旧 MSIX 移除已成功；`0x80073D28` 是 MSIX 包服务安装需要管理员权限，
+  不代表便携恢复失败。恢复成功提示改用本地化摘要，完整错误保留在折叠详情中；旧 MSIX 清理失败仍显示明确操作指引。
+- 版本列表首个 GitHub API 响应实际为 100 条、4,823,111 字节。原进程封装先 `try_wait` 再
+  `wait_with_output`，管道写满后子进程无法退出；无网络的 256 KiB 输出也可复现超时。
+  两个捕获入口现在轮询并持续排空 stdout/stderr，同时保留取消、总超时、停滞检测和有界输出。
+  Windows 使用 `PeekNamedPipe`，Unix 使用非阻塞读；子进程退出后遗留写句柄也不能绕过截止时间。
+  修复后的正式引擎读取同一真实 GitHub 页面用时 6.3 秒。
+- 日志改为每次刷新记录时打开和关闭文件，自动重建被删除的文件或目录；仍按 2 MiB 轮转、最多保留 5 个日志文件，
+  清理归档时不会误删活动日志。
+- PowerShell 输出优先使用 UTF-8；受限语言环境禁止设置编码时按继承的控制台/OEM 代码页解码，
+  不再直接使用有损 UTF-8 解码破坏中文错误。
+
+针对性验证覆盖 5 MiB stdout + 512 KiB stderr、退出码保留、超限输出、超时错误详情、继承管道句柄、
+运行中删除文件/目录、日志轮转保留、中文/CP936 输出，以及正常恢复和旧包清理失败两种前端展示。
+可用 `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --test github_release_catalog -- --ignored --nocapture`
+单独执行真实 GitHub 大响应验证。该验证需要网络，默认测试不联网。
+
 ## 回归验证
 
 - Windows 原生子进程窗口夹具覆盖：正常主窗口、仅错误标题、仅错误正文、主窗口出现后再报错，
