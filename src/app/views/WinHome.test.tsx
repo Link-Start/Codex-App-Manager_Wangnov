@@ -703,6 +703,33 @@ describe("WinHome state machine", () => {
     await waitFor(() => expect(api.winAdopt).toHaveBeenCalledTimes(1));
   });
 
+  it.each([false, true])("keeps fallback diagnostics collapsed and cleanup guidance visible (cleanup failed: %s)", async (cleanupFailed) => {
+    api.getSettings.mockResolvedValue(settings({ askBefore: false }));
+    api.winPerformUpdate.mockResolvedValue({
+      ...PERFORM_OK,
+      action: "portable-fallback-after-msix-failure",
+      fallbackAttempted: true,
+      message: "Portable Codex install completed.",
+      notes: ["MSIX sideload failed: 0x80073D28 管理员权限", "raw setup diagnostics"],
+      outcome: emptyOperationOutcome({
+        primaryOk: true,
+        appState: "present",
+        installClass: "managed",
+        cleanup: cleanupFailed ? { state: "failed", detail: "old MSIX remains" } : { state: "ok", detail: null },
+      }),
+    });
+    const user = userEvent.setup();
+    renderWinHome();
+    await user.click(await screen.findByRole("button", { name: /立即更新/ }));
+    expect(await screen.findByText("已安装便携版 Codex", { selector: ".rb-title" })).toBeInTheDocument();
+    expect(screen.getByText(cleanupFailed ? /旧 MSIX 未清理完成/ : /已自动切换为便携版并验证启动/, { selector: ".rb-detail" })).toBeInTheDocument();
+    expect(screen.queryByText(/0x80073D28/, { selector: ".rb-detail" })).not.toBeInTheDocument();
+    const diagnostics = screen.getByText(/0x80073D28/, { selector: ".errdetails" }).closest("details");
+    expect(diagnostics).not.toHaveAttribute("open");
+    await user.click(screen.getByText("查看详情", { selector: "summary" }));
+    expect(diagnostics).toHaveAttribute("open");
+  });
+
   it("keeps partial-install guidance aligned with the rendered recovery action", async () => {
     api.getSettings.mockResolvedValue(settings({ checkOnStartup: false }));
     api.winStatus

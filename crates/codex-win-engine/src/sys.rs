@@ -458,7 +458,13 @@ fn run_powershell_json_with_limits(
     limits: RunLimits,
 ) -> Result<String, PowerShellRunError> {
     let mut command = hidden_command(powershell_exe());
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    // Windows PowerShell otherwise writes the inherited/OEM console encoding.
+    // CLM may forbid changing Console.OutputEncoding; keep that environment
+    // supported and decode its code page below instead of corrupting Chinese.
+    let script = format!(
+        "try {{ [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) }} catch {{ }}\n{script}"
+    );
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
     let output = run_capturing(command, limits, None).map_err(|e| match e {
         RunError::Timeout { kind, .. } => PowerShellRunError::Timeout(kind),
         other => PowerShellRunError::Other(format!("powershell: {}", other.message())),
@@ -466,10 +472,59 @@ fn run_powershell_json_with_limits(
     if !output.status.success() {
         return Err(PowerShellRunError::Other(format!(
             "powershell failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_powershell_output(&output.stderr)?.trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(decode_powershell_output(&output.stdout)?.trim().to_string())
+}
+
+#[cfg(windows)]
+fn decode_powershell_output(bytes: &[u8]) -> Result<String, PowerShellRunError> {
+    use windows_sys::Win32::{Globalization::GetOEMCP, System::Console::GetConsoleOutputCP};
+    let console_cp = unsafe { GetConsoleOutputCP() };
+    let code_page = if console_cp == 0 {
+        unsafe { GetOEMCP() }
+    } else {
+        console_cp
+    };
+    decode_powershell_bytes(bytes, code_page).map_err(PowerShellRunError::Other)
+}
+
+#[cfg(windows)]
+fn decode_powershell_bytes(bytes: &[u8], code_page: u32) -> Result<String, String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.trim_start_matches('\u{feff}').to_string());
+    }
+    let len = i32::try_from(bytes.len()).map_err(|_| "PowerShell output too large")?;
+    let required = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if required == 0 {
+        return Err("PowerShell output has an unsupported encoding".to_string());
+    }
+    let mut wide = vec![0; required as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            wide.as_mut_ptr(),
+            required,
+        )
+    };
+    if written != required {
+        return Err("Could not decode PowerShell output".to_string());
+    }
+    String::from_utf16(&wide).map_err(|_| "Invalid UTF-16 in PowerShell output".to_string())
 }
 
 // Plain hashtables keep the same JSON contract as PSCustomObject without using
@@ -2510,6 +2565,27 @@ function Get-AppxPackage {
             report.msix_deployment.state,
             crate::capability::CapabilityState::Unavailable
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_transport_preserves_chinese_json_and_errors() {
+        let json = run_powershell_json(
+            "@{ message = '需要管理员权限；路径：C:\\用户\\测试' } | ConvertTo-Json -Compress",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["message"], "需要管理员权限；路径：C:\\用户\\测试");
+        let error = run_powershell_json("throw '需要管理员权限'")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("需要管理员权限"), "{error}");
+        let gbk = b"{\"message\":\"\xd6\xd0\xce\xc4\"}";
+        assert_eq!(
+            super::decode_powershell_bytes(gbk, 936).unwrap(),
+            "{\"message\":\"中文\"}"
+        );
+        assert!(super::decode_powershell_bytes(b"\xff", 65001).is_err());
     }
 
     #[cfg(windows)]

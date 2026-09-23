@@ -1339,17 +1339,22 @@ export function WinHome({
   // self-dismiss. A partial outcome's backend prose is diagnostic evidence, not
   // localized safety guidance, so it lives behind the disclosure below.
   const winPartial = Boolean(perform && outcomeIsPartial(perform.outcome));
+  const winFallback = Boolean(perform?.success && perform.fallbackAttempted);
   const winClean =
     Boolean(perform?.success) &&
     !perform?.stage?.upToDate &&
     !perform?.fallbackAttempted &&
     !winPartial;
   const winResultDetail =
-    perform && !winClean && !winPartial
-      ? perform.notes.filter(Boolean).join(" · ") || undefined
-      : undefined;
+    winFallback
+      ? t(perform?.outcome.cleanup.state === "failed"
+          ? "install.fallback.cleanup"
+          : "install.fallback.note")
+      : perform && !winClean && !winPartial
+        ? perform.notes.filter(Boolean).join(" · ") || undefined
+        : undefined;
   const winResultDiagnostics =
-    perform && winPartial
+    perform && (winPartial || winFallback)
       ? [perform.message, ...perform.notes].filter(Boolean).join("\n") ||
         undefined
       : undefined;
@@ -1413,10 +1418,12 @@ export function WinHome({
           <>
             <ResultBanner
               tone={perform.success ? "ok" : "err"}
-              // Partial outcomes use localized product copy. The backend's raw
-              // message remains available only in the collapsed diagnostics.
+              // Partial outcomes and portable recovery use localized copy;
+              // intermediate MSIX failures stay in the collapsed diagnostics.
               title={
-                winPartial
+                winFallback
+                  ? t("install.fallback.title")
+                  : winPartial
                   ? t("install.done.title")
                   : winClean
                     ? updatedVer
