@@ -8,6 +8,35 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      # React and its renderer must match; include both type packages as well.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      react-security:
+        applies-to: security-updates
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      eslint:
+        patterns:
+          - "eslint"
+          - "@eslint/js"
+          - "eslint-plugin-*"
+          - "typescript-eslint"
+    # Remove these 10.x holds when jsx-a11y publishes ESLint 10 support:
+    # https://github.com/jsx-eslint/eslint-plugin-jsx-a11y/issues/1075
+    # ESLint 9 updates and jsx-a11y updates remain enabled.
+    ignore:
+      - dependency-name: "eslint"
+        versions: ["10.x"]
+      - dependency-name: "@eslint/js"
+        versions: ["10.x"]
   - package-ecosystem: npm
     directory: "/website"
     schedule:
