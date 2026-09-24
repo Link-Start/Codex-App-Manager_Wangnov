@@ -881,6 +881,7 @@ button.themecard-art:focus-visible {
 .skinrow {
   position: relative;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-sm);
   padding: 8px 10px;
@@ -916,7 +917,7 @@ button.themecard-art:focus-visible {
   object-fit: cover;
 }
 .skinrow-main {
-  flex: 1;
+  flex: 1 1 180px;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -949,7 +950,10 @@ button.themecard-art:focus-visible {
 .skinrow-actions {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  max-width: 100%;
+  margin-inline-start: auto;
 }
 .skinrow .skin-check {
   position: static;
