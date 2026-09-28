@@ -10,6 +10,7 @@ on:
       - "src-tauri/tauri.conf.json"
       - "src-tauri/tauri.smoke.conf.json"
       - "src-tauri/Cargo.toml"
+      - "Cargo.toml"
       - "Cargo.lock"
       - "src-tauri/capabilities/**"
       - "src-tauri/src/**"
