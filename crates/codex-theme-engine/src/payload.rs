@@ -11,8 +11,10 @@ use crate::theme::{
 };
 use crate::{Result, ENGINE_VERSION};
 
-/// The injected renderer runtime — maintained from codex-theme-studio. It
-/// encodes the flicker discipline (compare-before-write), sticky route
+/// The injected renderer runtime — authored here; `awesome-codex-skins`'s
+/// studio CLI vendors a pinned copy of this file and `composer-overflow.mjs`
+/// instead of maintaining its own (see that repo's `studio/RUNTIME_SOURCE.json`).
+/// It encodes the flicker discipline (compare-before-write), sticky route
 /// detection, icon annotation and cleanup contract, plus Manager's host
 /// compatibility shims for existing skin packages.
 const RUNTIME_TEMPLATE: &str = include_str!("runtime/theme-runtime.js");
@@ -525,5 +527,88 @@ mod tests {
         assert!(expr.contains("modeValid"));
         assert!(expr.contains("editorValid"));
         assert!(expr.contains("26.727.51351"));
+    }
+
+    /// Golden-fixture parity test. `tests/fixtures/golden/` is the shared
+    /// input the single-theme-runtime migration checks on both sides of the
+    /// vendoring boundary: `awesome-codex-skins`'s
+    /// `studio/test/runtime-golden.test.mjs` builds a payload from the same
+    /// fixture shape (id `golden-fixture`, same CSS, an overlay+stage chrome
+    /// fragment, one asset, one motion asset) through its own `buildPayload`
+    /// and executes it against real DOM snapshots; this test builds the
+    /// identical fixture through Rust's `build_payload` and asserts on the
+    /// generated payload *text* instead (Rust has no DOM to execute against).
+    /// The two are intentionally *not* compared by raw stamp equality —
+    /// `payload.rs` and `payload.mjs` fingerprint different inputs (this
+    /// crate's version constant vs. `STUDIO_VERSION`, and a
+    /// post-substitution vs. pre-substitution runtime template) so a
+    /// byte-identical package can legitimately produce different stamps
+    /// between the two engines. What must match is the *normalized*
+    /// structural contract below. If a future runtime edit changes one
+    /// side's observable output without the other fixture/test being
+    /// updated in lockstep, this test (or its studio counterpart) fails.
+    #[test]
+    fn golden_fixture_payload_matches_contract() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden");
+        let built = build_payload(&fixture_dir).unwrap();
+
+        // No placeholder survives substitution.
+        assert!(!built.payload.contains("__CTS_"), "unsubstituted placeholder");
+
+        // Exactly the assets the fixture declares: one CSS-inlined image
+        // plus one dedicated-slot motion asset (asset_count sums both).
+        assert_eq!(built.asset_count, 2, "fixture declares one still asset and one motion asset");
+        assert!(
+            built.payload.contains("--cts-asset-wall: url(\\\"data:image/png;base64,"),
+            "still asset must ride the CSS custom property as a data URL"
+        );
+        assert!(
+            built.payload.contains("data:video/mp4;base64,"),
+            "motion asset must be present as a data URL in the dedicated motion slot"
+        );
+        assert!(
+            !built.payload.contains("--cts-asset-intro-video"),
+            "motion assets must never become a CSS custom property"
+        );
+
+        // Both chrome layers from the fixture's overlay+stage markup.
+        assert!(built.payload.contains("data-cts-layer=\\\"overlay\\\""));
+        assert!(built.payload.contains("data-cts-layer=\\\"stage\\\""));
+
+        // Main-surface compatibility shim: current selector takes priority
+        // over the legacy one, and the compat marker exists.
+        let current = built
+            .payload
+            .find("main[data-app-shell-main-surface]")
+            .expect("current main-surface selector must be present");
+        let legacy = built
+            .payload
+            .find("main.${LEGACY_SHELL_MAIN_CLASS}")
+            .expect("legacy main-surface fallback must be present");
+        assert!(current < legacy, "current main-surface selector must be tried first");
+        assert!(built.payload.contains("data-cts-main-surface-compat"));
+
+        // Composer-surface compatibility shim: both the current CSS-module
+        // selector and the legacy-class compat marker are present.
+        assert!(built.payload.contains("[data-composer-surface-variant][data-composer-layout]"));
+        assert!(built.payload.contains("data-cts-composer-surface-compat"));
+        assert!(built.payload.contains("reconcileComposerSurfaces(document)"));
+        assert!(built.payload.contains("clearComposerSurfaceCompat(document)"));
+
+        // Composer overflow contract markers that the injected runtime relies
+        // on for classification and the hardening CSS appended after theme
+        // CSS.
+        assert!(built.payload.contains("annotateComposerOverflow.invalidate()"));
+        assert!(built.payload.contains("data-cts-composer-overflow=\\\"shell\\\""));
+        assert!(built.payload.contains("overflow: clip !important"));
+
+        // Stamp shape: engine version, fixture id, and a non-empty hash
+        // segment. Not compared against studio's stamp for a byte-identical
+        // package — see the doc comment above.
+        assert!(built.stamp.starts_with(&format!("{ENGINE_VERSION}:golden-fixture:")));
+        assert!(
+            built.stamp.rsplit(':').next().is_some_and(|h| !h.is_empty()),
+            "stamp must carry a non-empty fingerprint segment"
+        );
     }
 }
