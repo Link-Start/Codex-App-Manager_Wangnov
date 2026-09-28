@@ -8,6 +8,7 @@ on:
     paths:
       - ".github/workflows/windows-portable-msix-e2e.yml"
       - "crates/codex-win-engine/Cargo.toml"
+      - "Cargo.toml"
       - "Cargo.lock"
       - "crates/codex-win-engine/src/portable.rs"
       - "crates/codex-win-engine/src/portable_command.rs"
