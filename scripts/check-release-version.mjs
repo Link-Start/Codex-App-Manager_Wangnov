@@ -69,7 +69,9 @@ export function readReleaseSourceVersions(sourceRoot) {
     "src-tauri/tauri.conf.json",
   );
   const cargoTomlPath = join(root, "src-tauri", "Cargo.toml");
-  const cargoLockPath = join(root, "src-tauri", "Cargo.lock");
+  // Single Cargo workspace: the lockfile lives at the repo root now, not
+  // under src-tauri/ (which only kept its own Cargo.toml).
+  const cargoLockPath = join(root, "Cargo.lock");
   const cargoToml = readFileSync(cargoTomlPath, "utf8");
   const cargoLock = readFileSync(cargoLockPath, "utf8");
 
@@ -87,7 +89,7 @@ export function readReleaseSourceVersions(sourceRoot) {
       ),
     ],
     [
-      'src-tauri/Cargo.lock#[[package]] name="codex-app-manager".version',
+      'Cargo.lock#[[package]] name="codex-app-manager".version',
       cargoLockPackageVersion(cargoLock, "codex-app-manager"),
     ],
   ];
