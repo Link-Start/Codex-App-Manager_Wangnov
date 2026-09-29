@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::delta::executor::RangeFetcher;
-use crate::network::{is_schannel_revocation_offline, NetworkConfig, SchannelRevocationCheck};
+use crate::network::{is_schannel_revocation_check_failure, NetworkConfig, SchannelRevocationCheck};
 use crate::process::{curl_exe, hidden_command, run_capturing, run_with_progress, RunError, RunLimits};
 use crate::EngineError;
 
@@ -474,7 +474,7 @@ impl<'a> CurlTransport<'a> {
             Ok(output) if output.status.success() => Ok(output),
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                if is_schannel_revocation_offline(output.status.code(), &stderr) {
+                if is_schannel_revocation_check_failure(output.status.code(), &stderr) {
                     let retried =
                         attempt(SchannelRevocationCheck::Disabled).map_err(CurlFailure::Run)?;
                     if retried.status.success() {
