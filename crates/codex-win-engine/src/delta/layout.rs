@@ -141,6 +141,17 @@ pub fn resolve_package_layout(
         }
     }
 
+    // The planner turns these offsets into byte spans (`start..end`); a
+    // reversed or out-of-file span would underflow its length arithmetic.
+    // Reject inconsistent metadata here so the caller gets a clean `Err` and
+    // falls back to the full download.
+    if zip.central_directory_offset > zip.file_size {
+        return Err(EngineError::Msix(format!(
+            "central directory offset {} is past the end of the package ({} bytes)",
+            zip.central_directory_offset, zip.file_size
+        )));
+    }
+
     let mut entries = zip.entries;
     entries.sort_by_key(|entry| entry.local_header_offset);
 
@@ -150,6 +161,12 @@ pub fn resolve_package_layout(
             .get(index + 1)
             .map(|next| next.local_header_offset)
             .unwrap_or(zip.central_directory_offset);
+        if end_offset < entry.local_header_offset {
+            return Err(EngineError::Msix(format!(
+                "ZIP entry {:?} has a local header offset ({}) past the end of its record ({end_offset}); the central directory is inconsistent",
+                entry.name, entry.local_header_offset
+            )));
+        }
 
         let matched = by_slash_name
             .remove(&entry.name)
@@ -442,5 +459,28 @@ mod tests {
             let err = resolve_package_layout(zip, Some(block_map())).unwrap_err();
             assert!(err.to_string().contains("compressed size"), "{bad_size}: {err}");
         }
+    }
+
+    #[test]
+    fn inconsistent_entry_and_central_directory_offsets_are_a_clean_error() {
+        // Last entry's local header lies beyond the central directory.
+        let zip = ZipLayout {
+            file_size: 10_000,
+            central_directory_offset: 9_000,
+            central_directory_size: 500,
+            entries: vec![entry("app/a.bin", 9_500, 10, 10)],
+        };
+        let err = resolve_package_layout(zip, None).unwrap_err();
+        assert!(err.to_string().contains("inconsistent"), "{err}");
+
+        // Central directory claimed past EOF.
+        let zip = ZipLayout {
+            file_size: 10_000,
+            central_directory_offset: 10_500,
+            central_directory_size: 500,
+            entries: vec![entry("app/a.bin", 0, 10, 10)],
+        };
+        let err = resolve_package_layout(zip, None).unwrap_err();
+        assert!(err.to_string().contains("past the end of the package"), "{err}");
     }
 }
