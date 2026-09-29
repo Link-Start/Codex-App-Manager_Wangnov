@@ -1,0 +1,350 @@
+//! Combine a ZIP container's central directory with its `AppxBlockMap.xml`
+//! into one per-entry view the planner can walk directly: for each payload
+//! file, the exact absolute byte offset of every block, plus the small
+//! leftover regions (a possible "closer tail" and a data descriptor) the
+//! block map does not describe. Mirrors the feasibility prototype's
+//! `layout.py` `build_layout`, which this module's tests cross-check against
+//! real historical release pairs' behavior (see `delta::planner` tests).
+
+use std::collections::HashMap;
+
+use crate::appx_blockmap::{self, AppxBlockMap, AppxBlockMapFile};
+use crate::delta::zip_format::{self, ByteSource, ZipLayout};
+use crate::EngineError;
+
+pub const APPX_BLOCK_MAP_ENTRY_NAME: &str = "AppxBlockMap.xml";
+const MAX_APPX_BLOCK_MAP_XML_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct ResolvedBlock {
+    pub hash_base64: String,
+    pub size: u64,
+    /// Absolute byte offset of this block's on-disk data within the package.
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedBlockMapFile {
+    pub lfh_size: u64,
+    /// `local_header_offset + lfh_size` — the start of this entry's
+    /// compressed data.
+    pub data_offset: u64,
+    pub blocks: Vec<ResolvedBlock>,
+    /// Sum of the declared block sizes.
+    pub block_data_size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedFile {
+    /// ZIP entry name, exactly as stored in the central directory (may be
+    /// percent-encoded — MakeAppx encodes reserved characters like `@`).
+    pub name: String,
+    pub local_header_offset: u64,
+    /// Exclusive end of this entry's on-disk record: the next entry's local
+    /// header offset (entries are physically contiguous), or the central
+    /// directory offset for the last entry. Free — no extra reads needed.
+    pub end_offset: u64,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    /// `Some` when `AppxBlockMap.xml` describes this entry's blocks —
+    /// `None` for `AppxBlockMap.xml` itself and the handful of other
+    /// ancillary entries (`[Content_Types].xml`, `AppxSignature.p7x`,
+    /// code-integrity catalogs) that are always fetched in full.
+    pub block_map_file: Option<ResolvedBlockMapFile>,
+}
+
+impl ResolvedFile {
+    /// Bytes between the last described block and the end of the compressed
+    /// data region. Zero for every real package observed so far, but never
+    /// assumed to be — always fetched fresh rather than reused.
+    pub fn closer_tail_len(&self) -> u64 {
+        match &self.block_map_file {
+            Some(bf) => self.compressed_size.saturating_sub(bf.block_data_size),
+            None => 0,
+        }
+    }
+
+    /// Trailing bytes after the compressed data up to `end_offset` — a data
+    /// descriptor when the general-purpose bit 3 flag is set (0, 16 or 24
+    /// bytes), otherwise 0. Always fetched fresh, never reused.
+    pub fn data_descriptor_len(&self) -> u64 {
+        match &self.block_map_file {
+            Some(bf) => self
+                .end_offset
+                .saturating_sub(bf.data_offset + self.compressed_size),
+            None => 0,
+        }
+    }
+
+    pub fn is_covered_by_block_map(&self) -> bool {
+        self.block_map_file.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PackageLayout {
+    pub file_size: u64,
+    pub central_directory_offset: u64,
+    pub central_directory_size: u64,
+    /// Sorted by `local_header_offset`.
+    pub files: Vec<ResolvedFile>,
+    /// Block-map `<File>` entries that had no matching ZIP central-directory
+    /// entry. Never fatal on its own (the final whole-file SHA-256 check is
+    /// the real safety net) but worth surfacing — it means this package's
+    /// block map disagrees with its own ZIP directory.
+    pub unmatched_block_map_files: Vec<String>,
+}
+
+fn percent_decode_lenient(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_val(bytes[index + 1]), hex_val(bytes[index + 2]))
+            {
+                out.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Combine an already-parsed [`ZipLayout`] with an already-parsed
+/// [`AppxBlockMap`] into the per-entry [`PackageLayout`] the planner walks.
+/// Matching follows the same rule the feasibility prototype validated on
+/// real releases: `AppxBlockMap.xml`'s `File/@Name` is backslash-separated
+/// and never percent-encoded, while the ZIP entry name for the same payload
+/// file may be (MakeAppx percent-encodes reserved characters); the raw ZIP
+/// name is tried first, the percent-decoded ZIP name second.
+pub fn resolve_package_layout(
+    zip: ZipLayout,
+    block_map: Option<AppxBlockMap>,
+) -> Result<PackageLayout, EngineError> {
+    let mut by_slash_name: HashMap<String, AppxBlockMapFile> = HashMap::new();
+    if let Some(block_map) = block_map {
+        for file in block_map.files {
+            by_slash_name.insert(file.name.replace('\\', "/"), file);
+        }
+    }
+
+    let mut entries = zip.entries;
+    entries.sort_by_key(|entry| entry.local_header_offset);
+
+    let mut files = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let end_offset = entries
+            .get(index + 1)
+            .map(|next| next.local_header_offset)
+            .unwrap_or(zip.central_directory_offset);
+
+        let matched = by_slash_name
+            .remove(&entry.name)
+            .or_else(|| by_slash_name.remove(&percent_decode_lenient(&entry.name)));
+
+        let block_map_file = matched.map(|file| {
+            let data_offset = entry.local_header_offset + file.lfh_size;
+            let mut offset = data_offset;
+            let blocks = file
+                .blocks
+                .iter()
+                .map(|block| {
+                    let resolved = ResolvedBlock {
+                        hash_base64: block.hash_base64.clone(),
+                        size: block.size,
+                        offset,
+                    };
+                    offset += block.size;
+                    resolved
+                })
+                .collect::<Vec<_>>();
+            ResolvedBlockMapFile {
+                lfh_size: file.lfh_size,
+                data_offset,
+                block_data_size: file.block_data_size(),
+                blocks,
+            }
+        });
+
+        files.push(ResolvedFile {
+            name: entry.name.clone(),
+            local_header_offset: entry.local_header_offset,
+            end_offset,
+            compressed_size: entry.compressed_size,
+            uncompressed_size: entry.uncompressed_size,
+            block_map_file,
+        });
+    }
+
+    let mut unmatched_block_map_files = by_slash_name.into_keys().collect::<Vec<_>>();
+    unmatched_block_map_files.sort();
+
+    Ok(PackageLayout {
+        file_size: zip.file_size,
+        central_directory_offset: zip.central_directory_offset,
+        central_directory_size: zip.central_directory_size,
+        files,
+        unmatched_block_map_files,
+    })
+}
+
+/// Parse `AppxBlockMap.xml`'s XML text out of an already-parsed ZIP layout,
+/// reading (and, since real MSIX packages deflate-compress it, inflating)
+/// just that one entry's bytes rather than the whole package. Returns
+/// `Ok(None)` when the package has no such entry.
+pub fn read_block_map_xml<S: ByteSource>(
+    source: &S,
+    zip: &ZipLayout,
+) -> Result<Option<String>, EngineError> {
+    let Some(entry) = zip
+        .entries
+        .iter()
+        .find(|entry| entry.name == APPX_BLOCK_MAP_ENTRY_NAME)
+    else {
+        return Ok(None);
+    };
+    if entry.uncompressed_size > MAX_APPX_BLOCK_MAP_XML_BYTES {
+        return Err(EngineError::Msix(format!(
+            "AppxBlockMap.xml is unexpectedly large: {} bytes",
+            entry.uncompressed_size
+        )));
+    }
+    let bytes = zip_format::read_entry_decompressed(source, entry)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|err| EngineError::Msix(format!("AppxBlockMap.xml is not UTF-8: {err}")))
+}
+
+/// Parse a package's full layout (ZIP central directory + resolved block
+/// map) directly from a [`ByteSource`] — the one entry point most callers
+/// want, whether `source` is a local base file already in memory or a
+/// remote package fetched a `Range` GET at a time.
+pub fn build_package_layout<S: ByteSource>(source: &S) -> Result<PackageLayout, EngineError> {
+    let zip = zip_format::parse_zip_layout(source)?;
+    let block_map = match read_block_map_xml(source, &zip)? {
+        Some(xml) => Some(appx_blockmap::parse_appx_block_map_xml(&xml)?),
+        None => None,
+    };
+    resolve_package_layout(zip, block_map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delta::zip_format::CentralDirectoryEntry;
+
+    fn entry(name: &str, lho: u64, csize: u64, usize_: u64) -> CentralDirectoryEntry {
+        CentralDirectoryEntry {
+            name: name.to_string(),
+            method: 8,
+            flags: 0,
+            crc32: 0,
+            compressed_size: csize,
+            uncompressed_size: usize_,
+            local_header_offset: lho,
+        }
+    }
+
+    fn block_map_file(name: &str, usize_: u64, lfh_size: u64, blocks: &[(&str, u64)]) -> AppxBlockMapFile {
+        AppxBlockMapFile {
+            name: name.to_string(),
+            uncompressed_size: usize_,
+            lfh_size,
+            blocks: blocks
+                .iter()
+                .map(|(hash, size)| appx_blockmap::AppxBlock {
+                    hash_base64: hash.to_string(),
+                    size: *size,
+                    stored: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolves_block_offsets_and_end_offset_from_next_entry() {
+        let zip = ZipLayout {
+            file_size: 10_000,
+            central_directory_offset: 9_000,
+            central_directory_size: 500,
+            entries: vec![
+                entry("app/a.bin", 0, 210, 300),
+                entry("app/b.bin", 5_000, 100, 100),
+            ],
+        };
+        let block_map = AppxBlockMap {
+            files: vec![block_map_file(
+                r"app\a.bin",
+                300,
+                50,
+                &[("h1", 120), ("h2", 80)],
+            )],
+        };
+        let layout = resolve_package_layout(zip, Some(block_map)).unwrap();
+        assert_eq!(layout.files.len(), 2);
+        let a = &layout.files[0];
+        assert_eq!(a.end_offset, 5_000);
+        let bf = a.block_map_file.as_ref().unwrap();
+        assert_eq!(bf.data_offset, 50);
+        assert_eq!(bf.blocks[0].offset, 50);
+        assert_eq!(bf.blocks[1].offset, 50 + 120);
+        // compressed_size (210) exceeds the declared block data (200): the
+        // extra 10 bytes are a "closer tail" that must always be fetched
+        // fresh, never assumed reusable.
+        assert_eq!(a.closer_tail_len(), 10);
+        let b = &layout.files[1];
+        assert_eq!(b.end_offset, 9_000);
+        assert!(!b.is_covered_by_block_map());
+        assert!(layout.unmatched_block_map_files.is_empty());
+    }
+
+    #[test]
+    fn matches_percent_encoded_zip_names_against_plain_block_map_names() {
+        let zip = ZipLayout {
+            file_size: 1_000,
+            central_directory_offset: 900,
+            central_directory_size: 50,
+            entries: vec![entry("app/node_modules/%40oai/file.js", 0, 40, 40)],
+        };
+        let block_map = AppxBlockMap {
+            files: vec![block_map_file(
+                r"app\node_modules\@oai\file.js",
+                40,
+                40,
+                &[("h", 40)],
+            )],
+        };
+        let layout = resolve_package_layout(zip, Some(block_map)).unwrap();
+        assert!(layout.files[0].is_covered_by_block_map());
+        assert!(layout.unmatched_block_map_files.is_empty());
+    }
+
+    #[test]
+    fn surfaces_unmatched_block_map_entries_without_failing() {
+        let zip = ZipLayout {
+            file_size: 1_000,
+            central_directory_offset: 900,
+            central_directory_size: 50,
+            entries: vec![entry("app/a.bin", 0, 40, 40)],
+        };
+        let block_map = AppxBlockMap {
+            files: vec![block_map_file(r"app\ghost.bin", 40, 40, &[("h", 40)])],
+        };
+        let layout = resolve_package_layout(zip, Some(block_map)).unwrap();
+        assert!(!layout.files[0].is_covered_by_block_map());
+        assert_eq!(layout.unmatched_block_map_files, vec!["app/ghost.bin"]);
+    }
+}

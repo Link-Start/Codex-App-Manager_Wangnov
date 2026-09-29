@@ -271,31 +271,18 @@ fn parse_logical_msix_path(name: &str) -> Result<Vec<String>, EngineError> {
     Ok(components)
 }
 
+// The XML traversal (element names, required attributes, per-block parsing)
+// lives once in `appx_blockmap` — the delta engine needs the same File/Block
+// data plus LfhSize, which this extractor has no use for. This function only
+// adapts that shared parse into the logical-path-keyed view extraction wants.
 fn parse_appx_block_map(xml: &str) -> Result<BlockMapPaths, EngineError> {
-    let document = roxmltree::Document::parse(xml)
-        .map_err(|err| EngineError::Msix(format!("AppxBlockMap.xml: {err}")))?;
+    let parsed = crate::appx_blockmap::parse_appx_block_map_xml(xml)?;
     let mut by_logical_name = HashMap::new();
     let mut windows_names = HashMap::<String, String>::new();
 
-    for file in document
-        .descendants()
-        .filter(|node| node.has_tag_name("File"))
-    {
-        let logical_name = file
-            .attribute("Name")
-            .ok_or_else(|| EngineError::Msix("AppxBlockMap File missing Name".to_string()))?
-            .to_string();
-        let size = file
-            .attribute("Size")
-            .ok_or_else(|| {
-                EngineError::Msix(format!("AppxBlockMap File missing Size: {logical_name}"))
-            })?
-            .parse::<u64>()
-            .map_err(|err| {
-                EngineError::Msix(format!(
-                    "AppxBlockMap File has invalid Size for {logical_name}: {err}"
-                ))
-            })?;
+    for file in &parsed.files {
+        let logical_name = file.name.clone();
+        let size = file.uncompressed_size;
         let components = parse_logical_msix_path(&logical_name)?;
         let windows_key = windows_path_key(&components);
         if let Some(previous) = windows_names.insert(windows_key, logical_name.clone()) {
