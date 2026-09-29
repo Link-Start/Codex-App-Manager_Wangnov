@@ -43,7 +43,7 @@ jobs:
       - name: Run native launcher after relocating its directory
         run: >-
           cargo test
-          --manifest-path crates/codex-win-engine/Cargo.toml
+          -p codex-win-engine
           portable_launcher_survives_directory_move
           -- --nocapture
 
@@ -70,6 +70,6 @@ jobs:
       - name: Extract portable payload and resolve Computer Use modules
         run: >-
           cargo test
-          --manifest-path crates/codex-win-engine/Cargo.toml
+          -p codex-win-engine
           real_msix_uses_computer_use_logical_paths
           -- --ignored --nocapture
