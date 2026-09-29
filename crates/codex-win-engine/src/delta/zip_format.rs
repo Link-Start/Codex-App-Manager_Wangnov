@@ -19,6 +19,10 @@ use crate::EngineError;
 pub trait ByteSource {
     /// Total size of the underlying file in bytes.
     fn len(&self) -> u64;
+    /// True when the underlying file is empty (`len() == 0`).
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// Read exactly `len` bytes starting at `start`. `start + len` must not
     /// exceed `len()`.
     fn read_range(&self, start: u64, len: u64) -> Result<Vec<u8>, EngineError>;
@@ -120,6 +124,31 @@ fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=haystack.len() - needle.len()).rev().find(|&start| &haystack[start..start + needle.len()] == needle)
 }
 
+/// Find the rightmost occurrence of the classic EOCD signature in `tail`
+/// whose fixed 22-byte record plus its declared comment length lands
+/// *exactly* at the end of `tail` (`tail`'s end is always the true EOF --
+/// see [`parse_zip_layout`]). A plain rightmost-signature search is not
+/// enough: a ZIP archive comment is caller-chosen bytes and can itself
+/// contain `PK\x05\x06`, which would otherwise be mistaken for the real
+/// record. On a false match this keeps searching strictly before it for an
+/// earlier occurrence that does satisfy the length check.
+fn find_valid_eocd(tail: &[u8]) -> Option<usize> {
+    let mut search_end = tail.len();
+    loop {
+        let candidate = rfind(&tail[..search_end], &EOCD_SIGNATURE)?;
+        if tail.len() - candidate >= 22 {
+            let comment_len = u16_le(tail, candidate + 20) as usize;
+            if candidate + 22 + comment_len == tail.len() {
+                return Some(candidate);
+            }
+        }
+        if candidate == 0 {
+            return None;
+        }
+        search_end = candidate;
+    }
+}
+
 struct EocdInfo {
     central_directory_offset: u64,
     central_directory_size: u64,
@@ -132,11 +161,8 @@ struct EocdInfo {
 /// when the tail is too short to contain what it needs — the caller widens
 /// the tail and retries.
 fn parse_eocd(tail: &[u8], tail_base: u64) -> Result<EocdInfo, EngineError> {
-    let eocd_pos = rfind(tail, &EOCD_SIGNATURE)
+    let eocd_pos = find_valid_eocd(tail)
         .ok_or_else(|| EngineError::Msix("ZIP EOCD record not found in tail".to_string()))?;
-    if tail.len() - eocd_pos < 22 {
-        return Err(EngineError::Msix("ZIP EOCD record is truncated".to_string()));
-    }
     let mut entry_count = u16_le(tail, eocd_pos + 10) as u64;
     let mut central_directory_size = u32_le(tail, eocd_pos + 12) as u64;
     let mut central_directory_offset = u32_le(tail, eocd_pos + 16) as u64;
@@ -536,6 +562,36 @@ mod tests {
         assert!(parse_zip_layout(&source).is_err());
     }
 
+    /// A ZIP archive comment is caller-chosen bytes appended after the real
+    /// EOCD record; here it happens to contain the EOCD signature itself. A
+    /// naive rightmost-signature search would mistake that embedded bytes
+    /// for the real record and either fail to parse or read bogus offsets.
+    #[test]
+    fn finds_the_real_eocd_past_a_comment_containing_a_fake_signature() {
+        let mut data = build_zip(&[("a.txt", b"hello"), ("dir/b.txt", b"world!!")]);
+        // The real EOCD record ends where `data` currently ends (comment
+        // length 0). Append a comment containing an embedded, byte-for-byte
+        // fake EOCD signature followed by 18 arbitrary bytes -- deliberately
+        // NOT a well-formed record, so a parser that trusts it outright
+        // would either misread the directory offsets or error out instead
+        // of falling back to the real record.
+        let mut comment = Vec::new();
+        comment.extend_from_slice(&EOCD_SIGNATURE);
+        comment.extend_from_slice(&[0xAA; 18]);
+        let comment_len = comment.len() as u16;
+        data.extend_from_slice(&comment);
+        // Patch the real EOCD's comment-length field (the last 2 bytes
+        // before the comment we just appended) to declare it.
+        let eocd_at = data.len() - comment.len() - 22;
+        data[eocd_at + 20..eocd_at + 22].copy_from_slice(&le16(comment_len));
+
+        let source = InMemorySource::new(&data);
+        let layout = parse_zip_layout(&source).unwrap();
+        assert_eq!(layout.entries.len(), 2);
+        assert_eq!(layout.entries[0].name, "a.txt");
+        assert_eq!(layout.entries[1].name, "dir/b.txt");
+    }
+
     /// Build a ZIP64 archive: one entry whose central-directory record marks
     /// usize/csize/lho as 0xFFFFFFFF and carries the real 64-bit values in a
     /// ZIP64 extra field, plus a ZIP64 EOCD locator + record ahead of the
@@ -709,6 +765,6 @@ mod tests {
             layout.entries[0].compressed_size,
             b"zip64-payload-bytes".len() as u64
         );
-        assert_eq!(layout.entries[1].local_header_offset > 0, true);
+        assert!(layout.entries[1].local_header_offset > 0);
     }
 }
