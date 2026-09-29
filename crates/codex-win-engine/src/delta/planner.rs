@@ -90,12 +90,20 @@ impl DeltaPlan {
     }
 }
 
-/// `(block hash, block on-disk size) -> absolute offset in the base file`,
+/// Key under which a block's on-disk bytes are interchangeable between two
+/// packages: `(block hash, block on-disk size, stored)`. The hash covers the
+/// *uncompressed* content, so the size alone distinguishes most re-encodings,
+/// but a stored block and a deflated block of identical content can (rarely,
+/// for incompressible data) have the same size while holding different bytes:
+/// hence the storage mode is part of the key too.
+pub type ReuseKey = (String, u64, bool);
+
+/// `(block hash, block on-disk size, stored) -> absolute offset in the base file`,
 /// built once from the base package's own resolved layout. When the same
 /// (hash, size) pair appears more than once in the base (content duplicated
 /// across files), the first occurrence wins — matching the feasibility
 /// prototype and sufficient since either location holds byte-identical data.
-pub fn build_reuse_index(base: &PackageLayout) -> HashMap<(String, u64), u64> {
+pub fn build_reuse_index(base: &PackageLayout) -> HashMap<ReuseKey, u64> {
     let mut index = HashMap::new();
     for file in &base.files {
         let Some(block_map_file) = &file.block_map_file else {
@@ -103,7 +111,7 @@ pub fn build_reuse_index(base: &PackageLayout) -> HashMap<(String, u64), u64> {
         };
         for block in &block_map_file.blocks {
             index
-                .entry((block.hash_base64.clone(), block.size))
+                .entry((block.hash_base64.clone(), block.size, block.stored))
                 .or_insert(block.offset);
         }
     }
@@ -116,7 +124,7 @@ pub fn build_reuse_index(base: &PackageLayout) -> HashMap<(String, u64), u64> {
 /// [`FetchStep`], so `copies` and `fetches` together cover every byte from
 /// offset 0 to `new_layout.file_size`.
 pub fn plan_delta(
-    base_reuse_index: &HashMap<(String, u64), u64>,
+    base_reuse_index: &HashMap<ReuseKey, u64>,
     new_layout: &PackageLayout,
     config: &PlannerConfig,
 ) -> DeltaPlan {
@@ -155,7 +163,7 @@ pub fn plan_delta(
                 ));
                 for block in &block_map_file.blocks {
                     total_blocks += 1;
-                    let key = (block.hash_base64.clone(), block.size);
+                    let key = (block.hash_base64.clone(), block.size, block.stored);
                     if let Some(&base_offset) = base_reuse_index.get(&key) {
                         reused_blocks += 1;
                         reused_bytes += block.size;
@@ -382,8 +390,8 @@ mod tests {
             vec![block("h1", 100), block("h2", 150)],
         );
         let reuse_index = build_reuse_index(&base);
-        assert!(reuse_index.contains_key(&("h2".to_string(), 200)));
-        assert!(!reuse_index.contains_key(&("h2".to_string(), 150)));
+        assert!(reuse_index.contains_key(&("h2".to_string(), 200, false)));
+        assert!(!reuse_index.contains_key(&("h2".to_string(), 150, false)));
 
         let plan = plan_delta(&reuse_index, &new_layout, &PlannerConfig { coalesce_gap: 0 });
         assert_eq!(plan.total_blocks, 2);
@@ -392,6 +400,17 @@ mod tests {
         assert_eq!(plan.copies[0].len, 100);
         // The size-mismatched block (new offsets 140..290) is fetched whole.
         assert!(plan.fetches.iter().any(|f| f.offset <= 140 && f.offset + f.len >= 140 + 150));
+    }
+
+    #[test]
+    fn same_hash_and_size_but_a_different_storage_mode_is_not_reused() {
+        // A stored block and a deflated block of identical content can have
+        // the same on-disk size for incompressible data, yet different bytes.
+        let base = single_file_layout("app/a.bin", 0, 40, vec![block("h1", 100)]);
+        let mut new_layout = single_file_layout("app/a.bin", 0, 40, vec![block("h1", 100)]);
+        new_layout.files[0].block_map_file.as_mut().unwrap().blocks[0].stored = true;
+        let plan = plan_delta(&build_reuse_index(&base), &new_layout, &PlannerConfig { coalesce_gap: 0 });
+        assert_eq!(plan.reused_blocks, 0);
     }
 
     #[test]

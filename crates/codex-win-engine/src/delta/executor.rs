@@ -17,13 +17,13 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::delta::layout::{build_package_layout, PackageLayout};
-use crate::delta::planner::{build_reuse_index, plan_delta, DeltaPlan, PlannerConfig};
+use crate::delta::planner::{build_reuse_index, plan_delta, DeltaPlan, PlannerConfig, ReuseKey};
 use crate::delta::zip_format::{ByteSource, InMemorySource};
 pub use crate::delta::http::{CurlRangeFetcher, RetryPolicy, RetryStats};
 use crate::EngineError;
 
 /// Prefix of every error that means "the local base package itself is bad"
-/// (unparseable, or a reused block fails its own `AppxBlockMap.xml` hash).
+/// (unreadable, unparseable, or a reused block fails its own `AppxBlockMap.xml` hash).
 /// Unlike a network failure this will fail identically on the next attempt,
 /// so a caller should drop the retained base
 /// ([`crate::delta::retention::clear_retained_base`]) when
@@ -259,8 +259,14 @@ pub fn execute_delta<F: RangeFetcher>(
     // parse and every `CopyStep` read with zero extra syscalls. A future,
     // memory-constrained caller could swap this for an `mmap`-backed
     // `ByteSource` without changing anything downstream of `base_source`.
-    let base_bytes = std::fs::read(base_path)
-        .map_err(|err| EngineError::Io(format!("read base {}: {err}", base_path.display())))?;
+    // An unreadable base (deleted, permissions, bad sector) will fail the
+    // same way next time: classify it as a corrupt base so the caller drops it.
+    let base_bytes = std::fs::read(base_path).map_err(|err| {
+        EngineError::Msix(format!(
+            "{CORRUPT_BASE_PREFIX} cannot read base {}: {err}",
+            base_path.display()
+        ))
+    })?;
     let base_source = InMemorySource::new(&base_bytes);
     let base_layout = build_package_layout(&base_source)
         .map_err(|err| {
@@ -358,24 +364,24 @@ fn verify_reused_base_blocks(
     base_layout: &PackageLayout,
     base_bytes: &[u8],
     new_layout: &PackageLayout,
-    reuse_index: &HashMap<(String, u64), u64>,
+    reuse_index: &HashMap<ReuseKey, u64>,
 ) -> Result<usize, EngineError> {
-    let needed: HashSet<(&str, u64)> = new_layout
+    let needed: HashSet<(&str, u64, bool)> = new_layout
         .files
         .iter()
         .filter_map(|file| file.block_map_file.as_ref())
         .flat_map(|file| file.blocks.iter())
-        .filter(|block| reuse_index.contains_key(&(block.hash_base64.clone(), block.size)))
-        .map(|block| (block.hash_base64.as_str(), block.size))
+        .filter(|block| reuse_index.contains_key(&(block.hash_base64.clone(), block.size, block.stored)))
+        .map(|block| (block.hash_base64.as_str(), block.size, block.stored))
         .collect();
 
-    let mut verified: HashSet<(&str, u64)> = HashSet::new();
+    let mut verified: HashSet<(&str, u64, bool)> = HashSet::new();
     for file in &base_layout.files {
         let Some(block_map_file) = &file.block_map_file else {
             continue;
         };
         for (index, block) in block_map_file.blocks.iter().enumerate() {
-            let key = (block.hash_base64.as_str(), block.size);
+            let key = (block.hash_base64.as_str(), block.size, block.stored);
             // First occurrence only: that is the one `build_reuse_index`
             // (and therefore the copy step) points at.
             if !needed.contains(&key) || !verified.insert(key) {
@@ -1099,6 +1105,25 @@ mod tests {
 
         let _ = std::fs::remove_file(&base_path);
         let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[test]
+    fn unreadable_and_unparseable_bases_are_classified_as_corrupt_bases() {
+        let missing = std::env::temp_dir().join(format!("codex-win-executor-missing-{}.msix", uuid::Uuid::new_v4()));
+        let dest = std::env::temp_dir().join(format!("codex-win-executor-missing-dest-{}.msix", uuid::Uuid::new_v4()));
+        let fetcher = FakeFetcher { data: vec![0u8; 10] };
+        let err = execute_delta(&missing, &fetcher, &dest, &"0".repeat(64), &PlannerConfig::default(), 0.0)
+            .unwrap_err();
+        assert!(is_corrupt_base_error(&err), "{err}");
+
+        let garbage = write_temp_file("garbage-base", b"not a zip");
+        let err = execute_delta(&garbage, &fetcher, &dest, &"0".repeat(64), &PlannerConfig::default(), 0.0)
+            .unwrap_err();
+        assert!(is_corrupt_base_error(&err), "{err}");
+        let _ = std::fs::remove_file(&garbage);
+
+        // A network-side failure is not a corrupt base.
+        assert!(!is_corrupt_base_error(&EngineError::Io("connection reset".to_string())));
     }
 
     #[test]
