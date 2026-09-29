@@ -43,7 +43,13 @@ pub struct AppxBlockMapFile {
     /// entry's local-header offset from the ZIP central directory, this
     /// gives the exact start of the entry's compressed data with zero extra
     /// reads — no need to ever fetch/parse the local header itself.
-    pub lfh_size: u64,
+    ///
+    /// `None` when the XML's `<File>` element omits `LfhSize` -- optional
+    /// here because only `delta::layout` needs it; `portable.rs`'s
+    /// extractor never reads this field and must keep accepting a block map
+    /// that omits it, exactly as it did before this parser was shared.
+    /// `delta::layout` treats a missing value as its own hard error.
+    pub lfh_size: Option<u64>,
     pub blocks: Vec<AppxBlock>,
 }
 
@@ -95,10 +101,10 @@ pub fn parse_appx_block_map_xml(xml: &str) -> Result<AppxBlockMap, EngineError> 
     {
         let name = attr(&file, "Name", "File")?.to_string();
         let uncompressed_size = parse_u64_attr(attr(&file, "Size", "File")?, &format!("File Size: {name}"))?;
-        let lfh_size = parse_u64_attr(
-            attr(&file, "LfhSize", "File")?,
-            &format!("File LfhSize: {name}"),
-        )?;
+        let lfh_size = file
+            .attribute("LfhSize")
+            .map(|raw| parse_u64_attr(raw, &format!("File LfhSize: {name}")))
+            .transpose()?;
 
         let mut blocks = Vec::new();
         for (index, block) in file
@@ -165,7 +171,7 @@ mod tests {
         let asar = &parsed.files[0];
         assert_eq!(asar.name, r"app\resources\app.asar");
         assert_eq!(asar.uncompressed_size, 140000);
-        assert_eq!(asar.lfh_size, 47);
+        assert_eq!(asar.lfh_size, Some(47));
         assert_eq!(asar.blocks.len(), 3);
         assert_eq!(asar.blocks[0].size, 65536);
         assert!(!asar.blocks[0].stored);
@@ -182,10 +188,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_lfh_size() {
+    fn accepts_missing_lfh_size_as_none() {
+        // The portable-install extractor never needs `LfhSize` and must
+        // keep accepting a block map that omits it, exactly as it did
+        // before this parser was shared with the delta engine (which is
+        // the caller that actually requires the field -- see
+        // `delta::layout`).
         let xml = r#"<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap"><File Name="a" Size="1"><Block Hash="x" Size="1"/></File></BlockMap>"#;
-        let err = parse_appx_block_map_xml(xml).unwrap_err();
-        assert!(err.to_string().contains("LfhSize"), "{err}");
+        let parsed = parse_appx_block_map_xml(xml).unwrap();
+        assert_eq!(parsed.files[0].lfh_size, None);
     }
 
     #[test]

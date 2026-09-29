@@ -2107,6 +2107,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_block_map_files_that_omit_lfh_size() {
+        // Portable extraction only needs a File's logical path and
+        // uncompressed size; LfhSize is a delta-engine-only field on the
+        // shared `appx_blockmap` parser (see that module's doc comment).
+        // A real-world block map that omits it must still extract here,
+        // exactly as it did before the parser was shared.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap" HashMethod="http://www.w3.org/2001/04/xmlenc#sha256">
+  <File Name="app\resources\app.asar" Size="9">
+    <Block Hash="aaaa" Size="9" />
+  </File>
+</BlockMap>"#;
+        let paths = parse_appx_block_map(xml).unwrap();
+        assert!(paths.by_logical_name.contains_key("app\\resources\\app.asar"));
+    }
+
+    #[test]
     fn rejects_missing_or_size_mismatched_block_map_payloads() {
         for (files, expected) in [
             (

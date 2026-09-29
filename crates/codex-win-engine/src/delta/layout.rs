@@ -155,29 +155,41 @@ pub fn resolve_package_layout(
             .remove(&entry.name)
             .or_else(|| by_slash_name.remove(&percent_decode_lenient(&entry.name)));
 
-        let block_map_file = matched.map(|file| {
-            let data_offset = entry.local_header_offset + file.lfh_size;
-            let mut offset = data_offset;
-            let blocks = file
-                .blocks
-                .iter()
-                .map(|block| {
-                    let resolved = ResolvedBlock {
-                        hash_base64: block.hash_base64.clone(),
-                        size: block.size,
-                        offset,
-                    };
-                    offset += block.size;
-                    resolved
+        let block_map_file = matched
+            .map(|file| -> Result<ResolvedBlockMapFile, EngineError> {
+                // Unlike `portable.rs`'s extractor (which never reads this
+                // field), the delta engine cannot locate a single block
+                // without it: `lfh_size` is what turns a local-header
+                // offset into the start of compressed data.
+                let lfh_size = file.lfh_size.ok_or_else(|| {
+                    EngineError::Msix(format!(
+                        "AppxBlockMap.xml File {:?} is missing LfhSize, required for delta layout",
+                        file.name
+                    ))
+                })?;
+                let data_offset = entry.local_header_offset + lfh_size;
+                let mut offset = data_offset;
+                let blocks = file
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        let resolved = ResolvedBlock {
+                            hash_base64: block.hash_base64.clone(),
+                            size: block.size,
+                            offset,
+                        };
+                        offset += block.size;
+                        resolved
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ResolvedBlockMapFile {
+                    lfh_size,
+                    data_offset,
+                    block_data_size: file.block_data_size(),
+                    blocks,
                 })
-                .collect::<Vec<_>>();
-            ResolvedBlockMapFile {
-                lfh_size: file.lfh_size,
-                data_offset,
-                block_data_size: file.block_data_size(),
-                blocks,
-            }
-        });
+            })
+            .transpose()?;
 
         files.push(ResolvedFile {
             name: entry.name.clone(),
@@ -262,7 +274,7 @@ mod tests {
         AppxBlockMapFile {
             name: name.to_string(),
             uncompressed_size: usize_,
-            lfh_size,
+            lfh_size: Some(lfh_size),
             blocks: blocks
                 .iter()
                 .map(|(hash, size)| appx_blockmap::AppxBlock {

@@ -261,7 +261,7 @@ mod tests {
             files: vec![AppxBlockMapFile {
                 name: name.replace('/', "\\"),
                 uncompressed_size: csize * 2,
-                lfh_size,
+                lfh_size: Some(lfh_size),
                 blocks,
             }],
         };
