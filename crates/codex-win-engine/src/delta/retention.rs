@@ -67,6 +67,16 @@ pub const BASE_SHA256_FILE_NAME: &str = "delta-base.sha256";
 /// onto the fixed [`BASE_FILE_NAME`] once fully written, so a crash or a
 /// disk-full error partway through never leaves a truncated file at the
 /// name a future update would trust.
+///
+/// The previous sidecar checksum is removed *before* the new base is
+/// renamed into place, and the new sidecar is written *after* -- never the
+/// reverse. A crash (or disk-full error) between those two steps therefore
+/// always leaves either the still-consistent previous (base, sha256) pair
+/// intact (nothing renamed yet) or a base file with no sidecar at all,
+/// which [`retained_base`] treats as "no usable base". The one ordering
+/// this rules out is the unsafe one: a *new* base ever left paired with the
+/// *previous* base's sidecar, which [`retained_base`] would otherwise hand
+/// out as a usable pair despite the checksum belonging to different bytes.
 pub fn retain_verified_base(
     base_dir: &Path,
     verified_msix: &Path,
@@ -75,12 +85,15 @@ pub fn retain_verified_base(
     std::fs::create_dir_all(base_dir)?;
     let dest = base_dir.join(BASE_FILE_NAME);
     let tmp = base_dir.join(format!("{BASE_FILE_NAME}.tmp"));
+    let sha_path = base_dir.join(BASE_SHA256_FILE_NAME);
     std::fs::copy(verified_msix, &tmp)?;
+    match std::fs::remove_file(&sha_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
     std::fs::rename(&tmp, &dest)?;
-    // Written last: if this fails, `retained_base` below still refuses the
-    // (now base-only, sha-less) directory rather than trusting a base with
-    // no recorded checksum.
-    std::fs::write(base_dir.join(BASE_SHA256_FILE_NAME), sha256.trim())?;
+    std::fs::write(&sha_path, sha256.trim())?;
     Ok(dest)
 }
 
@@ -182,6 +195,34 @@ mod tests {
         let (path, sha256) = retained_base(&base_dir).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"version two, longer content");
         assert_eq!(sha256, "hash-two");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn a_replace_interrupted_before_the_new_sidecar_is_written_is_not_usable() {
+        let base_dir = temp_dir("interrupted-replace");
+        let source_dir = temp_dir("interrupted-replace-source");
+        let first = source_dir.join("first.msix");
+        let second = source_dir.join("second.msix");
+        std::fs::write(&first, b"version one").unwrap();
+        std::fs::write(&second, b"version two").unwrap();
+
+        retain_verified_base(&base_dir, &first, "hash-one").unwrap();
+
+        // Replay `retain_verified_base`'s first two steps for the second
+        // call (copy the new content into place, drop the old sidecar) but
+        // stop short of writing the new sidecar -- simulating a crash right
+        // there. The old sidecar's value ("hash-one") must never come back
+        // out paired with the new base's bytes.
+        std::fs::copy(&second, base_dir.join(BASE_FILE_NAME)).unwrap();
+        std::fs::remove_file(base_dir.join(BASE_SHA256_FILE_NAME)).unwrap();
+
+        assert!(
+            retained_base(&base_dir).is_none(),
+            "an interrupted replace must never surface a (new base, stale sha256) pair"
+        );
 
         std::fs::remove_dir_all(&base_dir).ok();
         std::fs::remove_dir_all(&source_dir).ok();

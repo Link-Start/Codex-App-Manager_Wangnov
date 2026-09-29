@@ -386,11 +386,15 @@ impl RangeFetcher for CurlRangeFetcher<'_> {
             ],
             RunLimits::with_stall(Duration::from_secs(30 * 60), Duration::from_secs(90)),
         );
-        result?;
-        let data = std::fs::read(&body)
-            .map_err(|err| EngineError::Io(format!("read fetched range: {err}")))?;
+        // Clean up the temp file on every path -- a failed or timed-out curl
+        // invocation can still have written a partial body before erroring,
+        // and repeated failed delta attempts must not accumulate large
+        // partial-range files in `tmp_dir`.
+        let read_result = result.map(|_| ()).and_then(|()| {
+            std::fs::read(&body).map_err(|err| EngineError::Io(format!("read fetched range: {err}")))
+        });
         let _ = std::fs::remove_file(&body);
-        Ok(data)
+        read_result
     }
 }
 
