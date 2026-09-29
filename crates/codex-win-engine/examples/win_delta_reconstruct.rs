@@ -134,7 +134,7 @@ fn main() -> ExitCode {
             );
             println!(
                 "  curl invocations:   {}",
-                outcome.request_count + outcome.retry_stats.retries + outcome.retry_stats.re_resolves
+                outcome.request_count + outcome.retry_stats.retries + 2 * outcome.retry_stats.re_resolves
             );
             println!(
                 "  blocks reused:      {} of {} (base blocks hash-verified before fetching: {})",

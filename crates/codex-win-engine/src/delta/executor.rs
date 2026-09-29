@@ -183,7 +183,8 @@ pub struct DeltaOutcome {
     /// in tests): the length probe plus every layout-probing and planned
     /// range fetch. Retried and re-resolve requests are reported separately
     /// in [`retry_stats`](Self::retry_stats); total curl invocations are
-    /// `request_count + retry_stats.retries + retry_stats.re_resolves`.
+    /// `request_count + retry_stats.retries + 2 * retry_stats.re_resolves` (each
+    /// re-resolve is the rejected HTTP 403 range request plus the fresh probe).
     pub request_count: usize,
     /// Retries after transient failures and URL re-resolutions.
     pub retry_stats: RetryStats,
