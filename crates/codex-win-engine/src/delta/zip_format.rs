@@ -167,12 +167,19 @@ fn parse_eocd(tail: &[u8], tail_base: u64) -> Result<EocdInfo, EngineError> {
     let mut central_directory_size = u32_le(tail, eocd_pos + 12) as u64;
     let mut central_directory_offset = u32_le(tail, eocd_pos + 16) as u64;
 
-    if let Some(locator_pos) = rfind(&tail[..eocd_pos], &ZIP64_EOCD_LOCATOR_SIGNATURE) {
-        if tail.len() - locator_pos < 20 {
-            return Err(EngineError::Msix(
-                "ZIP64 EOCD locator is truncated".to_string(),
-            ));
-        }
+    // The ZIP64 EOCD Locator is a fixed 20-byte record whose position is
+    // defined by the spec, not discovered by search: it sits immediately
+    // before the (classic) EOCD record this function just found. Checking
+    // only that fixed position -- rather than searching backward for the
+    // 4-byte signature anywhere earlier in `tail` -- avoids mistaking an
+    // unrelated occurrence of those same four bytes inside an ordinary
+    // (non-ZIP64) archive's payload or central directory for a locator that
+    // isn't actually there, which would otherwise misread bogus ZIP64
+    // fields or reject an entirely valid classic ZIP.
+    let locator_pos = eocd_pos
+        .checked_sub(20)
+        .filter(|&pos| tail[pos..pos + 4] == ZIP64_EOCD_LOCATOR_SIGNATURE);
+    if let Some(locator_pos) = locator_pos {
         let zip64_eocd_offset = u64_le(tail, locator_pos + 8);
         if zip64_eocd_offset < tail_base {
             return Err(EngineError::Msix(format!(
