@@ -50,8 +50,17 @@ impl ByteSource for InMemorySource<'_> {
             .map_err(|_| EngineError::Msix("zip range start overflows usize".to_string()))?;
         let len = usize::try_from(len)
             .map_err(|_| EngineError::Msix("zip range length overflows usize".to_string()))?;
+        // `start` and `len` individually fit `usize` here, but their *sum*
+        // can still overflow it (both are derived from ZIP/AppxBlockMap
+        // offsets and sizes, which are untrusted package bytes on a corrupt
+        // base or remote layout) -- a plain `start + len` would then panic
+        // in a debug build instead of falling through to the ordinary
+        // out-of-bounds `Err` below.
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| EngineError::Msix("zip range end overflows usize".to_string()))?;
         self.data
-            .get(start..start + len)
+            .get(start..end)
             .map(|slice| slice.to_vec())
             .ok_or_else(|| {
                 EngineError::Msix(format!(
@@ -188,12 +197,22 @@ fn parse_eocd(tail: &[u8], tail_base: u64) -> Result<EocdInfo, EngineError> {
         }
         let relative = usize::try_from(zip64_eocd_offset - tail_base)
             .map_err(|_| EngineError::Msix("ZIP64 EOCD offset overflows usize".to_string()))?;
-        if tail.len() < relative + 56 {
-            return Err(EngineError::Msix(
-                "ZIP64 EOCD record is truncated in the fetched tail".to_string(),
-            ));
-        }
-        let record = &tail[relative..relative + 56];
+        // `relative + 56` on a `relative` derived from attacker/corruption-
+        // controlled package bytes could otherwise overflow `usize` before
+        // this ever gets to compare against `tail.len()` -- a debug-build
+        // panic (this crate's tests, and any debug build of the app) rather
+        // than the intended clean `Err` that lets the caller fall back to a
+        // full download. Compare via a checked add instead of computing the
+        // end offset unchecked.
+        let record_end = match relative.checked_add(56) {
+            Some(end) if end <= tail.len() => end,
+            _ => {
+                return Err(EngineError::Msix(
+                    "ZIP64 EOCD record is truncated in the fetched tail".to_string(),
+                ))
+            }
+        };
+        let record = &tail[relative..record_end];
         if record[0..4] != ZIP64_EOCD_RECORD_SIGNATURE {
             return Err(EngineError::Msix(
                 "ZIP64 EOCD locator points at a bad signature".to_string(),
@@ -355,7 +374,16 @@ pub fn parse_zip_layout<S: ByteSource>(source: &S) -> Result<ZipLayout, EngineEr
         }
     };
 
-    if eocd.central_directory_offset + eocd.central_directory_size > total_size {
+    // Same overflow hazard as the ZIP64 record bounds check above: both
+    // operands come straight from package bytes (local or remote,
+    // untrusted either way), so a corrupt EOCD declaring values near
+    // `u64::MAX` must not be able to wrap this addition into a
+    // false-negative bounds check -- or, in a debug build, panic instead of
+    // returning the `Err` that lets the caller fall back to a full download.
+    let central_directory_end = eocd
+        .central_directory_offset
+        .checked_add(eocd.central_directory_size);
+    if central_directory_end.is_none_or(|end| end > total_size) {
         return Err(EngineError::Msix(format!(
             "central directory (offset={} size={}) extends past end of file ({total_size} bytes)",
             eocd.central_directory_offset, eocd.central_directory_size
@@ -773,5 +801,31 @@ mod tests {
             b"zip64-payload-bytes".len() as u64
         );
         assert!(layout.entries[1].local_header_offset > 0);
+    }
+
+    /// A ZIP64 EOCD locator's offset field is 8 bytes read straight out of
+    /// untrusted package bytes (local base file or remote metadata alike).
+    /// A corrupt package declaring a value near `u64::MAX` must fail
+    /// cleanly with `Err` -- never panic on an unchecked `relative + 56` --
+    /// so `execute_delta`'s caller still gets the fall-back-to-full-download
+    /// signal instead of the whole process aborting.
+    #[test]
+    fn a_zip64_locator_offset_near_u64_max_fails_closed_instead_of_overflowing() {
+        let mut data = build_zip64(&[("big/one.bin", b"zip64-payload-bytes"), ("two.bin", b"more")]);
+        let locator_pos = data
+            .windows(ZIP64_EOCD_LOCATOR_SIGNATURE.len())
+            .rposition(|window| window == ZIP64_EOCD_LOCATOR_SIGNATURE)
+            .expect("build_zip64 always writes a ZIP64 EOCD locator");
+        // Bytes [locator_pos+8 .. locator_pos+16] are the locator's 8-byte
+        // little-endian "offset of the ZIP64 EOCD record" field (after the
+        // 4-byte signature + 4-byte disk-number fields).
+        data[locator_pos + 8..locator_pos + 16].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+        let source = InMemorySource::new(&data);
+        let err = parse_zip_layout(&source).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("zip64")
+                || err.to_string().to_lowercase().contains("overflow"),
+            "unexpected error: {err}"
+        );
     }
 }
