@@ -10,16 +10,31 @@
 //! in-memory fetcher and exercise the full plan-then-assemble-then-verify
 //! pipeline with no network and no real curl binary required.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::delta::layout::build_package_layout;
+use crate::delta::layout::{build_package_layout, PackageLayout};
 use crate::delta::planner::{build_reuse_index, plan_delta, DeltaPlan, PlannerConfig};
 use crate::delta::zip_format::{ByteSource, InMemorySource};
 pub use crate::delta::http::{CurlRangeFetcher, RetryPolicy, RetryStats};
 use crate::EngineError;
+
+/// Prefix of every error that means "the local base package itself is bad"
+/// (unparseable, or a reused block fails its own `AppxBlockMap.xml` hash).
+/// Unlike a network failure this will fail identically on the next attempt,
+/// so a caller should drop the retained base
+/// ([`crate::delta::retention::clear_retained_base`]) when
+/// [`is_corrupt_base_error`] is `true`, then fall back to the full download.
+pub const CORRUPT_BASE_PREFIX: &str = "corrupt delta base:";
+
+/// `true` when `err` reports a bad local base package (see
+/// [`CORRUPT_BASE_PREFIX`]).
+pub fn is_corrupt_base_error(err: &EngineError) -> bool {
+    matches!(err, EngineError::Msix(message) if message.starts_with(CORRUPT_BASE_PREFIX))
+}
 
 /// Anything the delta engine can pull an arbitrary byte range from. Kept
 /// separate from [`ByteSource`] (which never fails to know its own length)
@@ -145,7 +160,15 @@ impl<F: RangeFetcher> ByteSource for FetcherSource<'_, F> {
     }
 
     fn read_range(&self, start: u64, len: u64) -> Result<Vec<u8>, EngineError> {
-        self.fetcher.fetch_range(start, len)
+        // Offsets come from the (untrusted) remote central directory: refuse
+        // a range outside the resource before it becomes a request.
+        match start.checked_add(len) {
+            Some(end) if end <= self.len => self.fetcher.fetch_range(start, len),
+            _ => Err(EngineError::Msix(format!(
+                "remote range {start}+{len} lies outside the {} byte package",
+                self.len
+            ))),
+        }
     }
 }
 
@@ -170,6 +193,14 @@ pub struct DeltaOutcome {
     /// [`DeltaPlan::savings_pct`] for the plan that was executed.
     pub savings_pct: f64,
     pub new_size: u64,
+    /// Blocks of the new package described by its block map.
+    pub total_blocks: usize,
+    /// Of those, blocks copied from the base (not fetched).
+    pub reused_blocks: usize,
+    /// Distinct base blocks whose content was checked against their
+    /// `AppxBlockMap.xml` hash before any bulk fetch (see
+    /// [`execute_delta`]).
+    pub verified_base_blocks: usize,
 }
 
 /// Plan and execute a block-level delta reconstruction of `dest_path` from
@@ -231,7 +262,11 @@ pub fn execute_delta<F: RangeFetcher>(
         .map_err(|err| EngineError::Io(format!("read base {}: {err}", base_path.display())))?;
     let base_source = InMemorySource::new(&base_bytes);
     let base_layout = build_package_layout(&base_source)
-        .map_err(|err| EngineError::Msix(format!("base package is unusable as a delta base: {err}")))?;
+        .map_err(|err| {
+            EngineError::Msix(format!(
+                "{CORRUPT_BASE_PREFIX} base package is unusable as a delta base: {err}"
+            ))
+        })?;
 
     let counting = CountingFetcher::new(new_fetcher);
     let remote_source = FetcherSource::new(&counting)?;
@@ -247,6 +282,14 @@ pub fn execute_delta<F: RangeFetcher>(
             plan.total_blocks,
         )));
     }
+
+    // Before spending bandwidth, prove the base blocks about to be copied are
+    // intact: the final whole-file SHA-256 would catch a flipped byte too, but
+    // only after every changed range had been downloaded (a bad base would
+    // then cost the delta bytes plus the whole full download). Only reused
+    // blocks are checked, each distinct block once.
+    let verified_base_blocks =
+        verify_reused_base_blocks(&base_layout, &base_bytes, &new_layout, &reuse_index)?;
 
     // Assemble and verify in an independent staging file next to
     // `dest_path` (so the final rename below stays on one filesystem),
@@ -299,7 +342,95 @@ pub fn execute_delta<F: RangeFetcher>(
         sha256: actual_sha256,
         savings_pct: plan.savings_pct(),
         new_size: plan.new_size,
+        total_blocks: plan.total_blocks,
+        reused_blocks: plan.reused_blocks,
+        verified_base_blocks,
     })
+}
+
+/// Check every base block the plan would reuse against the SHA-256 the base's
+/// own `AppxBlockMap.xml` declares for it (inflating deflated blocks first:
+/// the hash covers the uncompressed bytes). A mismatch means the retained
+/// base is silently corrupt; the error is a [`is_corrupt_base_error`] one.
+/// Returns the number of distinct blocks checked.
+fn verify_reused_base_blocks(
+    base_layout: &PackageLayout,
+    base_bytes: &[u8],
+    new_layout: &PackageLayout,
+    reuse_index: &HashMap<(String, u64), u64>,
+) -> Result<usize, EngineError> {
+    let needed: HashSet<(&str, u64)> = new_layout
+        .files
+        .iter()
+        .filter_map(|file| file.block_map_file.as_ref())
+        .flat_map(|file| file.blocks.iter())
+        .filter(|block| reuse_index.contains_key(&(block.hash_base64.clone(), block.size)))
+        .map(|block| (block.hash_base64.as_str(), block.size))
+        .collect();
+
+    let mut verified: HashSet<(&str, u64)> = HashSet::new();
+    for file in &base_layout.files {
+        let Some(block_map_file) = &file.block_map_file else {
+            continue;
+        };
+        for (index, block) in block_map_file.blocks.iter().enumerate() {
+            let key = (block.hash_base64.as_str(), block.size);
+            // First occurrence only: that is the one `build_reuse_index`
+            // (and therefore the copy step) points at.
+            if !needed.contains(&key) || !verified.insert(key) {
+                continue;
+            }
+            let corrupt = |why: String| {
+                EngineError::Msix(format!(
+                    "{CORRUPT_BASE_PREFIX} block {index} of {:?} at base offset {} {why}",
+                    file.name, block.offset
+                ))
+            };
+            let slice = usize::try_from(block.offset)
+                .ok()
+                .zip(usize::try_from(block.size).ok())
+                .and_then(|(start, len)| base_bytes.get(start..start.checked_add(len)?))
+                .ok_or_else(|| corrupt("lies outside the base file".to_string()))?;
+            let actual = if block.stored {
+                sha256_base64(slice)
+            } else {
+                sha256_base64(&inflate_block(slice).map_err(|err| corrupt(format!("does not inflate ({err})")))?)
+            };
+            if actual != block.hash_base64 {
+                return Err(corrupt("does not match its AppxBlockMap hash".to_string()));
+            }
+        }
+    }
+    Ok(verified.len())
+}
+
+/// Inflate one independent raw-deflate block (bounded: a corrupt stream must
+/// not balloon memory; real blocks are 64 KiB uncompressed).
+fn inflate_block(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const MAX_BLOCK_UNCOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+    let mut out = Vec::new();
+    flate2::read::DeflateDecoder::new(data)
+        .take(MAX_BLOCK_UNCOMPRESSED_BYTES)
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn sha256_base64(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(44);
+    for chunk in digest.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 fn assemble<F: RangeFetcher>(
@@ -393,7 +524,6 @@ mod tests {
 
     struct BlockSpec {
         content: Vec<u8>,
-        hash: &'static str,
         /// `true`: independently deflate this block's bytes (mirrors real
         /// MSIX block compression -- every 64 KiB chunk is its own deflate
         /// stream). `false`: store the raw bytes, matching how
@@ -440,6 +570,10 @@ mod tests {
             let mut method = 0u16;
             let mut block_xml = String::new();
             for block in &file.blocks {
+                // The real block hash (SHA-256 of the uncompressed content,
+                // base64), as in a real AppxBlockMap.xml: the executor
+                // verifies reused base blocks against it.
+                let block_hash = sha256_base64(&block.content);
                 usize_total += block.content.len() as u64;
                 let on_disk = if block.compress {
                     method = 8;
@@ -450,11 +584,11 @@ mod tests {
                 if block.compress {
                     block_xml.push_str(&format!(
                         "    <Block Hash=\"{}\" Size=\"{}\" />\n",
-                        block.hash,
+                        block_hash,
                         on_disk.len()
                     ));
                 } else {
-                    block_xml.push_str(&format!("    <Block Hash=\"{}\" />\n", block.hash));
+                    block_xml.push_str(&format!("    <Block Hash=\"{}\" />\n", block_hash));
                 }
                 data.extend_from_slice(&on_disk);
             }
@@ -616,9 +750,9 @@ mod tests {
         let base = build_package(&[FileSpec {
             name: "app/chrome.dll",
             blocks: vec![
-                BlockSpec { content: unchanged_1.clone(), hash: "h-unchanged-1", compress: true },
-                BlockSpec { content: old_block_2, hash: "h-will-change", compress: true },
-                BlockSpec { content: unchanged_2.clone(), hash: "h-unchanged-2", compress: true },
+                BlockSpec { content: unchanged_1.clone(), compress: true },
+                BlockSpec { content: old_block_2, compress: true },
+                BlockSpec { content: unchanged_2.clone(), compress: true },
             ],
         }]);
         // New: block 2 changed (Codex's own rebuilt payload, per the
@@ -628,14 +762,14 @@ mod tests {
             FileSpec {
                 name: "app/chrome.dll",
                 blocks: vec![
-                    BlockSpec { content: unchanged_1, hash: "h-unchanged-1", compress: true },
-                    BlockSpec { content: new_block_2, hash: "h-changed-now", compress: true },
-                    BlockSpec { content: unchanged_2, hash: "h-unchanged-2", compress: true },
+                    BlockSpec { content: unchanged_1, compress: true },
+                    BlockSpec { content: new_block_2, compress: true },
+                    BlockSpec { content: unchanged_2, compress: true },
                 ],
             },
             FileSpec {
                 name: "app/resources/new-file.bin",
-                blocks: vec![BlockSpec { content: vec![0xEE; 1_000], hash: "h-brand-new", compress: false }],
+                blocks: vec![BlockSpec { content: vec![0xEE; 1_000], compress: false }],
             },
         ]);
 
@@ -695,7 +829,6 @@ mod tests {
                         let changed = h.ends_with("-new");
                         BlockSpec {
                             content: filler(i as u32 + if changed { seed_shift } else { 0 }, BLOCK_LEN),
-                            hash: h,
                             compress: true,
                         }
                     })
@@ -756,11 +889,11 @@ mod tests {
 
         let base = build_package(&[FileSpec {
             name: "app/a.bin",
-            blocks: vec![BlockSpec { content: filler(1, 100_000), hash: "h1", compress: true }],
+            blocks: vec![BlockSpec { content: filler(1, 100_000), compress: true }],
         }]);
         let new_pkg = build_package(&[FileSpec {
             name: "app/a.bin",
-            blocks: vec![BlockSpec { content: filler(2, 100_000), hash: "h2", compress: true }],
+            blocks: vec![BlockSpec { content: filler(2, 100_000), compress: true }],
         }]);
         let base_path = write_temp_file("throttled-base", &base);
         let dest_path = std::env::temp_dir().join(format!(
@@ -793,7 +926,7 @@ mod tests {
         let base_path = write_temp_file("corrupt-base", b"this is not a zip file at all");
         let new_pkg = build_package(&[FileSpec {
             name: "app/a.bin",
-            blocks: vec![BlockSpec { content: vec![1u8; 1_000], hash: "h1", compress: false }],
+            blocks: vec![BlockSpec { content: vec![1u8; 1_000], compress: false }],
         }]);
         let dest_path = std::env::temp_dir().join(format!(
             "codex-win-engine-executor-test-dest-corrupt-{}-{}.msix",
@@ -837,7 +970,7 @@ mod tests {
         let base_path = write_temp_file("alias-base", &base_content);
         let new_pkg = build_package(&[FileSpec {
             name: "app/a.bin",
-            blocks: vec![BlockSpec { content: vec![1u8; 1_000], hash: "h1", compress: false }],
+            blocks: vec![BlockSpec { content: vec![1u8; 1_000], compress: false }],
         }]);
         let expected_sha256 = sha256_hex(&new_pkg);
         let fetcher = FakeFetcher { data: new_pkg };
@@ -881,7 +1014,7 @@ mod tests {
         // `base_path` as a ZIP/AppxBlockMap layout before anything else.
         let base_content = build_package(&[FileSpec {
             name: "app/original.bin",
-            blocks: vec![BlockSpec { content: vec![1u8; 1_000], hash: "h-original", compress: false }],
+            blocks: vec![BlockSpec { content: vec![1u8; 1_000], compress: false }],
         }]);
         let base_path = write_temp_file("hardlink-base", &base_content);
         let dest_path = std::env::temp_dir().join(format!(
@@ -893,7 +1026,7 @@ mod tests {
 
         let new_pkg = build_package(&[FileSpec {
             name: "app/a.bin",
-            blocks: vec![BlockSpec { content: vec![2u8; 1_000], hash: "h1", compress: false }],
+            blocks: vec![BlockSpec { content: vec![2u8; 1_000], compress: false }],
         }]);
         let expected_sha256 = sha256_hex(&new_pkg);
         let fetcher = FakeFetcher { data: new_pkg.clone() };
@@ -925,7 +1058,7 @@ mod tests {
         // file on failure, never `dest_path`.
         let base_content = build_package(&[FileSpec {
             name: "app/original.bin",
-            blocks: vec![BlockSpec { content: vec![1u8; 1_000], hash: "h-original", compress: false }],
+            blocks: vec![BlockSpec { content: vec![1u8; 1_000], compress: false }],
         }]);
         let base_path = write_temp_file("hardlink-base-fail", &base_content);
         let dest_path = std::env::temp_dir().join(format!(
@@ -937,7 +1070,7 @@ mod tests {
 
         let new_pkg = build_package(&[FileSpec {
             name: "app/a.bin",
-            blocks: vec![BlockSpec { content: vec![3u8; 1_000], hash: "h1", compress: false }],
+            blocks: vec![BlockSpec { content: vec![3u8; 1_000], compress: false }],
         }]);
         let fetcher = FakeFetcher { data: new_pkg };
 
@@ -968,6 +1101,107 @@ mod tests {
     }
 
     #[test]
+    fn a_valid_base_with_a_flipped_block_byte_is_rejected_before_any_bulk_fetch() {
+        use crate::delta::http::test_support::{new_session, FakeTransport};
+
+        // Structurally valid base (parses fine, layout and block map agree)
+        // whose reused blocks have silent bit rot: one stored block and one
+        // deflated block are corrupted in turn. Both must be caught by the
+        // per-block hash check *before* the changed range is downloaded.
+        let unchanged_stored = filler(11, 40_000);
+        let unchanged_deflated = filler(12, 40_000);
+        let old_changed = filler(13, 200_000);
+        let new_changed = filler(14, 200_000);
+        // The builder uses one compression method per entry, so the stored
+        // and the deflated reused block live in separate files.
+        let files = |changed: Vec<u8>| {
+            [
+                FileSpec {
+                    name: "app/stored.bin",
+                    blocks: vec![BlockSpec { content: unchanged_stored.clone(), compress: false }],
+                },
+                FileSpec {
+                    name: "app/deflated.bin",
+                    blocks: vec![BlockSpec { content: unchanged_deflated.clone(), compress: true }],
+                },
+                FileSpec { name: "app/changed.bin", blocks: vec![BlockSpec { content: changed, compress: true }] },
+            ]
+        };
+        let base = build_package(&files(old_changed));
+        let new_pkg = build_package(&files(new_changed));
+        let expected_sha256 = sha256_hex(&new_pkg);
+
+        // Locate the on-disk bytes of both reused blocks in the base.
+        let layout = build_package_layout(&InMemorySource::new(&base)).unwrap();
+        let block_offset = |name: &str| {
+            layout
+                .files
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap()
+                .block_map_file
+                .as_ref()
+                .unwrap()
+                .blocks[0]
+                .offset as usize
+        };
+
+        // Control: the pristine base reconstructs, and both reused blocks
+        // were verified.
+        let pristine_path = write_temp_file("pristine-base", &base);
+        let dest_ok = std::env::temp_dir().join(format!("codex-win-executor-pristine-{}.msix", uuid::Uuid::new_v4()));
+        let (pristine_session, _) = new_session(FakeTransport::new(new_pkg.clone(), false), RetryPolicy::none());
+        let outcome = execute_delta(
+            &pristine_path,
+            &pristine_session,
+            &dest_ok,
+            &expected_sha256,
+            &PlannerConfig { coalesce_gap: 0 },
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(outcome.reused_blocks, 2);
+        assert_eq!(outcome.verified_base_blocks, 2);
+        assert_eq!(std::fs::read(&dest_ok).unwrap(), new_pkg);
+        // Requests a successful run makes: layout probes plus plan fetches.
+        let pristine_requests = pristine_session.transport().range_calls().len();
+        let _ = std::fs::remove_file(&pristine_path);
+        let _ = std::fs::remove_file(&dest_ok);
+
+        for (label, flip_at) in [
+            ("stored", block_offset("app/stored.bin") + 100),
+            ("deflated", block_offset("app/deflated.bin") + 100),
+        ] {
+            let mut corrupt = base.clone();
+            corrupt[flip_at] ^= 0xFF;
+            let base_path = write_temp_file(&format!("bitrot-base-{label}"), &corrupt);
+            let dest_path = std::env::temp_dir().join(format!("codex-win-executor-bitrot-{}.msix", uuid::Uuid::new_v4()));
+
+            // A transport that counts requests, to prove no bulk fetch ran.
+            let (session, _) = new_session(FakeTransport::new(new_pkg.clone(), false), RetryPolicy::none());
+            let err = execute_delta(
+                &base_path,
+                &session,
+                &dest_path,
+                &expected_sha256,
+                &PlannerConfig { coalesce_gap: 0 },
+                0.0,
+            )
+            .unwrap_err();
+            assert!(is_corrupt_base_error(&err), "{label}: {err}");
+            assert!(!dest_path.exists());
+            // Only the layout probes ran; none of the plan's fetches did.
+            let requests = session.transport().range_calls().len();
+            assert!(
+                requests < pristine_requests,
+                "{label}: {requests} requests, a pristine run makes {pristine_requests}: the plan must not be fetched for a corrupt base"
+            );
+
+            let _ = std::fs::remove_file(&base_path);
+        }
+    }
+
+    #[test]
     fn a_block_whose_compression_changed_is_fetched_fresh_not_reused() {
         // Base stores this file's payload uncompressed (`stored`); the new
         // package block-compresses the very same logical content. Per the
@@ -980,11 +1214,11 @@ mod tests {
         let payload = vec![0x42; 50_000];
         let base = build_package(&[FileSpec {
             name: "app/codex.exe",
-            blocks: vec![BlockSpec { content: payload.clone(), hash: "h-stored", compress: false }],
+            blocks: vec![BlockSpec { content: payload.clone(), compress: false }],
         }]);
         let new_pkg = build_package(&[FileSpec {
             name: "app/codex.exe",
-            blocks: vec![BlockSpec { content: payload, hash: "h-deflated", compress: true }],
+            blocks: vec![BlockSpec { content: payload, compress: true }],
         }]);
 
         let base_path = write_temp_file("recompressed-base", &base);
@@ -1011,9 +1245,21 @@ mod tests {
 
         assert_eq!(std::fs::read(&dest_path).unwrap(), new_pkg);
         assert_eq!(outcome.sha256, expected_sha256);
-        // The payload was entirely re-fetched -- reused_blocks would be 0 in
-        // the underlying plan; observable here as fetched bytes covering
-        // essentially the whole new package.
+        // The block hash is over the *uncompressed* content, so both
+        // packages describe this block with the very same hash (asserted
+        // below) and only the on-disk size differs. Reuse must therefore be
+        // refused on the size half of the (hash, size) key: 0 blocks reused,
+        // and the payload is fetched (fetched bytes cover essentially the
+        // whole new package).
+        let base_layout = build_package_layout(&InMemorySource::new(&base)).unwrap();
+        let new_layout = build_package_layout(&InMemorySource::new(&new_pkg)).unwrap();
+        let base_block = &base_layout.files[0].block_map_file.as_ref().unwrap().blocks[0];
+        let new_block = &new_layout.files[0].block_map_file.as_ref().unwrap().blocks[0];
+        assert_eq!(base_block.hash_base64, new_block.hash_base64, "same content, same hash");
+        assert_ne!(base_block.size, new_block.size, "stored vs deflated: different on-disk size");
+        assert_eq!(outcome.total_blocks, 1);
+        assert_eq!(outcome.reused_blocks, 0, "a hash-only key would (wrongly) reuse the stored bytes");
+        assert_eq!(outcome.verified_base_blocks, 0);
         assert!(outcome.bytes_fetched as f64 >= new_pkg.len() as f64 * 0.9);
 
         let _ = std::fs::remove_file(&base_path);

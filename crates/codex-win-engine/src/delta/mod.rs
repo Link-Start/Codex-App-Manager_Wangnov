@@ -22,7 +22,9 @@
 //!     re-resolving once on an expired presign (403), and retries 429/503 (with
 //!     a capped `Retry-After`) and transient curl exits under a bounded budget.
 //!   - [`executor`]: runs a plan against a real ([`http::CurlRangeFetcher`])
-//!     or fake (tests) range source, assembles the new package in a staging file, and
+//!     or fake (tests) range source, verifies the base blocks it is about to
+//!     reuse against their own block-map hashes, assembles the new package in a
+//!     staging file, and
 //!     requires the assembled file's streamed SHA-256 to equal the value the
 //!     caller supplies (from the mirror manifest / `SHA256SUMS-windows.txt`)
 //!     before ever returning success. Any failure -- a plan not worth using,
@@ -30,14 +32,21 @@
 //!     is surfaced as an `Err` so the caller falls back to the existing full
 //!     download path; this module never partially "commits" a bad file.
 //!   - [`retention`]: keeps at most one verified MSIX on disk as the delta
-//!     base for the next update (see that module's doc comment for the disk
-//!     cost and where the app's update flow currently keeps/discards its
-//!     downloaded MSIX).
+//!     base for the next update. Its module docs record where the app's update
+//!     flow really deletes the downloaded MSIX (`clear_download_cache()`
+//!     right after a successful install, so retention must hook in *before*
+//!     that call and store the base outside `downloads/`), the hard-link
+//!     placement, and the disk cost.
 //!
 //! **Not wired into the app's update flow in this PR.** `perform_windows_update*`
 //! in `src-tauri/src/app/win_update.rs` still always does a full download; see
 //! the PR description for what integrating this would require and why it is
-//! deferred.
+//! deferred. Wiring prerequisites: hook retention before the post-install
+//! `clear_download_cache()`; pass the app's cancel flag through
+//! [`http::CurlRangeFetcher::with_cancel`] (without it a range request cannot
+//! be aborted for up to 30 minutes) and treat [`http::is_cancelled_error`] as
+//! "stop", not "fall back"; on [`executor::is_corrupt_base_error`] clear the
+//! retained base before falling back.
 
 pub mod executor;
 pub mod http;

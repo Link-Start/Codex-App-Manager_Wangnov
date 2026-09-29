@@ -21,6 +21,10 @@ pub struct ResolvedBlock {
     pub size: u64,
     /// Absolute byte offset of this block's on-disk data within the package.
     pub offset: u64,
+    /// `true` for a stored (uncompressed) block (`<Block>` without `Size`):
+    /// the on-disk bytes are the hashed content itself. Otherwise the block
+    /// is an independent raw-deflate stream whose inflated bytes are hashed.
+    pub stored: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +213,7 @@ pub fn resolve_package_layout(
                         hash_base64: block.hash_base64.clone(),
                         size: block.size,
                         offset,
+                        stored: block.stored,
                     });
                     offset = offset.checked_add(block.size).ok_or_else(|| {
                         EngineError::Msix(format!(

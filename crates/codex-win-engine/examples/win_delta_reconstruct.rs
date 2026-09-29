@@ -136,6 +136,10 @@ fn main() -> ExitCode {
                 "  curl invocations:   {}",
                 outcome.request_count + outcome.retry_stats.retries + outcome.retry_stats.re_resolves
             );
+            println!(
+                "  blocks reused:      {} of {} (base blocks hash-verified before fetching: {})",
+                outcome.reused_blocks, outcome.total_blocks, outcome.verified_base_blocks
+            );
             println!("  planned savings:    {:.2}%", outcome.savings_pct);
             println!(
                 "  actual savings:     {:.2}% (1 - bytes_fetched/new_size, includes layout-probing overhead)",

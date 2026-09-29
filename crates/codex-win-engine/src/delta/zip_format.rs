@@ -95,6 +95,10 @@ const ZIP64_EOCD_LOCATOR_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
 const ZIP64_EOCD_RECORD_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
 const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP64_EXTRA_FIELD_ID: u16 = 0x0001;
+/// Cap on the compressed size of an ancillary entry read in full through
+/// [`read_entry_decompressed`] (in practice only `AppxBlockMap.xml`, which is
+/// a few MB at most). Matches the 64 MiB uncompressed cap in `delta::layout`.
+const MAX_ANCILLARY_ENTRY_COMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Starting size of the tail fetched/scanned for the EOCD record. Real MSIX
 /// central directories observed in the feasibility study run well under this
@@ -417,6 +421,20 @@ pub fn local_header_size<S: ByteSource>(
     source: &S,
     entry: &CentralDirectoryEntry,
 ) -> Result<u64, EngineError> {
+    let header_end = entry.local_header_offset.checked_add(30).ok_or_else(|| {
+        EngineError::Msix(format!(
+            "ZIP entry {:?} has a local header offset that overflows",
+            entry.name
+        ))
+    })?;
+    if header_end > source.len() {
+        return Err(EngineError::Msix(format!(
+            "ZIP entry {:?} local header at {} is past the end of the package ({} bytes)",
+            entry.name,
+            entry.local_header_offset,
+            source.len()
+        )));
+    }
     let header = source.read_range(entry.local_header_offset, 30)?;
     let signature = u32_le(&header, 0);
     if signature != 0x0403_4b50 {
@@ -439,8 +457,37 @@ pub fn read_entry_decompressed<S: ByteSource>(
     source: &S,
     entry: &CentralDirectoryEntry,
 ) -> Result<Vec<u8>, EngineError> {
+    // Every operand is untrusted package metadata: bound the read before
+    // issuing it (a hostile central directory must yield an `Err`, not an
+    // overflow panic, a nonsense range request, or a huge download just to
+    // read a small ancillary entry).
+    if entry.compressed_size > MAX_ANCILLARY_ENTRY_COMPRESSED_BYTES {
+        return Err(EngineError::Msix(format!(
+            "ZIP entry {:?} has an unexpectedly large compressed size ({} bytes)",
+            entry.name, entry.compressed_size
+        )));
+    }
     let lfh_size = local_header_size(source, entry)?;
-    let raw = source.read_range(entry.local_header_offset + lfh_size, entry.compressed_size)?;
+    let data_start = entry.local_header_offset.checked_add(lfh_size).ok_or_else(|| {
+        EngineError::Msix(format!(
+            "ZIP entry {:?} has a local header offset that overflows",
+            entry.name
+        ))
+    })?;
+    let data_end = data_start.checked_add(entry.compressed_size).ok_or_else(|| {
+        EngineError::Msix(format!(
+            "ZIP entry {:?} has a compressed size that overflows its data offset",
+            entry.name
+        ))
+    })?;
+    if data_end > source.len() {
+        return Err(EngineError::Msix(format!(
+            "ZIP entry {:?} data ends at {data_end}, past the end of the package ({} bytes)",
+            entry.name,
+            source.len()
+        )));
+    }
+    let raw = source.read_range(data_start, entry.compressed_size)?;
     match entry.method {
         0 => Ok(raw),
         8 => inflate_raw_deflate(&raw, entry.uncompressed_size),
@@ -787,6 +834,37 @@ mod tests {
         assert_eq!(layout.entries[0].method, 8);
         let decoded = read_entry_decompressed(&source, &layout.entries[0]).unwrap();
         assert_eq!(decoded, content);
+    }
+
+    /// The central directory is untrusted: an entry with a local header
+    /// offset near `u64::MAX`, or a compressed size that is absurd or runs
+    /// past the package, must be a clean `Err` (never an overflow panic, a
+    /// nonsense range request, or a giant read just to fetch a small entry).
+    #[test]
+    fn read_entry_decompressed_rejects_hostile_offsets_and_sizes() {
+        let content = b"AppxBlockMap.xml content repeated ".repeat(200);
+        let data = build_zip_with_deflate_entry("AppxBlockMap.xml", &content);
+        let source = InMemorySource::new(&data);
+        let good = parse_zip_layout(&source).unwrap().entries[0].clone();
+
+        let hostile = [
+            CentralDirectoryEntry { local_header_offset: u64::MAX, ..good.clone() },
+            CentralDirectoryEntry { local_header_offset: u64::MAX - 10, ..good.clone() },
+            CentralDirectoryEntry { local_header_offset: data.len() as u64, ..good.clone() },
+            CentralDirectoryEntry { compressed_size: u64::MAX, ..good.clone() },
+            CentralDirectoryEntry { compressed_size: 1 << 40, ..good.clone() },
+            // Within the size cap but running past the end of the package.
+            CentralDirectoryEntry { compressed_size: data.len() as u64 + 1, ..good.clone() },
+        ];
+        for entry in &hostile {
+            assert!(
+                read_entry_decompressed(&source, entry).is_err(),
+                "should reject offset={} csize={}",
+                entry.local_header_offset,
+                entry.compressed_size
+            );
+        }
+        assert!(read_entry_decompressed(&source, &good).is_ok());
     }
 
     #[test]

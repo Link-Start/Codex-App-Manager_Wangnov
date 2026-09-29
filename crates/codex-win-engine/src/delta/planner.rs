@@ -355,6 +355,34 @@ mod tests {
     }
 
     #[test]
+    fn same_hash_but_different_on_disk_size_is_not_reused() {
+        // In a real MSIX the block hash covers the *uncompressed* bytes, so
+        // identical content re-compressed differently (or stored vs
+        // deflated) keeps its hash and only the on-disk size changes.
+        // Copying the base's bytes into that slot would produce the wrong
+        // encoding, so the reuse key must include the size, not just the hash.
+        let base = single_file_layout("app/a.bin", 0, 40, vec![block("h1", 100), block("h2", 200)]);
+        let new_layout = single_file_layout(
+            "app/a.bin",
+            0,
+            40,
+            // h1: same hash and size (reusable). h2: same hash, size differs.
+            vec![block("h1", 100), block("h2", 150)],
+        );
+        let reuse_index = build_reuse_index(&base);
+        assert!(reuse_index.contains_key(&("h2".to_string(), 200)));
+        assert!(!reuse_index.contains_key(&("h2".to_string(), 150)));
+
+        let plan = plan_delta(&reuse_index, &new_layout, &PlannerConfig { coalesce_gap: 0 });
+        assert_eq!(plan.total_blocks, 2);
+        assert_eq!(plan.reused_blocks, 1, "only the same-hash, same-size block is reused");
+        assert_eq!(plan.copies.len(), 1);
+        assert_eq!(plan.copies[0].len, 100);
+        // The size-mismatched block (new offsets 140..290) is fetched whole.
+        assert!(plan.fetches.iter().any(|f| f.offset <= 140 && f.offset + f.len >= 140 + 150));
+    }
+
+    #[test]
     fn ancillary_non_block_mapped_entries_are_always_fetched_whole() {
         let zip = ZipLayout {
             file_size: 2_000,

@@ -33,8 +33,9 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::delta::executor::RangeFetcher;
 use crate::network::{is_schannel_revocation_check_failure, NetworkConfig, SchannelRevocationCheck};
@@ -46,6 +47,54 @@ use crate::EngineError;
 /// 28 timeout, 35 TLS handshake / connection reset, 52 empty reply,
 /// 55 send error, 56 receive error.
 pub const TRANSIENT_CURL_EXITS: [i32; 8] = [6, 7, 18, 28, 35, 52, 55, 56];
+
+/// Message of the error returned when the caller's cancel flag stops a delta
+/// fetch. Use [`is_cancelled_error`] rather than matching the text.
+pub const CANCELLED_MESSAGE: &str = "delta fetch cancelled";
+
+/// `true` when `err` is the cancellation error of this module (the caller's
+/// cancel flag was raised), as opposed to a network/verification failure. A
+/// caller that wired a cancel flag should stop instead of falling back to a
+/// full download when this is the outcome.
+pub fn is_cancelled_error(err: &EngineError) -> bool {
+    matches!(err, EngineError::Io(message) if message == CANCELLED_MESSAGE)
+}
+
+fn cancelled_error() -> EngineError {
+    EngineError::Io(CANCELLED_MESSAGE.to_string())
+}
+
+/// Temp files (range bodies, header dumps) older than this that a killed
+/// process left in the temp dir are removed when a fetcher is created. Longer
+/// than the 30 minute per-request limit, so a live request is never touched.
+const STALE_TMP_AFTER: Duration = Duration::from_secs(60 * 60);
+const TMP_FILE_PREFIXES: [&str; 3] = ["delta-probe-body-", "delta-probe-headers-", "delta-range-"];
+
+/// Best-effort removal of stale temp files from an earlier process that was
+/// killed mid-request (normal paths always remove their own).
+fn sweep_stale_tmp_files(tmp_dir: &Path, older_than: Duration) {
+    let Ok(entries) = std::fs::read_dir(tmp_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !TMP_FILE_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|meta| meta.is_file())
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= older_than);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 /// HTTP statuses worth retrying after a pause.
 const TRANSIENT_HTTP_STATUSES: [u16; 5] = [408, 429, 502, 503, 504];
@@ -189,6 +238,12 @@ pub trait RangeTransport {
     /// and return its path; the caller removes it. Must verify the response
     /// really is the `206` for that range. On error, leaves no file behind.
     fn get_range(&self, url: &str, offset: u64, len: u64) -> Result<PathBuf, AttemptError>;
+    /// `true` once the caller asked to stop. Checked between attempts (and
+    /// before every backoff wait); an in-flight request is stopped by the
+    /// transport itself. Defaults to never cancelled.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 struct SessionState {
@@ -289,6 +344,9 @@ impl<T: RangeTransport> RangeSession<T> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            if self.transport.is_cancelled() {
+                return Err(cancelled_error());
+            }
             let url = if for_probe {
                 self.original_url.clone()
             } else {
@@ -338,6 +396,9 @@ impl<T: RangeTransport> RangeSession<T> {
                 )));
             }
             (self.sleeper)(self.policy.delay_for(attempt, err.retry_after()));
+            if self.transport.is_cancelled() {
+                return Err(cancelled_error());
+            }
         }
     }
 
@@ -363,6 +424,13 @@ impl<T: RangeTransport> RangeSession<T> {
     }
 
     fn fetch_to_temp_file(&self, offset: u64, len: u64) -> Result<PathBuf, EngineError> {
+        // Offsets and lengths derive from untrusted package metadata: refuse
+        // a range whose end overflows before it can become a request.
+        if offset.checked_add(len).is_none() {
+            return Err(EngineError::Msix(format!(
+                "range fetch bytes {offset}+{len} overflows the address space"
+            )));
+        }
         let what = format!("range fetch bytes {offset}+{len}");
         self.run(&what, false, |url| self.transport.get_range(url, offset, len))
     }
@@ -420,6 +488,7 @@ enum CurlFailure {
 pub struct CurlTransport<'a> {
     network: &'a NetworkConfig,
     tmp_dir: PathBuf,
+    cancel: Option<&'a AtomicBool>,
 }
 
 impl<'a> CurlTransport<'a> {
@@ -427,7 +496,15 @@ impl<'a> CurlTransport<'a> {
         Self {
             network,
             tmp_dir: tmp_dir.into(),
+            cancel: None,
         }
+    }
+
+    /// Stop in-flight curl processes (and further attempts) once `cancel`
+    /// becomes `true`.
+    pub fn with_cancel(mut self, cancel: &'a AtomicBool) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// `progress_path`, when given, is polled for its file size to detect a
@@ -462,11 +539,11 @@ impl<'a> CurlTransport<'a> {
                 Some(path) => run_with_progress(
                     command,
                     limits,
-                    None,
+                    self.cancel,
                     &|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
                     &|_| {},
                 ),
-                None => run_capturing(command, limits, None),
+                None => run_capturing(command, limits, self.cancel),
             }
         };
 
@@ -531,6 +608,7 @@ fn classify_curl_failure(failure: CurlFailure, header_text: &str) -> AttemptErro
         CurlFailure::Exit { code, stderr } => AttemptError::Fatal(EngineError::Io(format!(
             "curl failed (exit={code:?}): {stderr}"
         ))),
+        CurlFailure::Run(RunError::Cancelled) => AttemptError::Fatal(cancelled_error()),
         // A stalled or over-long transfer is the same class of problem as
         // curl's own timeout (exit 28).
         CurlFailure::Run(err @ RunError::Timeout { .. }) => AttemptError::Transport {
@@ -544,6 +622,11 @@ fn classify_curl_failure(failure: CurlFailure, header_text: &str) -> AttemptErro
 }
 
 impl RangeTransport for CurlTransport<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     fn probe(&self, url: &str) -> Result<Probe, AttemptError> {
         self.ensure_tmp_dir()?;
         let body = self.unique_tmp_path("delta-probe-body");
@@ -613,7 +696,14 @@ impl RangeTransport for CurlTransport<'_> {
         let headers = self.unique_tmp_path("delta-range-headers");
         let body_str = body.to_string_lossy().into_owned();
         let headers_str = headers.to_string_lossy().into_owned();
-        let end_inclusive = offset + len - 1;
+        let end_inclusive = offset
+            .checked_add(len)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| {
+                AttemptError::Fatal(EngineError::Msix(format!(
+                    "range bytes {offset}+{len} is empty or overflows the address space"
+                )))
+            })?;
 
         let result = self.run_curl(
             url,
@@ -675,9 +765,20 @@ impl<'a> CurlRangeFetcher<'a> {
         tmp_dir: impl Into<PathBuf>,
         policy: RetryPolicy,
     ) -> Self {
+        let tmp_dir = tmp_dir.into();
+        sweep_stale_tmp_files(&tmp_dir, STALE_TMP_AFTER);
         Self {
             session: RangeSession::new(CurlTransport::new(network, tmp_dir), url, policy),
         }
+    }
+
+    /// Let the caller cancel: raising `cancel` kills the in-flight curl
+    /// request and stops retries; the fetch then fails with an error for
+    /// which [`is_cancelled_error`] is `true`. Without it a single range
+    /// request can run for up to 30 minutes uninterruptibly.
+    pub fn with_cancel(mut self, cancel: &'a AtomicBool) -> Self {
+        self.session.transport.cancel = Some(cancel);
+        self
     }
 }
 
@@ -813,6 +914,8 @@ pub(crate) mod test_support {
         /// (1-based), simulating a presign expiring mid-download.
         pub expire_before_range_call: Mutex<Option<usize>>,
         pub calls: Mutex<Vec<Call>>,
+        /// Shared cancel flag reported through `is_cancelled`.
+        pub cancel: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeTransport {
@@ -826,6 +929,7 @@ pub(crate) mod test_support {
                 min_valid_generation: Mutex::new(0),
                 expire_before_range_call: Mutex::new(None),
                 calls: Mutex::new(Vec::new()),
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -866,6 +970,10 @@ pub(crate) mod test_support {
     }
 
     impl RangeTransport for FakeTransport {
+        fn is_cancelled(&self) -> bool {
+            self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn probe(&self, url: &str) -> Result<Probe, AttemptError> {
             self.calls.lock().unwrap().push(Call::Probe(url.to_string()));
             if let Some(err) = self.probe_failures.lock().unwrap().pop_front() {
@@ -1021,6 +1129,7 @@ HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
     // ---- Session policy tests over a scripted fake transport (no network).
 
     use super::test_support::*;
+    use std::sync::Arc;
 
     fn payload() -> Vec<u8> {
         (0..4096u32).map(|i| (i % 251) as u8).collect()
@@ -1317,4 +1426,80 @@ HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
         }
     }
 
+    #[test]
+    fn a_cancel_raised_before_a_request_stops_it_without_any_network_call() {
+        let transport = FakeTransport::new(payload(), false);
+        transport.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (session, _) = new_session(transport, RetryPolicy::default());
+        let err = session.fetch_range(0, 10).unwrap_err();
+        assert!(is_cancelled_error(&err), "{err}");
+        assert!(session.transport().calls().is_empty());
+        assert!(is_cancelled_error(&session.total_len().unwrap_err()));
+    }
+
+    #[test]
+    fn a_cancel_raised_during_a_backoff_wait_stops_the_retry_loop() {
+        let transport = FakeTransport::new(payload(), false);
+        transport.fail_ranges((0..10).map(|_| http_failure(503, Some(30))).collect());
+        let cancel = Arc::clone(&transport.cancel);
+        // The "sleep" of the first backoff is where the user hits cancel.
+        let session = RangeSession::with_sleeper(
+            transport,
+            "https://mirror.example/latest/win-x64",
+            RetryPolicy::default(),
+            Box::new(move |_| cancel.store(true, std::sync::atomic::Ordering::SeqCst)),
+        );
+        let err = session.fetch_range(0, 10).unwrap_err();
+        assert!(is_cancelled_error(&err), "{err}");
+        assert_eq!(session.transport().range_calls().len(), 1, "no attempt after the cancel");
+    }
+
+    #[test]
+    fn a_curl_run_cancellation_is_classified_as_the_cancel_error_and_never_retried() {
+        let err = classify_curl_failure(CurlFailure::Run(RunError::Cancelled), "");
+        assert!(!err.is_transient());
+        assert!(is_cancelled_error(&err.into_engine_error("range")));
+    }
+
+    #[test]
+    fn ranges_that_overflow_are_rejected_before_any_request() {
+        let (session, _) = new_session(FakeTransport::new(payload(), false), RetryPolicy::default());
+        assert!(session.fetch_range(u64::MAX, 2).is_err());
+        assert!(session.fetch_range(u64::MAX - 1, u64::MAX).is_err());
+        let tmp = std::env::temp_dir().join(format!("codex-win-delta-overflow-{}", uuid::Uuid::new_v4()));
+        let mut dest = File::create(tmp.with_extension("out")).unwrap();
+        assert!(session.fetch_range_into(u64::MAX, 2, &mut dest).is_err());
+        assert!(session.transport().calls().is_empty());
+        let _ = std::fs::remove_file(tmp.with_extension("out"));
+
+        // The curl transport rejects it too, before spawning anything.
+        let network = NetworkConfig::default();
+        let curl = CurlTransport::new(&network, &tmp);
+        match curl.get_range("https://mirror.example/x", u64::MAX, 2) {
+            Err(AttemptError::Fatal(_)) => {}
+            other => panic!("{other:?}"),
+        }
+        match curl.get_range("https://mirror.example/x", 0, 0) {
+            Err(AttemptError::Fatal(_)) => {}
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stale_temp_files_from_a_killed_process_are_swept_but_others_are_kept() {
+        let dir = std::env::temp_dir().join(format!("codex-win-delta-sweep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["delta-range-body-1-a", "delta-range-headers-1-a", "delta-probe-body-1-a", "delta-probe-headers-1-a", "unrelated.txt"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        // Fresh files are never touched by the production threshold.
+        sweep_stale_tmp_files(&dir, STALE_TMP_AFTER);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
+        // With a zero threshold every delta-* file is stale; foreign files stay.
+        sweep_stale_tmp_files(&dir, Duration::ZERO);
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("unrelated.txt")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
