@@ -11,8 +11,10 @@ use crate::theme::{
 };
 use crate::{Result, ENGINE_VERSION};
 
-/// The injected renderer runtime — maintained from codex-theme-studio. It
-/// encodes the flicker discipline (compare-before-write), sticky route
+/// The injected renderer runtime — authored here; `awesome-codex-skins`'s
+/// studio CLI vendors a pinned copy of this file and `composer-overflow.mjs`
+/// instead of maintaining its own (see that repo's `studio/RUNTIME_SOURCE.json`).
+/// It encodes the flicker discipline (compare-before-write), sticky route
 /// detection, icon annotation and cleanup contract, plus Manager's host
 /// compatibility shims for existing skin packages.
 const RUNTIME_TEMPLATE: &str = include_str!("runtime/theme-runtime.js");
@@ -324,6 +326,84 @@ pub fn verify_expression(expected_version: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// Searches the embedded `theme-runtime.js` source (as it appears inside
+    /// a built payload string) for the legacy `main.main-surface` fallback
+    /// that `resolveShellMain()` tries after the current
+    /// `main[data-app-shell-main-surface]` selector, in any of its known
+    /// source forms (template-literal, string-concatenation, or inlined
+    /// literal).
+    ///
+    /// The search window is deliberately bounded to `[current,
+    /// integrateWindowsMenu)`: `resolveShellMain()`'s legacy fallback is the
+    /// only thing this check is meant to verify, but the embedded source
+    /// also contains an unrelated, always-present `main.main-surface`
+    /// substring later on, inside `integrateWindowsMenu()`'s
+    /// `:scope > main.main-surface` query. An earlier, unbounded
+    /// `payload[current..].find(...)` search would find that unrelated
+    /// occurrence too and report the fallback as present even if
+    /// `resolveShellMain()`'s actual legacy branch had been deleted
+    /// entirely -- exactly the false-positive this function exists to rule
+    /// out. Bounding the window to end at `integrateWindowsMenu` (which is
+    /// always structurally after `resolveShellMain()` in the source) keeps
+    /// the search scoped to the shim region it is supposed to verify.
+    fn find_legacy_main_surface_fallback(payload: &str, current: usize) -> Option<usize> {
+        let region_end = payload[current..]
+            .find("integrateWindowsMenu")
+            .map(|offset| current + offset)
+            .unwrap_or(payload.len());
+        let region = &payload[current..region_end];
+        region
+            .find("main.${LEGACY_SHELL_MAIN_CLASS}")
+            .or_else(|| region.find("\"main.\" + LEGACY_SHELL_MAIN_CLASS"))
+            .or_else(|| region.find("main.main-surface"))
+    }
+
+    /// Regression test for the exact false positive described above:
+    /// deleting `resolveShellMain()`'s legacy fallback entirely (a real
+    /// Codex <= 26.715 backward-compatibility regression) must make the
+    /// search fail, even though an unrelated `main.main-surface` substring
+    /// still exists later in the source (standing in for
+    /// `integrateWindowsMenu()`'s unrelated query).
+    #[test]
+    fn legacy_main_surface_fallback_search_ignores_unrelated_later_occurrence() {
+        let payload_without_legacy_fallback = concat!(
+            "const resolveShellMain = () => {\n",
+            "  const shellMain = document.querySelector(\"main[data-app-shell-main-surface]\");\n",
+            "  return shellMain;\n",
+            "};\n",
+            "const integrateWindowsMenu = (shellMain) => {\n",
+            "  const main = shellRow?.querySelector(\":scope > main.main-surface\");\n",
+            "};\n",
+        );
+        let current = payload_without_legacy_fallback
+            .find("main[data-app-shell-main-surface]")
+            .unwrap();
+        assert_eq!(
+            find_legacy_main_surface_fallback(payload_without_legacy_fallback, current),
+            None,
+            "must not match the unrelated `main.main-surface` occurrence inside \
+             integrateWindowsMenu when resolveShellMain's own legacy fallback is missing"
+        );
+
+        // Sanity check: the same helper does find the fallback when it is
+        // actually present between the current selector and
+        // `integrateWindowsMenu`.
+        let payload_with_legacy_fallback = concat!(
+            "const resolveShellMain = () => {\n",
+            "  const shellMain = document.querySelector(\"main[data-app-shell-main-surface]\") ||\n",
+            "    document.querySelector(`main.${LEGACY_SHELL_MAIN_CLASS}`);\n",
+            "  return shellMain;\n",
+            "};\n",
+            "const integrateWindowsMenu = (shellMain) => {\n",
+            "  const main = shellRow?.querySelector(\":scope > main.main-surface\");\n",
+            "};\n",
+        );
+        let current = payload_with_legacy_fallback
+            .find("main[data-app-shell-main-surface]")
+            .unwrap();
+        assert!(find_legacy_main_surface_fallback(payload_with_legacy_fallback, current).is_some());
+    }
+
     fn fixture_theme(tmp: &Path) -> std::path::PathBuf {
         let dir = tmp.join("fixture");
         std::fs::create_dir_all(dir.join("assets")).unwrap();
@@ -525,5 +605,107 @@ mod tests {
         assert!(expr.contains("modeValid"));
         assert!(expr.contains("editorValid"));
         assert!(expr.contains("26.727.51351"));
+    }
+
+    /// Golden-fixture parity test. `tests/fixtures/golden/` is the shared
+    /// input the single-theme-runtime migration checks on both sides of the
+    /// vendoring boundary: `awesome-codex-skins`'s
+    /// `studio/test/runtime-golden.test.mjs` builds a payload from the same
+    /// fixture shape (id `golden-fixture`, same CSS, an overlay+stage chrome
+    /// fragment, one asset, one motion asset) through its own `buildPayload`
+    /// and executes it against real DOM snapshots; this test builds the
+    /// identical fixture through Rust's `build_payload` and asserts on the
+    /// generated payload *text* instead (Rust has no DOM to execute against).
+    /// The two are intentionally *not* compared by raw stamp equality —
+    /// `payload.rs` and `payload.mjs` fingerprint different inputs (this
+    /// crate's version constant vs. `STUDIO_VERSION`, and a
+    /// post-substitution vs. pre-substitution runtime template) so a
+    /// byte-identical package can legitimately produce different stamps
+    /// between the two engines. What must match is the *normalized*
+    /// structural contract below. If a future runtime edit changes one
+    /// side's observable output without the other fixture/test being
+    /// updated in lockstep, this test (or its studio counterpart) fails.
+    #[test]
+    fn golden_fixture_payload_matches_contract() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden");
+        let built = build_payload(&fixture_dir).unwrap();
+
+        // No placeholder survives substitution.
+        assert!(!built.payload.contains("__CTS_"), "unsubstituted placeholder");
+
+        // Exactly the assets the fixture declares: one CSS-inlined image
+        // plus one dedicated-slot motion asset (asset_count sums both).
+        assert_eq!(built.asset_count, 2, "fixture declares one still asset and one motion asset");
+        assert!(
+            built.payload.contains("--cts-asset-wall: url(\\\"data:image/png;base64,"),
+            "still asset must ride the CSS custom property as a data URL"
+        );
+        assert!(
+            built.payload.contains("data:video/mp4;base64,"),
+            "motion asset must be present as a data URL in the dedicated motion slot"
+        );
+        assert!(
+            !built.payload.contains("--cts-asset-intro-video"),
+            "motion assets must never become a CSS custom property"
+        );
+
+        // Both chrome layers from the fixture's overlay+stage markup.
+        assert!(built.payload.contains("data-cts-layer=\\\"overlay\\\""));
+        assert!(built.payload.contains("data-cts-layer=\\\"stage\\\""));
+
+        // Main-surface compatibility shim: current selector takes priority
+        // over the legacy one, and the compat marker exists.
+        //
+        // theme-runtime.js is embedded into the payload as literal JS source
+        // and is never evaluated by Rust, so `${LEGACY_SHELL_MAIN_CLASS}`
+        // below is NOT Rust/format! interpolation -- it is (one form of) the
+        // literal JS text theme-runtime.js writes for its
+        // `document.querySelector(\`main.${LEGACY_SHELL_MAIN_CLASS}\`)` call.
+        // This assertion is therefore checking the raw embedded JS source
+        // text for known constructions of that call, not the executed
+        // selector-ordering behavior itself -- that behavior is exercised
+        // against a real DOM by studio's `runtime-golden.test.mjs`.
+        //
+        // `find_legacy_main_surface_fallback` (see its doc comment) bounds
+        // the search to the `resolveShellMain()` shim region specifically so
+        // an unrelated, always-present `main.main-surface` occurrence
+        // elsewhere in the embedded source (e.g. `integrateWindowsMenu`'s
+        // `:scope > main.main-surface` query, which lies after this region)
+        // cannot satisfy the assertion by coincidence.
+        let current = built
+            .payload
+            .find("main[data-app-shell-main-surface]")
+            .expect("current main-surface selector must be present");
+        find_legacy_main_surface_fallback(&built.payload, current).expect(
+            "legacy main-surface fallback must be present between the current selector and \
+             `integrateWindowsMenu` (checked the template-literal, string-concatenation, and \
+             inlined-literal forms of theme-runtime.js's selector construction -- if \
+             theme-runtime.js's legacy-selector expression changed to a different form, update \
+             this test rather than assuming the fallback itself broke)",
+        );
+        assert!(built.payload.contains("data-cts-main-surface-compat"));
+
+        // Composer-surface compatibility shim: both the current CSS-module
+        // selector and the legacy-class compat marker are present.
+        assert!(built.payload.contains("[data-composer-surface-variant][data-composer-layout]"));
+        assert!(built.payload.contains("data-cts-composer-surface-compat"));
+        assert!(built.payload.contains("reconcileComposerSurfaces(document)"));
+        assert!(built.payload.contains("clearComposerSurfaceCompat(document)"));
+
+        // Composer overflow contract markers that the injected runtime relies
+        // on for classification and the hardening CSS appended after theme
+        // CSS.
+        assert!(built.payload.contains("annotateComposerOverflow.invalidate()"));
+        assert!(built.payload.contains("data-cts-composer-overflow=\\\"shell\\\""));
+        assert!(built.payload.contains("overflow: clip !important"));
+
+        // Stamp shape: engine version, fixture id, and a non-empty hash
+        // segment. Not compared against studio's stamp for a byte-identical
+        // package — see the doc comment above.
+        assert!(built.stamp.starts_with(&format!("{ENGINE_VERSION}:golden-fixture:")));
+        assert!(
+            built.stamp.rsplit(':').next().is_some_and(|h| !h.is_empty()),
+            "stamp must carry a non-empty fingerprint segment"
+        );
     }
 }
