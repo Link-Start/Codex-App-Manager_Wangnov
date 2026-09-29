@@ -180,24 +180,38 @@ pub fn resolve_package_layout(
                         file.name
                     ))
                 })?;
+                // Every block size is untrusted XML text too: a corrupt
+                // map must yield a clean `Err` (full-download fallback), not
+                // an overflow panic (debug) or a wrapped offset (release),
+                // and the blocks must fit inside the entry's own on-disk
+                // record.
                 let mut offset = data_offset;
-                let blocks = file
-                    .blocks
-                    .iter()
-                    .map(|block| {
-                        let resolved = ResolvedBlock {
-                            hash_base64: block.hash_base64.clone(),
-                            size: block.size,
-                            offset,
-                        };
-                        offset += block.size;
-                        resolved
-                    })
-                    .collect::<Vec<_>>();
+                let mut blocks = Vec::with_capacity(file.blocks.len());
+                for block in &file.blocks {
+                    blocks.push(ResolvedBlock {
+                        hash_base64: block.hash_base64.clone(),
+                        size: block.size,
+                        offset,
+                    });
+                    offset = offset.checked_add(block.size).ok_or_else(|| {
+                        EngineError::Msix(format!(
+                            "AppxBlockMap.xml File {:?} has block sizes that overflow the package offset",
+                            file.name
+                        ))
+                    })?;
+                }
+                if offset > end_offset {
+                    return Err(EngineError::Msix(format!(
+                        "AppxBlockMap.xml File {:?} declares blocks ending at {offset}, past its ZIP entry end {end_offset}",
+                        file.name
+                    )));
+                }
                 Ok(ResolvedBlockMapFile {
                     lfh_size,
                     data_offset,
-                    block_data_size: file.block_data_size(),
+                    // Equal to the sum of the declared block sizes, already
+                    // overflow-checked by the loop above.
+                    block_data_size: offset - data_offset,
                     blocks,
                 })
             })
@@ -370,5 +384,34 @@ mod tests {
         let layout = resolve_package_layout(zip, Some(block_map)).unwrap();
         assert!(!layout.files[0].is_covered_by_block_map());
         assert_eq!(layout.unmatched_block_map_files, vec!["app/ghost.bin"]);
+    }
+
+    #[test]
+    fn block_sizes_that_overflow_or_overrun_the_entry_are_a_clean_error() {
+        let zip = || ZipLayout {
+            file_size: 10_000,
+            central_directory_offset: 9_000,
+            central_directory_size: 500,
+            entries: vec![entry("app/a.bin", 0, 210, 300)],
+        };
+        // Sum of sizes overflows u64.
+        let overflowing = AppxBlockMap {
+            files: vec![block_map_file(
+                r"app\a.bin",
+                300,
+                50,
+                &[("h1", u64::MAX), ("h2", 2)],
+            )],
+        };
+        let err = resolve_package_layout(zip(), Some(overflowing)).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
+
+        // Declared blocks run past the end of the ZIP entry's own record
+        // (here the central directory at 9_000).
+        let overrunning = AppxBlockMap {
+            files: vec![block_map_file(r"app\a.bin", 300, 50, &[("h1", 9_500)])],
+        };
+        let err = resolve_package_layout(zip(), Some(overrunning)).unwrap_err();
+        assert!(err.to_string().contains("past its ZIP entry end"), "{err}");
     }
 }

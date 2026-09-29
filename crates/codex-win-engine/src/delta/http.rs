@@ -265,6 +265,18 @@ impl<T: RangeTransport> RangeSession<T> {
         Ok(probe)
     }
 
+    /// [`resolve`](Self::resolve) under the retry policy. A separate method
+    /// (not an inline closure in `run`) so `run` does not instantiate itself
+    /// recursively with an ever-nested closure type.
+    fn resolve_with_retry(&self, what: &str) -> Result<Probe, EngineError> {
+        let mut probe = None;
+        self.run(what, true, |_| {
+            probe = Some(self.resolve()?);
+            Ok(())
+        })?;
+        Ok(probe.expect("probe succeeded"))
+    }
+
     /// Run `op` against the current URL with the retry policy. `for_probe`
     /// runs it against the original URL (a probe always re-resolves from the
     /// source of truth) and disables the expired-presign handling.
@@ -306,12 +318,10 @@ impl<T: RangeTransport> RangeSession<T> {
                         self.original_url
                     )));
                 }
-                self.resolve().map_err(|resolve_err| {
-                    resolve_err.into_engine_error(&format!(
-                        "re-resolve {} after HTTP 403",
-                        self.original_url
-                    ))
-                })?;
+                // The refresh gets the same bounded retries as the initial
+                // probe: a brief 429/503 from the router must not turn a
+                // recoverable expiry into a full-download fallback.
+                self.resolve_with_retry("re-resolve after HTTP 403")?;
                 // A re-resolve is not a failed attempt of the range itself.
                 attempt -= 1;
                 continue;
@@ -360,13 +370,7 @@ impl<T: RangeTransport> RangeSession<T> {
 
 impl<T: RangeTransport> RangeFetcher for RangeSession<T> {
     fn total_len(&self) -> Result<u64, EngineError> {
-        let mut total = None;
-        self.run("length probe", true, |_| {
-            let probe = self.resolve()?;
-            total = Some(probe.total_len);
-            Ok(())
-        })?;
-        Ok(total.expect("probe succeeded"))
+        Ok(self.resolve_with_retry("length probe")?.total_len)
     }
 
     fn fetch_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, EngineError> {
@@ -1183,6 +1187,20 @@ HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
         // Later ranges use the fresh URL directly.
         session.fetch_range(20, 10).unwrap();
         assert_eq!(session.transport().range_calls().last().unwrap().0, "https://cdn.example/obj?sig=2");
+    }
+
+    #[test]
+    fn the_re_resolve_probe_itself_is_retried_on_transient_errors() {
+        let (session, sleeps) = new_session(FakeTransport::new(payload(), true), RetryPolicy::default());
+        session.total_len().unwrap();
+        session.transport().expire_issued_urls();
+        session.transport().fail_probes(vec![http_failure(429, Some(3)), transport_failure(35)]);
+
+        assert_eq!(session.fetch_range(0, 10).unwrap(), payload()[..10].to_vec());
+        assert_eq!(session.stats().re_resolves, 1);
+        assert_eq!(session.stats().retries, 2);
+        assert_eq!(session.transport().probe_count(), 4, "initial + failed + failed + succeeded");
+        assert_eq!(sleeps.lock().unwrap().len(), 2);
     }
 
     #[test]

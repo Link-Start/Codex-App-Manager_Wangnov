@@ -83,18 +83,20 @@ pub const BASE_SHA256_FILE_NAME: &str = "delta-base.sha256";
 /// leaves a fully usable pair for [`retained_base`] to hand back: a failed
 /// base rename leaves the *previous* (base, sidecar) pair completely
 /// untouched (this function's own temp files aside, which are cleaned up on
-/// every failure path), and the only state that would otherwise be lost --
-/// silently downgrading a perfectly good previous base to "no usable base"
-/// just because *replacing* it failed -- never happens. The one case this
-/// does not fully close is a literal crash in the sub-millisecond gap
-/// between the two renames, which would leave the *new* base paired with
-/// the *previous* sidecar; `retained_base`'s sidecar is bookkeeping (an
-/// identity hint so a caller need not re-hash a ~1 GB file), never a
-/// content-integrity check on the base itself -- [`crate::delta::executor`]
-/// always reads the base's real on-disk bytes and the final whole-file
-/// SHA-256 check is what actually gates trusting a delta reconstruction --
-/// so a stale sidecar surviving that narrow window is a bookkeeping
-/// inaccuracy, not a safety issue.
+/// every failure path), so a failed *replacement* never silently downgrades a
+/// perfectly good previous base to "no usable base".
+///
+/// The remaining hazard is a failure *after* the new base is already in
+/// place: writing or renaming the new sidecar then fails, and the old
+/// sidecar would vouch for the wrong file. That path removes the retained
+/// pair entirely (best effort) before returning the error, so
+/// [`retained_base`] reports "no usable base" instead of the new file under
+/// the previous release's checksum. (A literal process crash in the
+/// sub-millisecond gap between the two renames could still leave that
+/// pairing; the sidecar is an identity hint that saves re-hashing a ~1 GB
+/// file, never a content-integrity check on the base --
+/// [`crate::delta::executor`] always reads the base's real bytes and the
+/// final whole-file SHA-256 is what gates trusting a reconstruction.)
 pub fn retain_verified_base(
     base_dir: &Path,
     verified_msix: &Path,
@@ -114,11 +116,18 @@ pub fn retain_verified_base(
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
+    // The new base is in place; from here on a failure must not leave the
+    // previous sidecar vouching for it.
     if let Err(err) = std::fs::write(&sha_tmp, sha256.trim()) {
         let _ = std::fs::remove_file(&sha_tmp);
+        let _ = clear_retained_base(base_dir);
         return Err(err);
     }
-    std::fs::rename(&sha_tmp, &sha_path)?;
+    if let Err(err) = std::fs::rename(&sha_tmp, &sha_path) {
+        let _ = std::fs::remove_file(&sha_tmp);
+        let _ = clear_retained_base(base_dir);
+        return Err(err);
+    }
     Ok(dest)
 }
 
@@ -280,6 +289,31 @@ mod tests {
         let (path, sha256) = retained_base(&base_dir).expect("previous base must still be usable");
         assert_eq!(std::fs::read(&path).unwrap(), b"version one");
         assert_eq!(sha256, "hash-one");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn a_failed_sidecar_write_after_the_base_swap_does_not_leave_a_mismatched_pair() {
+        let base_dir = temp_dir("sidecar-fails");
+        let source_dir = temp_dir("sidecar-fails-source");
+        let first = source_dir.join("first.msix");
+        let second = source_dir.join("second.msix");
+        std::fs::write(&first, b"version one").unwrap();
+        std::fs::write(&second, b"version two").unwrap();
+        retain_verified_base(&base_dir, &first, "hash-one").unwrap();
+
+        // A directory squatting on the sidecar's temp name makes the sidecar
+        // write fail after the new base has already replaced the old one.
+        std::fs::create_dir(base_dir.join(format!("{BASE_SHA256_FILE_NAME}.tmp"))).unwrap();
+        assert!(retain_verified_base(&base_dir, &second, "hash-two").is_err());
+
+        assert!(
+            retained_base(&base_dir).is_none(),
+            "the new base must never be reported under the previous release's checksum"
+        );
+        assert!(!base_dir.join(BASE_FILE_NAME).exists(), "the unusable base is reclaimed");
 
         std::fs::remove_dir_all(&base_dir).ok();
         std::fs::remove_dir_all(&source_dir).ok();
