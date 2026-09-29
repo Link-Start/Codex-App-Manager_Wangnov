@@ -66,23 +66,35 @@ pub const BASE_SHA256_FILE_NAME: &str = "delta-base.sha256";
 /// The copy is written to a temp path in `base_dir` first and only renamed
 /// onto the fixed [`BASE_FILE_NAME`] once fully written, so a crash or a
 /// disk-full error partway through never leaves a truncated file at the
-/// name a future update would trust.
+/// name a future update would trust. If that initial copy fails outright
+/// (for example, the disk fills partway through copying a ~900 MB MSIX),
+/// the temp file it left behind is removed before returning the error --
+/// otherwise it would sit there permanently: `clear_retained_base` only
+/// ever removes the *final* base/sidecar names, not this function's own
+/// temp names, and a caller that reacts to this error by disabling delta
+/// updates would not reclaim that space.
 ///
-/// The previous sidecar checksum is removed *before* the new base is
-/// renamed into place, and the new sidecar is written *after* -- never the
-/// reverse. A crash (or disk-full error) between those two steps therefore
-/// always leaves either the still-consistent previous (base, sha256) pair
-/// intact (nothing renamed yet) or a base file with no sidecar at all,
-/// which [`retained_base`] treats as "no usable base". The one ordering
-/// this rules out is the unsafe one: a *new* base ever left paired with the
-/// *previous* base's sidecar, which [`retained_base`] would otherwise hand
-/// out as a usable pair despite the checksum belonging to different bytes.
-///
-/// The new sidecar's own write is not a plain [`std::fs::write`]: it goes
-/// through the same write-to-temp-then-rename sequence as the base copy
-/// above, so a crash or disk-full error partway through *that* write can
-/// never leave a truncated-but-nonempty sidecar file behind for
-/// [`retained_base`] to read back as if it were a complete SHA-256.
+/// Both the base and the sidecar checksum are replaced the same way -- copy
+/// or write to a temp path in `base_dir`, then [`std::fs::rename`] onto the
+/// fixed name, which atomically replaces whatever was already there on both
+/// Unix and Windows -- and, critically, the base is renamed into place
+/// *before* the sidecar is touched at all, with no separate "remove the old
+/// sidecar first" step. That ordering means a failure at either rename
+/// leaves a fully usable pair for [`retained_base`] to hand back: a failed
+/// base rename leaves the *previous* (base, sidecar) pair completely
+/// untouched (this function's own temp files aside, which are cleaned up on
+/// every failure path), and the only state that would otherwise be lost --
+/// silently downgrading a perfectly good previous base to "no usable base"
+/// just because *replacing* it failed -- never happens. The one case this
+/// does not fully close is a literal crash in the sub-millisecond gap
+/// between the two renames, which would leave the *new* base paired with
+/// the *previous* sidecar; `retained_base`'s sidecar is bookkeeping (an
+/// identity hint so a caller need not re-hash a ~1 GB file), never a
+/// content-integrity check on the base itself -- [`crate::delta::executor`]
+/// always reads the base's real on-disk bytes and the final whole-file
+/// SHA-256 check is what actually gates trusting a delta reconstruction --
+/// so a stale sidecar surviving that narrow window is a bookkeeping
+/// inaccuracy, not a safety issue.
 pub fn retain_verified_base(
     base_dir: &Path,
     verified_msix: &Path,
@@ -93,14 +105,19 @@ pub fn retain_verified_base(
     let tmp = base_dir.join(format!("{BASE_FILE_NAME}.tmp"));
     let sha_path = base_dir.join(BASE_SHA256_FILE_NAME);
     let sha_tmp = base_dir.join(format!("{BASE_SHA256_FILE_NAME}.tmp"));
-    std::fs::copy(verified_msix, &tmp)?;
-    match std::fs::remove_file(&sha_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+
+    if let Err(err) = std::fs::copy(verified_msix, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
     }
-    std::fs::rename(&tmp, &dest)?;
-    std::fs::write(&sha_tmp, sha256.trim())?;
+    if let Err(err) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::write(&sha_tmp, sha256.trim()) {
+        let _ = std::fs::remove_file(&sha_tmp);
+        return Err(err);
+    }
     std::fs::rename(&sha_tmp, &sha_path)?;
     Ok(dest)
 }
@@ -219,18 +236,50 @@ mod tests {
 
         retain_verified_base(&base_dir, &first, "hash-one").unwrap();
 
-        // Replay `retain_verified_base`'s first two steps for the second
-        // call (copy the new content into place, drop the old sidecar) but
-        // stop short of writing the new sidecar -- simulating a crash right
-        // there. The old sidecar's value ("hash-one") must never come back
-        // out paired with the new base's bytes.
+        // Directly simulate a base file that exists with no sidecar at all
+        // -- one possible shape an interruption could in principle leave
+        // behind, and the one `retained_base` must always treat as unusable
+        // regardless of how it was reached (this does not depend on
+        // `retain_verified_base`'s own internal step ordering, which is
+        // covered on its own by the tests below).
         std::fs::copy(&second, base_dir.join(BASE_FILE_NAME)).unwrap();
         std::fs::remove_file(base_dir.join(BASE_SHA256_FILE_NAME)).unwrap();
 
         assert!(
             retained_base(&base_dir).is_none(),
-            "an interrupted replace must never surface a (new base, stale sha256) pair"
+            "a base with no sidecar at all must never be treated as usable"
         );
+
+        std::fs::remove_dir_all(&base_dir).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn a_failed_replacement_leaves_the_previous_base_usable_and_cleans_up_the_temp_file() {
+        let base_dir = temp_dir("failed-replace");
+        let source_dir = temp_dir("failed-replace-source");
+        let first = source_dir.join("first.msix");
+        std::fs::write(&first, b"version one").unwrap();
+        let missing_source = source_dir.join("does-not-exist.msix");
+
+        retain_verified_base(&base_dir, &first, "hash-one").unwrap();
+
+        // A second call whose source can't even be read (standing in for
+        // any failure during the copy -- a full disk behaves the same way
+        // from this function's point of view: the copy step fails) must
+        // leave the previous, still-good (base, sha256) pair exactly as it
+        // was, and must not leave its own `.tmp` file behind for nothing to
+        // ever clean up (`clear_retained_base` only knows the final names).
+        let err = retain_verified_base(&base_dir, &missing_source, "hash-two").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        assert!(
+            !base_dir.join(format!("{BASE_FILE_NAME}.tmp")).exists(),
+            "a failed copy must not leave its temp file behind"
+        );
+        let (path, sha256) = retained_base(&base_dir).expect("previous base must still be usable");
+        assert_eq!(std::fs::read(&path).unwrap(), b"version one");
+        assert_eq!(sha256, "hash-one");
 
         std::fs::remove_dir_all(&base_dir).ok();
         std::fs::remove_dir_all(&source_dir).ok();

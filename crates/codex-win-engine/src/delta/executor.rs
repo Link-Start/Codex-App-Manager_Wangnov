@@ -181,20 +181,20 @@ pub fn execute_delta<F: RangeFetcher>(
     config: &PlannerConfig,
     min_savings_pct: f64,
 ) -> Result<DeltaOutcome, EngineError> {
-    // `assemble` below calls `File::create(dest_path)`, which truncates
-    // whatever is already there -- if a caller ever passed the same path
-    // for both arguments (nothing upstream of this function stops them;
-    // the example binary's optional destination argument in particular
-    // makes it one flag away), that would truncate the retained base out
-    // from under the read below, and a subsequent fetch/SHA-256 failure
-    // would then delete it entirely instead of leaving it available for a
-    // later attempt or the existing full-download fallback. Reject the
-    // aliasing outright rather than relying on read-before-write ordering
-    // to save it: `canonicalize` first (catches relative-vs-absolute and
-    // symlinked paths to the same file) and fall back to a raw path
-    // comparison for a `dest_path` that does not exist yet, which is the
-    // ordinary case and where `canonicalize` would otherwise always fail
-    // and silently skip the check.
+    // A quick, friendly rejection for the obvious misuse -- the same literal
+    // path for both arguments (nothing upstream of this function stops a
+    // caller; the example binary's optional destination argument in
+    // particular makes it one flag away). This is a diagnostic, not the
+    // safety net: `canonicalize` resolves symlinks but not a *hard* link
+    // (two distinct directory entries genuinely sharing one inode, which
+    // canonicalize cannot see through), so it cannot catch every form of
+    // aliasing on its own. The actual safety net is structural, below: this
+    // function never writes through `dest_path` at all until the very last
+    // step, once the whole reconstruction is already fetched, assembled,
+    // and SHA-256-verified in an independent staging file -- so even an
+    // aliasing form this check misses can, at worst, replace `dest_path`
+    // (and whatever else happens to share its inode) with fully verified
+    // bytes at the very end, never a truncated or partially written base.
     let same_file = std::fs::canonicalize(base_path)
         .ok()
         .zip(std::fs::canonicalize(dest_path).ok())
@@ -235,22 +235,47 @@ pub fn execute_delta<F: RangeFetcher>(
         )));
     }
 
-    if let Err(err) = assemble(&plan, &base_bytes, &counting, dest_path) {
-        let _ = std::fs::remove_file(dest_path);
+    // Assemble and verify in an independent staging file next to
+    // `dest_path` (so the final rename below stays on one filesystem),
+    // never `dest_path` itself: this is what actually makes aliasing safe
+    // regardless of its form (same path, symlink, or a hard link the
+    // `canonicalize` check above cannot see through) -- `dest_path` (and
+    // therefore `base_path`, if a caller did alias them) is not written to
+    // at all until the single rename at the very end, by which point the
+    // reconstructed bytes are already fully fetched, assembled, and
+    // SHA-256-verified. A staging file left behind by any failure along the
+    // way is this function's own to clean up; `dest_path` is never touched.
+    let mut staging_name = dest_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("delta-staging"));
+    staging_name.push(format!(".part-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+    let staging_path = dest_path.with_file_name(staging_name);
+
+    if let Err(err) = assemble(&plan, &base_bytes, &counting, &staging_path) {
+        let _ = std::fs::remove_file(&staging_path);
         return Err(err);
     }
 
-    let actual_sha256 = match crate::download::sha256_file(dest_path) {
+    let actual_sha256 = match crate::download::sha256_file(&staging_path) {
         Ok(sha256) => sha256,
         Err(err) => {
-            let _ = std::fs::remove_file(dest_path);
+            let _ = std::fs::remove_file(&staging_path);
             return Err(err);
         }
     };
     if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
-        let _ = std::fs::remove_file(dest_path);
+        let _ = std::fs::remove_file(&staging_path);
         return Err(EngineError::Msix(format!(
             "delta reconstruction SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256} -- discarding and falling back to a full download"
+        )));
+    }
+
+    if let Err(err) = std::fs::rename(&staging_path, dest_path) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(EngineError::Io(format!(
+            "rename verified reconstruction to {}: {err}",
+            dest_path.display()
         )));
     }
 
@@ -1045,11 +1070,15 @@ HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
     #[test]
     fn a_destination_that_aliases_the_base_is_rejected_before_touching_either_file() {
         // A caller that (mistakenly, or via the example binary's optional
-        // destination argument) passes the same path for both `base_path`
-        // and `dest_path` must not have that base truncated by `assemble`'s
-        // `File::create(dest_path)` -- see the comment at the top of
-        // `execute_delta`. The retained base's real bytes on disk are the
-        // signal this test checks: they must be completely untouched.
+        // destination argument) passes the same literal path for both
+        // `base_path` and `dest_path` gets a clear, immediate error rather
+        // than silently having that base replaced -- see the comment at the
+        // top of `execute_delta`. The retained base's real bytes on disk are
+        // the signal this test checks: they must be completely untouched.
+        // (A hard-link alias, which this literal-path check cannot see
+        // through, is covered separately below: the staging-file mechanism
+        // that check's own comment describes handles that case safely too,
+        // without ever rejecting it.)
         let base_content = b"this is a base file, not touched by this call at all".to_vec();
         let base_path = write_temp_file("alias-base", &base_content);
         let new_pkg = build_package(&[FileSpec {
@@ -1079,6 +1108,109 @@ HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
         );
 
         let _ = std::fs::remove_file(&base_path);
+    }
+
+    #[test]
+    fn a_hard_linked_destination_leaves_the_base_intact_after_a_successful_reconstruction() {
+        // `canonicalize` (used by the literal-path check above) cannot see
+        // through a hard link: `dest_path` here is a second directory entry
+        // for the exact same inode as `base_path`, under a different name,
+        // so that check does not fire and this call proceeds. Safety here
+        // comes from the structural fix instead -- `execute_delta` never
+        // writes through `dest_path` (or anything sharing its inode) until
+        // the final rename of an already fully verified staging file, so
+        // `base_path`'s *original* directory entry -- unaffected by a
+        // rename that only ever replaces `dest_path`'s entry -- must still
+        // read back the untouched old content even though it shares an
+        // inode with a destination that just got legitimately overwritten.
+        // Must be a real, parseable package -- `execute_delta` parses
+        // `base_path` as a ZIP/AppxBlockMap layout before anything else.
+        let base_content = build_package(&[FileSpec {
+            name: "app/original.bin",
+            blocks: vec![BlockSpec { content: vec![1u8; 1_000], hash: "h-original", compress: false }],
+        }]);
+        let base_path = write_temp_file("hardlink-base", &base_content);
+        let dest_path = std::env::temp_dir().join(format!(
+            "codex-win-engine-executor-test-hardlink-dest-{}-{}.msix",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::hard_link(&base_path, &dest_path).unwrap();
+
+        let new_pkg = build_package(&[FileSpec {
+            name: "app/a.bin",
+            blocks: vec![BlockSpec { content: vec![2u8; 1_000], hash: "h1", compress: false }],
+        }]);
+        let expected_sha256 = sha256_hex(&new_pkg);
+        let fetcher = FakeFetcher { data: new_pkg.clone() };
+
+        execute_delta(&base_path, &fetcher, &dest_path, &expected_sha256, &PlannerConfig::default(), 0.0)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&base_path).unwrap(),
+            base_content,
+            "base_path's own directory entry must still be the untouched original bytes"
+        );
+        assert_eq!(
+            std::fs::read(&dest_path).unwrap(),
+            new_pkg,
+            "dest_path must hold the new, verified reconstruction"
+        );
+
+        let _ = std::fs::remove_file(&base_path);
+        let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[test]
+    fn a_hard_linked_destination_survives_a_failed_reconstruction() {
+        // Same setup as above, but the reconstruction itself fails (a
+        // deliberately wrong `expected_sha256`, standing in for any
+        // assemble/verify failure). Neither name for the shared inode may
+        // be touched: `execute_delta` only ever cleans up its own staging
+        // file on failure, never `dest_path`.
+        let base_content = build_package(&[FileSpec {
+            name: "app/original.bin",
+            blocks: vec![BlockSpec { content: vec![1u8; 1_000], hash: "h-original", compress: false }],
+        }]);
+        let base_path = write_temp_file("hardlink-base-fail", &base_content);
+        let dest_path = std::env::temp_dir().join(format!(
+            "codex-win-engine-executor-test-hardlink-dest-fail-{}-{}.msix",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::hard_link(&base_path, &dest_path).unwrap();
+
+        let new_pkg = build_package(&[FileSpec {
+            name: "app/a.bin",
+            blocks: vec![BlockSpec { content: vec![3u8; 1_000], hash: "h1", compress: false }],
+        }]);
+        let fetcher = FakeFetcher { data: new_pkg };
+
+        let err = execute_delta(
+            &base_path,
+            &fetcher,
+            &dest_path,
+            &"0".repeat(64),
+            &PlannerConfig::default(),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SHA-256 mismatch"), "unexpected error: {err}");
+
+        assert_eq!(
+            std::fs::read(&base_path).unwrap(),
+            base_content,
+            "base_path must survive a failed reconstruction untouched"
+        );
+        assert_eq!(
+            std::fs::read(&dest_path).unwrap(),
+            base_content,
+            "dest_path (same inode) must also still read back the original bytes"
+        );
+
+        let _ = std::fs::remove_file(&base_path);
+        let _ = std::fs::remove_file(&dest_path);
     }
 
     #[test]
