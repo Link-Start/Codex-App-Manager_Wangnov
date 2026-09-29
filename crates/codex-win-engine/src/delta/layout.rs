@@ -71,7 +71,7 @@ impl ResolvedFile {
         match &self.block_map_file {
             Some(bf) => self
                 .end_offset
-                .saturating_sub(bf.data_offset + self.compressed_size),
+                .saturating_sub(bf.data_offset.saturating_add(self.compressed_size)),
             None => 0,
         }
     }
@@ -206,6 +206,18 @@ pub fn resolve_package_layout(
                         file.name
                     )));
                 }
+                // The central directory's own compressed size is untrusted
+                // as well; the planner does offset arithmetic with it, so
+                // the compressed data must end inside the entry's record.
+                data_offset
+                    .checked_add(entry.compressed_size)
+                    .filter(|end| *end <= end_offset)
+                    .ok_or_else(|| {
+                        EngineError::Msix(format!(
+                            "ZIP entry {:?} declares a compressed size ({}) that runs past its record end {end_offset}",
+                            entry.name, entry.compressed_size
+                        ))
+                    })?;
                 Ok(ResolvedBlockMapFile {
                     lfh_size,
                     data_offset,
@@ -413,5 +425,22 @@ mod tests {
         };
         let err = resolve_package_layout(zip(), Some(overrunning)).unwrap_err();
         assert!(err.to_string().contains("past its ZIP entry end"), "{err}");
+    }
+
+    #[test]
+    fn a_compressed_size_that_overflows_or_overruns_the_entry_is_a_clean_error() {
+        let block_map = || AppxBlockMap {
+            files: vec![block_map_file(r"app\a.bin", 300, 50, &[("h1", 100)])],
+        };
+        for bad_size in [u64::MAX - 10, 9_000] {
+            let zip = ZipLayout {
+                file_size: 10_000,
+                central_directory_offset: 9_000,
+                central_directory_size: 500,
+                entries: vec![entry("app/a.bin", 0, bad_size, 300)],
+            };
+            let err = resolve_package_layout(zip, Some(block_map())).unwrap_err();
+            assert!(err.to_string().contains("compressed size"), "{bad_size}: {err}");
+        }
     }
 }
