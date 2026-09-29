@@ -3,23 +3,22 @@
 //! streamed SHA-256 to match before ever returning success.
 //!
 //! [`RangeFetcher`] is the seam that makes this testable: production code
-//! reads ranges over HTTPS via [`CurlRangeFetcher`] (curl, `NetworkConfig`-aware,
-//! matching `download.rs`'s conventions -- presigned mirror URLs reject HEAD,
-//! so every probe here is itself a ranged GET); tests substitute an
+//! reads ranges over HTTPS via [`CurlRangeFetcher`] (see [`crate::delta::http`]:
+//! curl, `NetworkConfig`-aware, redirect pinning and bounded retries --
+//! presigned mirror URLs reject HEAD, so every probe is itself a ranged GET);
+//! tests substitute an
 //! in-memory fetcher and exercise the full plan-then-assemble-then-verify
 //! pipeline with no network and no real curl binary required.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use crate::delta::layout::build_package_layout;
 use crate::delta::planner::{build_reuse_index, plan_delta, DeltaPlan, PlannerConfig};
 use crate::delta::zip_format::{ByteSource, InMemorySource};
-use crate::network::{is_schannel_revocation_offline, NetworkConfig, SchannelRevocationCheck};
-use crate::process::{curl_exe, hidden_command, run_capturing, run_with_progress, RunError, RunLimits};
+pub use crate::delta::http::{CurlRangeFetcher, RetryPolicy, RetryStats};
 use crate::EngineError;
 
 /// Anything the delta engine can pull an arbitrary byte range from. Kept
@@ -47,6 +46,11 @@ pub trait RangeFetcher {
         dest.write_all(&bytes)
             .map_err(|err| EngineError::Io(format!("write fetched range: {err}")))?;
         Ok(bytes.len() as u64)
+    }
+    /// Retries and URL re-resolutions performed so far, for reporting. Fakes
+    /// that never retry keep the zero default.
+    fn retry_stats(&self) -> RetryStats {
+        RetryStats::default()
     }
 }
 
@@ -103,6 +107,10 @@ impl<F: RangeFetcher> RangeFetcher for CountingFetcher<'_, F> {
         Ok(data)
     }
 
+    fn retry_stats(&self) -> RetryStats {
+        self.inner.retry_stats()
+    }
+
     fn fetch_range_into(&self, offset: u64, len: u64, dest: &mut File) -> Result<u64, EngineError> {
         let written = self.inner.fetch_range_into(offset, len, dest)?;
         if written != len {
@@ -148,9 +156,14 @@ pub struct DeltaOutcome {
     /// remote tail/EOCD scan, the central directory, `AppxBlockMap.xml`)
     /// plus every planned [`crate::delta::planner::FetchStep`].
     pub bytes_fetched: u64,
-    /// Number of curl invocations (or fake-fetcher calls in tests) this
-    /// reconstruction made in total.
+    /// Number of successful requests (curl invocations, or fake-fetcher calls
+    /// in tests): the length probe plus every layout-probing and planned
+    /// range fetch. Retried and re-resolve requests are reported separately
+    /// in [`retry_stats`](Self::retry_stats); total curl invocations are
+    /// `request_count + retry_stats.retries + retry_stats.re_resolves`.
     pub request_count: usize,
+    /// Retries after transient failures and URL re-resolutions.
+    pub retry_stats: RetryStats,
     /// The assembled file's verified SHA-256 (lowercase hex) -- equal to
     /// `expected_sha256` by construction, since a mismatch is an `Err`.
     pub sha256: String,
@@ -282,6 +295,7 @@ pub fn execute_delta<F: RangeFetcher>(
     Ok(DeltaOutcome {
         bytes_fetched: counting.bytes_fetched(),
         request_count: counting.request_count(),
+        retry_stats: counting.retry_stats(),
         sha256: actual_sha256,
         savings_pct: plan.savings_pct(),
         new_size: plan.new_size,
@@ -334,384 +348,12 @@ fn assemble<F: RangeFetcher>(
     Ok(())
 }
 
-/// A curl-backed [`RangeFetcher`] over HTTPS, matching `download.rs`'s curl
-/// conventions (`-fL`, HTTPS-only, `NetworkConfig`-aware proxy args, the same
-/// Schannel-revocation-offline retry). Presigned mirror URLs reject `HEAD`
-/// (confirmed in the feasibility report), so [`total_len`](Self::total_len)
-/// itself is a ranged GET for `bytes=0-0` (the first byte), reading the
-/// total size back out of the response's `Content-Range` header rather than
-/// issuing a separate request kind. A *suffix* range (`bytes=-1`, "the last
-/// byte") would do the same with a smaller/simpler-looking request, but real
-/// presigned URLs disagree on supporting it -- observed live: GitHub
-/// Releases' current backend (Azure Blob Storage) answers a suffix range
-/// with `501 Not Implemented`, while the S3-backed mirror the feasibility
-/// report measured against accepted it. A plain forward range starting at 0
-/// is the one form every backend observed so far accepts.
-pub struct CurlRangeFetcher<'a> {
-    url: &'a str,
-    network: &'a NetworkConfig,
-    tmp_dir: PathBuf,
-}
-
-impl<'a> CurlRangeFetcher<'a> {
-    pub fn new(url: &'a str, network: &'a NetworkConfig, tmp_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            url,
-            network,
-            tmp_dir: tmp_dir.into(),
-        }
-    }
-
-    /// `progress_path`, when given, is polled for its file size to detect a
-    /// stalled transfer (`limits.stall`, if set, is otherwise never enforced
-    /// -- `run_capturing`'s no-progress-callback form only ever checks the
-    /// total deadline). It should be the path curl is writing its `-o`
-    /// output to; growth in that file's size is curl making progress.
-    fn run_curl(
-        &self,
-        extra_args: &[String],
-        limits: RunLimits,
-        progress_path: Option<&Path>,
-    ) -> Result<std::process::Output, EngineError> {
-        let attempt = |revocation: SchannelRevocationCheck| -> Result<std::process::Output, RunError> {
-            let mut command = hidden_command(curl_exe());
-            let mut args = self.network.curl_args_with_schannel_revocation(revocation);
-            args.extend([
-                "-fL".to_string(),
-                "--proto".to_string(),
-                "=https".to_string(),
-                "--proto-redir".to_string(),
-                "=https".to_string(),
-                "-sS".to_string(),
-                "--connect-timeout".to_string(),
-                "20".to_string(),
-            ]);
-            args.extend_from_slice(extra_args);
-            args.push(self.url.to_string());
-            command.args(args);
-            match progress_path {
-                Some(path) => run_with_progress(
-                    command,
-                    limits,
-                    None,
-                    &|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-                    &|_| {},
-                ),
-                None => run_capturing(command, limits, None),
-            }
-        };
-
-        match attempt(SchannelRevocationCheck::Strict) {
-            Ok(output) if output.status.success() => Ok(output),
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                if is_schannel_revocation_offline(output.status.code(), &stderr) {
-                    let retried = attempt(SchannelRevocationCheck::Disabled)
-                        .map_err(|err| EngineError::Io(format!("curl: {}", err.message())))?;
-                    if retried.status.success() {
-                        Ok(retried)
-                    } else {
-                        Err(EngineError::Io(format!(
-                            "curl failed (exit={:?}): {}",
-                            retried.status.code(),
-                            String::from_utf8_lossy(&retried.stderr).trim()
-                        )))
-                    }
-                } else {
-                    Err(EngineError::Io(format!(
-                        "curl failed (exit={:?}): {}",
-                        output.status.code(),
-                        stderr.trim()
-                    )))
-                }
-            }
-            Err(err) => Err(EngineError::Io(format!("curl: {}", err.message()))),
-        }
-    }
-
-    fn unique_tmp_path(&self, prefix: &str) -> PathBuf {
-        self.tmp_dir.join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ))
-    }
-}
-
-impl RangeFetcher for CurlRangeFetcher<'_> {
-    fn total_len(&self) -> Result<u64, EngineError> {
-        std::fs::create_dir_all(&self.tmp_dir)
-            .map_err(|err| EngineError::Io(format!("create tmp dir: {err}")))?;
-        let body = self.unique_tmp_path("delta-probe-body");
-        let headers = self.unique_tmp_path("delta-probe-headers");
-        let body_str = body.to_string_lossy().into_owned();
-        let headers_str = headers.to_string_lossy().into_owned();
-
-        // "bytes=0-0": the server's first byte. A short, cheap probe whose
-        // response header carries the resource's total size, without
-        // relying on `HEAD` (rejected by the presigned mirror URLs this is
-        // built for, and by GitHub's own release-asset redirect target) or
-        // downloading the resource itself. Same aliasing risk as the payload
-        // fetches below: an origin or proxy that ignores `Range` and answers
-        // `200` with the whole package would otherwise make this probe write
-        // the entire ~900 MB response to disk before the missing/mismatched
-        // `Content-Range` check below ever ran. `--max-filesize` bounds that
-        // to one probe-sized body instead (curl aborts with a non-zero exit,
-        // caught by `result?`, once the response exceeds the cap).
-        const PROBE_MAX_BODY_BYTES: u64 = 64 * 1024;
-        let result = self.run_curl(
-            &[
-                "-r".to_string(),
-                "0-0".to_string(),
-                "--max-filesize".to_string(),
-                PROBE_MAX_BODY_BYTES.to_string(),
-                "-D".to_string(),
-                headers_str.clone(),
-                "-o".to_string(),
-                body_str.clone(),
-            ],
-            RunLimits::total(Duration::from_secs(30)),
-            None,
-        );
-        let header_text = std::fs::read_to_string(&headers).unwrap_or_default();
-        let _ = std::fs::remove_file(&body);
-        let _ = std::fs::remove_file(&headers);
-        result?;
-
-        // Require an actual `206 Partial Content` for exactly `bytes 0-0`,
-        // not just *a* Content-Range-shaped header -- the same aliasing an
-        // ignored Range could produce if a proxy happened to echo one back
-        // on a `200`.
-        validate_range_response(&header_text, 0, 0).map_err(|err| {
-            EngineError::Io(format!(
-                "length probe for {} did not behave like a Range-capable server: {err}",
-                self.url
-            ))
-        })?;
-
-        parse_content_range_total(&header_text).ok_or_else(|| {
-            EngineError::Io(format!(
-                "no Content-Range header in response for {} -- does it support HTTP Range requests?",
-                self.url
-            ))
-        })
-    }
-
-    fn fetch_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, EngineError> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let body = self.fetch_range_to_temp_file(offset, len)?;
-        // Clean up the temp file on every path -- a failed or timed-out curl
-        // invocation can still have written a partial body before erroring,
-        // and repeated failed delta attempts must not accumulate large
-        // partial-range files in `tmp_dir`.
-        let read_result =
-            std::fs::read(&body).map_err(|err| EngineError::Io(format!("read fetched range: {err}")));
-        let _ = std::fs::remove_file(&body);
-        read_result
-    }
-
-    fn fetch_range_into(&self, offset: u64, len: u64, dest: &mut File) -> Result<u64, EngineError> {
-        if len == 0 {
-            return Ok(0);
-        }
-        let body = self.fetch_range_to_temp_file(offset, len)?;
-        // Stream the curl output file into `dest` in bounded chunks (via
-        // `io::copy`'s fixed-size internal buffer) rather than reading it
-        // fully into an owned `Vec` first -- the whole point of this method
-        // over `fetch_range` is to keep a large coalesced range (up to
-        // several hundred MB) from ever being resident in memory at once.
-        let copy_result = (|| -> Result<u64, EngineError> {
-            let mut reader = std::fs::File::open(&body)
-                .map_err(|err| EngineError::Io(format!("open fetched range: {err}")))?;
-            std::io::copy(&mut reader, dest)
-                .map_err(|err| EngineError::Io(format!("copy fetched range: {err}")))
-        })();
-        let _ = std::fs::remove_file(&body);
-        copy_result
-    }
-}
-
-impl CurlRangeFetcher<'_> {
-    /// Range-fetch `len` bytes starting at `offset` into a freshly named
-    /// temp file under `tmp_dir` and return its path. The caller owns
-    /// removing that file (on every path, including error, since a
-    /// failed/timed-out curl invocation can still have written a partial
-    /// body).
-    fn fetch_range_to_temp_file(&self, offset: u64, len: u64) -> Result<PathBuf, EngineError> {
-        std::fs::create_dir_all(&self.tmp_dir)
-            .map_err(|err| EngineError::Io(format!("create tmp dir: {err}")))?;
-        let body = self.unique_tmp_path("delta-range-body");
-        let headers = self.unique_tmp_path("delta-range-headers");
-        let body_str = body.to_string_lossy().into_owned();
-        let headers_str = headers.to_string_lossy().into_owned();
-        let end_inclusive = offset + len - 1;
-
-        let result = self.run_curl(
-            &[
-                "-r".to_string(),
-                format!("{offset}-{end_inclusive}"),
-                // If an origin or proxy ignores the Range request and
-                // answers `200` with the entire package, curl's exit status
-                // alone would still look like success -- `-fL` only treats
-                // HTTP error *statuses* (>=400) as failure, not an ignored
-                // Range. `--max-filesize` bounds the resulting waste: curl
-                // aborts (a non-zero exit, caught below) once the response
-                // body exceeds `len` bytes, instead of downloading the
-                // whole ~900 MB package before the final byte-count check
-                // in `CountingFetcher`/`FetcherSource` would have caught it
-                // anyway.
-                "--max-filesize".to_string(),
-                len.to_string(),
-                "-D".to_string(),
-                headers_str.clone(),
-                "-o".to_string(),
-                body_str.clone(),
-            ],
-            RunLimits::with_stall(Duration::from_secs(30 * 60), Duration::from_secs(90)),
-            Some(&body),
-        );
-        let header_text = std::fs::read_to_string(&headers).unwrap_or_default();
-        let _ = std::fs::remove_file(&headers);
-        let validated = result.and_then(|_| {
-            validate_range_response(&header_text, offset, end_inclusive).map_err(|err| {
-                EngineError::Msix(format!(
-                    "range fetch for bytes {offset}-{end_inclusive} of {}: {err}",
-                    self.url
-                ))
-            })
-        });
-        match validated {
-            Ok(()) => Ok(body),
-            Err(err) => {
-                let _ = std::fs::remove_file(&body);
-                Err(err)
-            }
-        }
-    }
-}
-
-/// Require the response curl just wrote `body` from to actually be the
-/// `206 Partial Content` response for exactly `bytes {offset}-{end_inclusive}`
-/// that was requested -- not, say, a `200` with the full resource because an
-/// origin or proxy silently ignored the `Range` header. Checked against the
-/// *last* status/`Content-Range` header block in a `-fL` header dump so a
-/// redirect chain's final response is what gets validated.
-fn validate_range_response(headers: &str, offset: u64, end_inclusive: u64) -> Result<(), String> {
-    match parse_last_status_code(headers) {
-        Some(206) => {}
-        Some(other) => return Err(format!("expected HTTP 206 Partial Content, got {other}")),
-        None => return Err("no HTTP status line in response headers".to_string()),
-    }
-    match parse_content_range_start_end(headers) {
-        Some((start, end)) if start == offset && end == end_inclusive => Ok(()),
-        Some((start, end)) => Err(format!(
-            "Content-Range bytes {start}-{end} does not match the requested {offset}-{end_inclusive}"
-        )),
-        None => Err("no Content-Range header in response".to_string()),
-    }
-}
-
-/// Parse curl's `-D` header dump for the last `HTTP/<version> <code> ...`
-/// status line (may contain one per redirect hop -- the final hop's status
-/// is what matters).
-fn parse_last_status_code(headers: &str) -> Option<u16> {
-    headers.lines().rev().find_map(|line| {
-        let line = line.trim();
-        line.strip_prefix("HTTP/")?
-            .split_whitespace()
-            .nth(1)?
-            .parse::<u16>()
-            .ok()
-    })
-}
-
-/// Like [`parse_content_range_total`], but returns the response's declared
-/// `(start, end)` byte range instead of the total resource size.
-fn parse_content_range_start_end(headers: &str) -> Option<(u64, u64)> {
-    headers.lines().rev().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if !name.trim().eq_ignore_ascii_case("content-range") {
-            return None;
-        }
-        let range = value.trim().strip_prefix("bytes ")?.split_once('/')?.0;
-        let (start, end) = range.split_once('-')?;
-        Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
-    })
-}
-
-/// Parse `Content-Range: bytes X-Y/TOTAL` out of a raw curl `-D` header dump
-/// (which, with `-fL`, may contain one header block per redirect hop) and
-/// return `TOTAL`. The *last* occurrence in the text is used so a redirect
-/// chain's final response wins over an intermediate hop's headers.
-fn parse_content_range_total(headers: &str) -> Option<u64> {
-    headers.lines().rev().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if !name.trim().eq_ignore_ascii_case("content-range") {
-            return None;
-        }
-        value.trim().rsplit('/').next()?.trim().parse::<u64>().ok()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::write::DeflateEncoder;
     use flate2::Compression;
-
-    #[test]
-    fn parses_content_range_total_from_a_header_dump() {
-        let headers = "HTTP/2 206\r\ncontent-range: bytes 876623360-876623360/876623361\r\naccept-ranges: bytes\r\n\r\n";
-        assert_eq!(parse_content_range_total(headers), Some(876623361));
-    }
-
-    #[test]
-    fn parses_content_range_total_preferring_the_final_redirect_hop() {
-        let headers = "\
-HTTP/2 302\r\nlocation: https://mirror.example/final\r\n\r\n\
-HTTP/2 206\r\nContent-Range: bytes 0-0/123456\r\n\r\n";
-        assert_eq!(parse_content_range_total(headers), Some(123456));
-    }
-
-    #[test]
-    fn missing_content_range_header_is_none() {
-        let headers = "HTTP/2 200\r\ncontent-length: 42\r\n\r\n";
-        assert_eq!(parse_content_range_total(headers), None);
-    }
-
-    #[test]
-    fn validate_range_response_accepts_a_matching_206() {
-        let headers = "HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
-        assert!(validate_range_response(headers, 100, 199).is_ok());
-    }
-
-    #[test]
-    fn validate_range_response_rejects_an_ignored_range_answered_with_200() {
-        // An origin/proxy that ignores `Range` and returns the whole
-        // resource -- exactly the failure mode a `--max-filesize` cap and
-        // this status check exist to catch quickly instead of trusting a
-        // merely-successful curl exit.
-        let headers = "HTTP/2 200\r\ncontent-length: 876623361\r\n\r\n";
-        let err = validate_range_response(headers, 100, 199).unwrap_err();
-        assert!(err.contains("206"), "{err}");
-    }
-
-    #[test]
-    fn validate_range_response_rejects_a_content_range_for_the_wrong_bytes() {
-        let headers = "HTTP/2 206\r\ncontent-range: bytes 0-99/876623361\r\n\r\n";
-        let err = validate_range_response(headers, 100, 199).unwrap_err();
-        assert!(err.contains("does not match"), "{err}");
-    }
-
-    #[test]
-    fn validate_range_response_prefers_the_final_redirect_hops_status() {
-        let headers = "\
-HTTP/2 302\r\nlocation: https://mirror.example/final\r\n\r\n\
-HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
-        assert!(validate_range_response(headers, 100, 199).is_ok());
-    }
+    use std::path::PathBuf;
 
     // ---- Fake, in-memory RangeFetcher + synthetic MSIX-like ZIP builder for
     // full plan -> assemble -> verify pipeline tests with no network at all.
@@ -1032,6 +674,118 @@ HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
 
         let _ = std::fs::remove_file(&base_path);
         let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[test]
+    fn reconstructs_through_a_pinned_url_with_retries_and_a_mid_run_re_resolve() {
+        use crate::delta::http::test_support::{http_failure, new_session, transport_failure, Call, FakeTransport};
+
+        // Five blocks; blocks 1 and 3 change, so with a zero coalescing gap
+        // the plan has separate fetch ranges in addition to the layout reads.
+        const BLOCK_LEN: usize = 300_000;
+        let hashes = ["h0", "h1-old", "h2", "h3-old", "h4"];
+        let new_hashes = ["h0", "h1-new", "h2", "h3-new", "h4"];
+        let make = |hs: &[&'static str], seed_shift: u32| {
+            build_package(&[FileSpec {
+                name: "app/big.dll",
+                blocks: hs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| {
+                        let changed = h.ends_with("-new");
+                        BlockSpec {
+                            content: filler(i as u32 + if changed { seed_shift } else { 0 }, BLOCK_LEN),
+                            hash: h,
+                            compress: true,
+                        }
+                    })
+                    .collect(),
+            }])
+        };
+        let base = make(&hashes, 0);
+        let new_pkg = make(&new_hashes, 100);
+        let base_path = write_temp_file("pinned-base", &base);
+        let dest_path = std::env::temp_dir().join(format!(
+            "codex-win-engine-executor-test-dest-pinned-{}-{}.msix",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let expected_sha256 = sha256_hex(&new_pkg);
+
+        let transport = FakeTransport::new(new_pkg.clone(), true);
+        // The first two layout reads hit a 429 (Retry-After) and a curl
+        // exit 56; then the presigned URL "expires" before the 5th range call.
+        transport.fail_ranges(vec![http_failure(429, Some(1)), transport_failure(56)]);
+        *transport.expire_before_range_call.lock().unwrap() = Some(6);
+        let (session, sleeps) = new_session(transport, RetryPolicy::default());
+
+        let outcome = execute_delta(
+            &base_path,
+            &session,
+            &dest_path,
+            &expected_sha256,
+            &PlannerConfig { coalesce_gap: 0 },
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest_path).unwrap(), new_pkg, "byte-identical");
+        assert_eq!(outcome.sha256, expected_sha256);
+        assert_eq!(outcome.retry_stats.retries, 2);
+        assert_eq!(outcome.retry_stats.re_resolves, 1);
+        assert_eq!(sleeps.lock().unwrap().len(), 2);
+        assert!(outcome.savings_pct > 0.0, "some blocks were reused");
+
+        let transport = session.transport();
+        // Only probes ever touch the router URL; every range goes to a
+        // presigned URL.
+        for call in transport.calls() {
+            if let Call::Range { url, .. } = call {
+                assert!(url.starts_with("https://cdn.example/"), "{url}");
+            }
+        }
+        assert_eq!(transport.probe_count(), 2, "initial resolve + one re-resolve");
+
+        let _ = std::fs::remove_file(&base_path);
+        let _ = std::fs::remove_file(&dest_path);
+    }
+
+    #[test]
+    fn persistent_throttling_surfaces_an_error_and_leaves_no_destination() {
+        use crate::delta::http::test_support::{http_failure, new_session, FakeTransport};
+
+        let base = build_package(&[FileSpec {
+            name: "app/a.bin",
+            blocks: vec![BlockSpec { content: filler(1, 100_000), hash: "h1", compress: true }],
+        }]);
+        let new_pkg = build_package(&[FileSpec {
+            name: "app/a.bin",
+            blocks: vec![BlockSpec { content: filler(2, 100_000), hash: "h2", compress: true }],
+        }]);
+        let base_path = write_temp_file("throttled-base", &base);
+        let dest_path = std::env::temp_dir().join(format!(
+            "codex-win-engine-executor-test-dest-throttled-{}-{}.msix",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let transport = FakeTransport::new(new_pkg.clone(), true);
+        transport.fail_ranges((0..50).map(|_| http_failure(429, Some(1))).collect());
+        let (session, _) = new_session(transport, RetryPolicy::default());
+
+        let err = execute_delta(
+            &base_path,
+            &session,
+            &dest_path,
+            &sha256_hex(&new_pkg),
+            &PlannerConfig::default(),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("HTTP 429"), "{err}");
+        assert!(!dest_path.exists());
+        assert_eq!(session.transport().range_calls().len(), 4, "bounded by max_attempts");
+
+        let _ = std::fs::remove_file(&base_path);
     }
 
     #[test]

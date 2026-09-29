@@ -14,7 +14,19 @@
 //!
 //! Usage:
 //!   cargo run -p codex-win-engine --example win_delta_reconstruct -- \
+//!     [--gap-kib N] [--min-savings PCT] \
 //!     <base-msix-path> <new-package-url> <expected-sha256> [dest-path]
+//!
+//! `--gap-kib` is the range-coalescing gap (default 256): a larger gap means
+//! fewer HTTP requests at the cost of re-fetching some reusable bytes that sit
+//! between two changed regions. `--min-savings` is the planned-savings
+//! percentage below which the run gives up (default 15).
+//!
+//! The package URL is resolved once (its redirect, e.g. the mirror router's
+//! 302 to a presigned S3 URL, is followed by the length probe and every range
+//! request goes to the final URL); 429/503 and transient curl failures are
+//! retried within a bounded budget. On macOS the win engine's system-proxy
+//! mode resolves nothing, so set `HTTPS_PROXY` when a proxy is needed.
 //!
 //! `dest-path` defaults to a file next to the base path; it is created (and
 //! left in place unless you delete it -- this is example code, not the
@@ -31,11 +43,37 @@ use codex_win_engine::delta::planner::PlannerConfig;
 use codex_win_engine::NetworkConfig;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let mut raw = env::args();
+    let program = raw.next().unwrap_or_else(|| "win_delta_reconstruct".to_string());
+    let mut gap_kib: u64 = 256;
+    let mut min_savings: f64 = 15.0;
+    let mut positional: Vec<String> = Vec::new();
+    while let Some(arg) = raw.next() {
+        match arg.as_str() {
+            "--gap-kib" => match raw.next().and_then(|v| v.parse().ok()) {
+                Some(v) => gap_kib = v,
+                None => {
+                    eprintln!("--gap-kib needs an integer");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--min-savings" => match raw.next().and_then(|v| v.parse().ok()) {
+                Some(v) => min_savings = v,
+                None => {
+                    eprintln!("--min-savings needs a number");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => positional.push(arg),
+        }
+    }
+    // Shift so the indexes below stay `args[1..]`.
+    let mut args = vec![program];
+    args.extend(positional);
     if args.len() < 4 || args.len() > 5 {
         eprintln!(
-            "usage: {} <base-msix-path> <new-package-url> <expected-sha256> [dest-path]",
-            args.first().map(String::as_str).unwrap_or("win_delta_reconstruct")
+            "usage: {} [--gap-kib N] [--min-savings PCT] <base-msix-path> <new-package-url> <expected-sha256> [dest-path]",
+            args[0]
         );
         return ExitCode::FAILURE;
     }
@@ -59,6 +97,7 @@ fn main() -> ExitCode {
     println!("new package url: {url}");
     println!("expected sha256: {expected_sha256}");
     println!("dest:            {}", dest_path.display());
+    println!("coalesce gap:    {gap_kib} KiB, min planned savings {min_savings}%");
     println!();
 
     let network = NetworkConfig::system();
@@ -76,8 +115,10 @@ fn main() -> ExitCode {
         &fetcher,
         &dest_path,
         &expected_sha256,
-        &PlannerConfig::default(),
-        15.0,
+        &PlannerConfig {
+            coalesce_gap: gap_kib * 1024,
+        },
+        min_savings,
     );
     let elapsed = started.elapsed();
 
@@ -86,7 +127,15 @@ fn main() -> ExitCode {
             println!("RECONSTRUCTION SUCCEEDED");
             println!("  new package size:  {} bytes", outcome.new_size);
             println!("  bytes fetched:      {} bytes", outcome.bytes_fetched);
-            println!("  requests made:      {}", outcome.request_count);
+            println!("  requests made:      {} (successful; includes the length probe)", outcome.request_count);
+            println!(
+                "  retries:            {} transient retries, {} URL re-resolves",
+                outcome.retry_stats.retries, outcome.retry_stats.re_resolves
+            );
+            println!(
+                "  curl invocations:   {}",
+                outcome.request_count + outcome.retry_stats.retries + outcome.retry_stats.re_resolves
+            );
             println!("  planned savings:    {:.2}%", outcome.savings_pct);
             println!(
                 "  actual savings:     {:.2}% (1 - bytes_fetched/new_size, includes layout-probing overhead)",

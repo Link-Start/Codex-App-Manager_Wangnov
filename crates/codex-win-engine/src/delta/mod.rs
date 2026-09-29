@@ -16,9 +16,13 @@
 //!     the planner can walk directly (absolute byte offset of every block).
 //!   - [`planner`]: pure copy-or-fetch planning with gap coalescing. No I/O,
 //!     so it is unit-tested without a network or a real MSIX on disk.
-//!   - [`executor`]: runs a plan against a real (`executor::CurlRangeFetcher`,
-//!     curl-based, honors [`crate::network::NetworkConfig`]) or fake (tests)
-//!     range source, assembles the new package in a staging file, and
+//!   - [`http`]: the range transport. [`http::CurlRangeFetcher`] (curl-based,
+//!     honors [`crate::network::NetworkConfig`]) resolves the package URL's
+//!     redirect once and pins every range request to the final URL,
+//!     re-resolving once on an expired presign (403), and retries 429/503 (with
+//!     a capped `Retry-After`) and transient curl exits under a bounded budget.
+//!   - [`executor`]: runs a plan against a real ([`http::CurlRangeFetcher`])
+//!     or fake (tests) range source, assembles the new package in a staging file, and
 //!     requires the assembled file's streamed SHA-256 to equal the value the
 //!     caller supplies (from the mirror manifest / `SHA256SUMS-windows.txt`)
 //!     before ever returning success. Any failure -- a plan not worth using,
@@ -36,6 +40,7 @@
 //! deferred.
 
 pub mod executor;
+pub mod http;
 pub mod layout;
 pub mod planner;
 pub mod retention;
