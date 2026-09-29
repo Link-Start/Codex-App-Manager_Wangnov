@@ -463,27 +463,102 @@ impl CurlRangeFetcher<'_> {
         std::fs::create_dir_all(&self.tmp_dir)
             .map_err(|err| EngineError::Io(format!("create tmp dir: {err}")))?;
         let body = self.unique_tmp_path("delta-range-body");
+        let headers = self.unique_tmp_path("delta-range-headers");
         let body_str = body.to_string_lossy().into_owned();
+        let headers_str = headers.to_string_lossy().into_owned();
         let end_inclusive = offset + len - 1;
 
         let result = self.run_curl(
             &[
                 "-r".to_string(),
                 format!("{offset}-{end_inclusive}"),
+                // If an origin or proxy ignores the Range request and
+                // answers `200` with the entire package, curl's exit status
+                // alone would still look like success -- `-fL` only treats
+                // HTTP error *statuses* (>=400) as failure, not an ignored
+                // Range. `--max-filesize` bounds the resulting waste: curl
+                // aborts (a non-zero exit, caught below) once the response
+                // body exceeds `len` bytes, instead of downloading the
+                // whole ~900 MB package before the final byte-count check
+                // in `CountingFetcher`/`FetcherSource` would have caught it
+                // anyway.
+                "--max-filesize".to_string(),
+                len.to_string(),
+                "-D".to_string(),
+                headers_str.clone(),
                 "-o".to_string(),
                 body_str.clone(),
             ],
             RunLimits::with_stall(Duration::from_secs(30 * 60), Duration::from_secs(90)),
             Some(&body),
         );
-        match result {
-            Ok(_) => Ok(body),
+        let header_text = std::fs::read_to_string(&headers).unwrap_or_default();
+        let _ = std::fs::remove_file(&headers);
+        let validated = result.and_then(|_| {
+            validate_range_response(&header_text, offset, end_inclusive).map_err(|err| {
+                EngineError::Msix(format!(
+                    "range fetch for bytes {offset}-{end_inclusive} of {}: {err}",
+                    self.url
+                ))
+            })
+        });
+        match validated {
+            Ok(()) => Ok(body),
             Err(err) => {
                 let _ = std::fs::remove_file(&body);
                 Err(err)
             }
         }
     }
+}
+
+/// Require the response curl just wrote `body` from to actually be the
+/// `206 Partial Content` response for exactly `bytes {offset}-{end_inclusive}`
+/// that was requested -- not, say, a `200` with the full resource because an
+/// origin or proxy silently ignored the `Range` header. Checked against the
+/// *last* status/`Content-Range` header block in a `-fL` header dump so a
+/// redirect chain's final response is what gets validated.
+fn validate_range_response(headers: &str, offset: u64, end_inclusive: u64) -> Result<(), String> {
+    match parse_last_status_code(headers) {
+        Some(206) => {}
+        Some(other) => return Err(format!("expected HTTP 206 Partial Content, got {other}")),
+        None => return Err("no HTTP status line in response headers".to_string()),
+    }
+    match parse_content_range_start_end(headers) {
+        Some((start, end)) if start == offset && end == end_inclusive => Ok(()),
+        Some((start, end)) => Err(format!(
+            "Content-Range bytes {start}-{end} does not match the requested {offset}-{end_inclusive}"
+        )),
+        None => Err("no Content-Range header in response".to_string()),
+    }
+}
+
+/// Parse curl's `-D` header dump for the last `HTTP/<version> <code> ...`
+/// status line (may contain one per redirect hop -- the final hop's status
+/// is what matters).
+fn parse_last_status_code(headers: &str) -> Option<u16> {
+    headers.lines().rev().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("HTTP/")?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u16>()
+            .ok()
+    })
+}
+
+/// Like [`parse_content_range_total`], but returns the response's declared
+/// `(start, end)` byte range instead of the total resource size.
+fn parse_content_range_start_end(headers: &str) -> Option<(u64, u64)> {
+    headers.lines().rev().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("content-range") {
+            return None;
+        }
+        let range = value.trim().strip_prefix("bytes ")?.split_once('/')?.0;
+        let (start, end) = range.split_once('-')?;
+        Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+    })
 }
 
 /// Parse `Content-Range: bytes X-Y/TOTAL` out of a raw curl `-D` header dump
@@ -524,6 +599,38 @@ HTTP/2 206\r\nContent-Range: bytes 0-0/123456\r\n\r\n";
     fn missing_content_range_header_is_none() {
         let headers = "HTTP/2 200\r\ncontent-length: 42\r\n\r\n";
         assert_eq!(parse_content_range_total(headers), None);
+    }
+
+    #[test]
+    fn validate_range_response_accepts_a_matching_206() {
+        let headers = "HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
+        assert!(validate_range_response(headers, 100, 199).is_ok());
+    }
+
+    #[test]
+    fn validate_range_response_rejects_an_ignored_range_answered_with_200() {
+        // An origin/proxy that ignores `Range` and returns the whole
+        // resource -- exactly the failure mode a `--max-filesize` cap and
+        // this status check exist to catch quickly instead of trusting a
+        // merely-successful curl exit.
+        let headers = "HTTP/2 200\r\ncontent-length: 876623361\r\n\r\n";
+        let err = validate_range_response(headers, 100, 199).unwrap_err();
+        assert!(err.contains("206"), "{err}");
+    }
+
+    #[test]
+    fn validate_range_response_rejects_a_content_range_for_the_wrong_bytes() {
+        let headers = "HTTP/2 206\r\ncontent-range: bytes 0-99/876623361\r\n\r\n";
+        let err = validate_range_response(headers, 100, 199).unwrap_err();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn validate_range_response_prefers_the_final_redirect_hops_status() {
+        let headers = "\
+HTTP/2 302\r\nlocation: https://mirror.example/final\r\n\r\n\
+HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
+        assert!(validate_range_response(headers, 100, 199).is_ok());
     }
 
     // ---- Fake, in-memory RangeFetcher + synthetic MSIX-like ZIP builder for
