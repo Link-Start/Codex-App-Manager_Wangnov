@@ -84,23 +84,19 @@ fn parse_u64_attr(value: &str, context: &str) -> Result<u64, EngineError> {
         .map_err(|err| EngineError::Msix(format!("AppxBlockMap {context} has invalid integer: {err}")))
 }
 
-/// Parse `AppxBlockMap.xml` into the full per-file, per-block structure.
-///
-/// This is the single place that walks the XML; both `portable.rs` (which
-/// only wants `name` + `uncompressed_size`) and `delta::layout` (which also
-/// needs `lfh_size` and every block) call through here so the traversal and
-/// its error messages exist exactly once.
-pub fn parse_appx_block_map_xml(xml: &str) -> Result<AppxBlockMap, EngineError> {
-    let document = roxmltree::Document::parse(xml)
-        .map_err(|err| EngineError::Msix(format!("AppxBlockMap.xml: {err}")))?;
-
-    let mut files = Vec::new();
-    for file in document
-        .descendants()
-        .filter(|node| node.has_tag_name("File"))
-    {
-        let name = attr(&file, "Name", "File")?.to_string();
-        let uncompressed_size = parse_u64_attr(attr(&file, "Size", "File")?, &format!("File Size: {name}"))?;
+/// Parse a single `<File>` element's `LfhSize` + `<Block>` children --
+/// everything only `delta::layout` needs, never `portable.rs`'s extractor.
+/// Any malformed or invalid data here (a nonnumeric `LfhSize`, a `<Block>`
+/// missing `Hash`, a nonnumeric `Block Size`) downgrades to `(None, vec![])`
+/// instead of failing the whole document: this field-set existing in some
+/// form but being unusable for delta purposes is exactly the same case, as
+/// far as `delta::layout` is concerned, as `LfhSize`/`<Block>` being absent
+/// entirely (its `lfh_size.ok_or_else` already errors on `None`, which is
+/// the correct outcome -- fall back to a full download for *that* package --
+/// without portable extraction, which never reads either field, ever seeing
+/// the error at all).
+fn parse_delta_only_fields(file: &roxmltree::Node, name: &str, uncompressed_size: u64) -> (Option<u64>, Vec<AppxBlock>) {
+    let parse = || -> Result<(Option<u64>, Vec<AppxBlock>), EngineError> {
         let lfh_size = file
             .attribute("LfhSize")
             .map(|raw| parse_u64_attr(raw, &format!("File LfhSize: {name}")))
@@ -130,6 +126,33 @@ pub fn parse_appx_block_map_xml(xml: &str) -> Result<AppxBlockMap, EngineError> 
                 stored,
             });
         }
+        Ok((lfh_size, blocks))
+    };
+    parse().unwrap_or((None, Vec::new()))
+}
+
+/// Parse `AppxBlockMap.xml` into the full per-file, per-block structure.
+///
+/// This is the single place that walks the XML; both `portable.rs` (which
+/// only wants `name` + `uncompressed_size`) and `delta::layout` (which also
+/// needs `lfh_size` and every block) call through here so the traversal and
+/// its error messages exist exactly once. Only `Name` and `Size` -- the two
+/// fields the portable extractor actually reads -- are hard requirements
+/// for a `<File>` element, matching the standalone extractor this replaced;
+/// see [`parse_delta_only_fields`] for why everything else degrades instead
+/// of failing the whole parse.
+pub fn parse_appx_block_map_xml(xml: &str) -> Result<AppxBlockMap, EngineError> {
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|err| EngineError::Msix(format!("AppxBlockMap.xml: {err}")))?;
+
+    let mut files = Vec::new();
+    for file in document
+        .descendants()
+        .filter(|node| node.has_tag_name("File"))
+    {
+        let name = attr(&file, "Name", "File")?.to_string();
+        let uncompressed_size = parse_u64_attr(attr(&file, "Size", "File")?, &format!("File Size: {name}"))?;
+        let (lfh_size, blocks) = parse_delta_only_fields(&file, &name, uncompressed_size);
 
         files.push(AppxBlockMapFile {
             name,
@@ -197,6 +220,38 @@ mod tests {
         let xml = r#"<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap"><File Name="a" Size="1"><Block Hash="x" Size="1"/></File></BlockMap>"#;
         let parsed = parse_appx_block_map_xml(xml).unwrap();
         assert_eq!(parsed.files[0].lfh_size, None);
+    }
+
+    #[test]
+    fn nonnumeric_lfh_size_degrades_to_none_instead_of_failing_the_document() {
+        // Portable extraction never reads `LfhSize`; a document with a
+        // malformed value for it (or, as below, no parseable blocks) must
+        // still parse successfully for `Name`/`Size` -- exactly as it would
+        // if the attribute were absent. Only `delta::layout`, which does
+        // need the field, treats the resulting `None` as its own error.
+        let xml = r#"<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap"><File Name="a" Size="10" LfhSize="not-a-number"><Block Hash="x" Size="10"/></File></BlockMap>"#;
+        let parsed = parse_appx_block_map_xml(xml).unwrap();
+        assert_eq!(parsed.files[0].name, "a");
+        assert_eq!(parsed.files[0].uncompressed_size, 10);
+        assert_eq!(parsed.files[0].lfh_size, None);
+    }
+
+    #[test]
+    fn a_block_missing_hash_degrades_the_whole_file_to_no_blocks_instead_of_failing() {
+        // The pre-refactor portable extractor never even looked at `<Block>`
+        // elements, so a document with one malformed `<Block>` (here,
+        // missing `Hash`) must not become unparseable for portable
+        // extraction just because the shared parser also reads blocks now.
+        let xml = r#"<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap"><File Name="a" Size="10" LfhSize="1"><Block Size="10"/></File></BlockMap>"#;
+        let parsed = parse_appx_block_map_xml(xml).unwrap();
+        assert_eq!(parsed.files[0].name, "a");
+        assert_eq!(parsed.files[0].uncompressed_size, 10);
+        // The whole delta-only field set for this file -- LfhSize included
+        // -- downgrades together, so `delta::layout` (which needs both)
+        // fails closed on the missing LfhSize rather than resolving blocks
+        // against a value that was never actually validated.
+        assert_eq!(parsed.files[0].lfh_size, None);
+        assert!(parsed.files[0].blocks.is_empty());
     }
 
     #[test]

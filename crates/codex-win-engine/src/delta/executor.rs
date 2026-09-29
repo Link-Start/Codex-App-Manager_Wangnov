@@ -399,11 +399,20 @@ impl RangeFetcher for CurlRangeFetcher<'_> {
         // response header carries the resource's total size, without
         // relying on `HEAD` (rejected by the presigned mirror URLs this is
         // built for, and by GitHub's own release-asset redirect target) or
-        // downloading the resource itself.
+        // downloading the resource itself. Same aliasing risk as the payload
+        // fetches below: an origin or proxy that ignores `Range` and answers
+        // `200` with the whole package would otherwise make this probe write
+        // the entire ~900 MB response to disk before the missing/mismatched
+        // `Content-Range` check below ever ran. `--max-filesize` bounds that
+        // to one probe-sized body instead (curl aborts with a non-zero exit,
+        // caught by `result?`, once the response exceeds the cap).
+        const PROBE_MAX_BODY_BYTES: u64 = 64 * 1024;
         let result = self.run_curl(
             &[
                 "-r".to_string(),
                 "0-0".to_string(),
+                "--max-filesize".to_string(),
+                PROBE_MAX_BODY_BYTES.to_string(),
                 "-D".to_string(),
                 headers_str.clone(),
                 "-o".to_string(),
@@ -416,6 +425,17 @@ impl RangeFetcher for CurlRangeFetcher<'_> {
         let _ = std::fs::remove_file(&body);
         let _ = std::fs::remove_file(&headers);
         result?;
+
+        // Require an actual `206 Partial Content` for exactly `bytes 0-0`,
+        // not just *a* Content-Range-shaped header -- the same aliasing an
+        // ignored Range could produce if a proxy happened to echo one back
+        // on a `200`.
+        validate_range_response(&header_text, 0, 0).map_err(|err| {
+            EngineError::Io(format!(
+                "length probe for {} did not behave like a Range-capable server: {err}",
+                self.url
+            ))
+        })?;
 
         parse_content_range_total(&header_text).ok_or_else(|| {
             EngineError::Io(format!(

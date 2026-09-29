@@ -77,6 +77,12 @@ pub const BASE_SHA256_FILE_NAME: &str = "delta-base.sha256";
 /// this rules out is the unsafe one: a *new* base ever left paired with the
 /// *previous* base's sidecar, which [`retained_base`] would otherwise hand
 /// out as a usable pair despite the checksum belonging to different bytes.
+///
+/// The new sidecar's own write is not a plain [`std::fs::write`]: it goes
+/// through the same write-to-temp-then-rename sequence as the base copy
+/// above, so a crash or disk-full error partway through *that* write can
+/// never leave a truncated-but-nonempty sidecar file behind for
+/// [`retained_base`] to read back as if it were a complete SHA-256.
 pub fn retain_verified_base(
     base_dir: &Path,
     verified_msix: &Path,
@@ -86,6 +92,7 @@ pub fn retain_verified_base(
     let dest = base_dir.join(BASE_FILE_NAME);
     let tmp = base_dir.join(format!("{BASE_FILE_NAME}.tmp"));
     let sha_path = base_dir.join(BASE_SHA256_FILE_NAME);
+    let sha_tmp = base_dir.join(format!("{BASE_SHA256_FILE_NAME}.tmp"));
     std::fs::copy(verified_msix, &tmp)?;
     match std::fs::remove_file(&sha_path) {
         Ok(()) => {}
@@ -93,7 +100,8 @@ pub fn retain_verified_base(
         Err(err) => return Err(err),
     }
     std::fs::rename(&tmp, &dest)?;
-    std::fs::write(&sha_path, sha256.trim())?;
+    std::fs::write(&sha_tmp, sha256.trim())?;
+    std::fs::rename(&sha_tmp, &sha_path)?;
     Ok(dest)
 }
 
