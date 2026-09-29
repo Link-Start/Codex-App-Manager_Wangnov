@@ -126,6 +126,18 @@ pub fn plan_delta(
     let mut reused_blocks = 0usize;
     let mut reused_bytes = 0u64;
 
+    // Bytes before the first local header (a self-extractor stub or other
+    // prefix; none in real MSIX packages, but a valid ZIP may have one) are
+    // described by no block hash: always fetch them, or `assemble` would leave
+    // zeroes there and only the final SHA-256 would notice.
+    let first_entry_offset = new_layout
+        .files
+        .first()
+        .map_or(new_layout.central_directory_offset, |file| file.local_header_offset);
+    if first_entry_offset > 0 {
+        raw_fetch_spans.push((0, first_entry_offset));
+    }
+
     for file in &new_layout.files {
         match &file.block_map_file {
             None => {
@@ -380,6 +392,28 @@ mod tests {
         assert_eq!(plan.copies[0].len, 100);
         // The size-mismatched block (new offsets 140..290) is fetched whole.
         assert!(plan.fetches.iter().any(|f| f.offset <= 140 && f.offset + f.len >= 140 + 150));
+    }
+
+    #[test]
+    fn bytes_before_the_first_entry_are_fetched() {
+        // A package with a 64-byte prefix before its first local header.
+        let base = single_file_layout("app/a.bin", 64, 40, vec![block("h1", 100)]);
+        let new_layout = single_file_layout("app/a.bin", 64, 40, vec![block("h1", 100)]);
+        let plan = plan_delta(&build_reuse_index(&base), &new_layout, &PlannerConfig { coalesce_gap: 0 });
+        assert!(
+            plan.fetches.iter().any(|f| f.offset == 0 && f.len >= 64),
+            "the prefix 0..64 must be covered by a fetch: {:?}",
+            plan.fetches
+        );
+        // Every byte is covered by a copy or a fetch.
+        let mut covered = vec![false; new_layout.file_size as usize];
+        for c in &plan.copies {
+            covered[c.new_offset as usize..(c.new_offset + c.len) as usize].fill(true);
+        }
+        for f in &plan.fetches {
+            covered[f.offset as usize..(f.offset + f.len) as usize].fill(true);
+        }
+        assert!(covered.iter().all(|c| *c));
     }
 
     #[test]
