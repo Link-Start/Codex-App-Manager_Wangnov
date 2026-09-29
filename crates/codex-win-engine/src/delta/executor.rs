@@ -181,6 +181,33 @@ pub fn execute_delta<F: RangeFetcher>(
     config: &PlannerConfig,
     min_savings_pct: f64,
 ) -> Result<DeltaOutcome, EngineError> {
+    // `assemble` below calls `File::create(dest_path)`, which truncates
+    // whatever is already there -- if a caller ever passed the same path
+    // for both arguments (nothing upstream of this function stops them;
+    // the example binary's optional destination argument in particular
+    // makes it one flag away), that would truncate the retained base out
+    // from under the read below, and a subsequent fetch/SHA-256 failure
+    // would then delete it entirely instead of leaving it available for a
+    // later attempt or the existing full-download fallback. Reject the
+    // aliasing outright rather than relying on read-before-write ordering
+    // to save it: `canonicalize` first (catches relative-vs-absolute and
+    // symlinked paths to the same file) and fall back to a raw path
+    // comparison for a `dest_path` that does not exist yet, which is the
+    // ordinary case and where `canonicalize` would otherwise always fail
+    // and silently skip the check.
+    let same_file = std::fs::canonicalize(base_path)
+        .ok()
+        .zip(std::fs::canonicalize(dest_path).ok())
+        .map(|(base, dest)| base == dest)
+        .unwrap_or_else(|| base_path == dest_path);
+    if same_file {
+        return Err(EngineError::Msix(format!(
+            "delta destination {} must not be the same file as the base {}",
+            dest_path.display(),
+            base_path.display()
+        )));
+    }
+
     // The base is read fully into memory rather than streamed: at up to
     // ~900 MB (current x64 MSIX sizes) this is a real but bounded and
     // one-shot cost, and it lets `InMemorySource` serve both the layout
@@ -1011,6 +1038,45 @@ HTTP/2 206\r\ncontent-range: bytes 100-199/876623361\r\n\r\n";
             "unexpected error: {err}"
         );
         assert!(!dest_path.exists());
+
+        let _ = std::fs::remove_file(&base_path);
+    }
+
+    #[test]
+    fn a_destination_that_aliases_the_base_is_rejected_before_touching_either_file() {
+        // A caller that (mistakenly, or via the example binary's optional
+        // destination argument) passes the same path for both `base_path`
+        // and `dest_path` must not have that base truncated by `assemble`'s
+        // `File::create(dest_path)` -- see the comment at the top of
+        // `execute_delta`. The retained base's real bytes on disk are the
+        // signal this test checks: they must be completely untouched.
+        let base_content = b"this is a base file, not touched by this call at all".to_vec();
+        let base_path = write_temp_file("alias-base", &base_content);
+        let new_pkg = build_package(&[FileSpec {
+            name: "app/a.bin",
+            blocks: vec![BlockSpec { content: vec![1u8; 1_000], hash: "h1", compress: false }],
+        }]);
+        let expected_sha256 = sha256_hex(&new_pkg);
+        let fetcher = FakeFetcher { data: new_pkg };
+
+        let err = execute_delta(
+            &base_path,
+            &fetcher,
+            &base_path,
+            &expected_sha256,
+            &PlannerConfig::default(),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be the same file"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&base_path).unwrap(),
+            base_content,
+            "the base file must be byte-for-byte untouched by a rejected call"
+        );
 
         let _ = std::fs::remove_file(&base_path);
     }
