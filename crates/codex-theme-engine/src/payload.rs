@@ -577,15 +577,39 @@ mod tests {
 
         // Main-surface compatibility shim: current selector takes priority
         // over the legacy one, and the compat marker exists.
+        //
+        // theme-runtime.js is embedded into the payload as literal JS source
+        // and is never evaluated by Rust, so `${LEGACY_SHELL_MAIN_CLASS}`
+        // below is NOT Rust/format! interpolation -- it is (one form of) the
+        // literal JS text theme-runtime.js writes for its
+        // `document.querySelector(\`main.${LEGACY_SHELL_MAIN_CLASS}\`)` call.
+        // This assertion is therefore checking the raw embedded JS source
+        // text for known constructions of that call, not the executed
+        // selector-ordering behavior itself -- that behavior is exercised
+        // against a real DOM by studio's `runtime-golden.test.mjs`. To
+        // survive a behavior-preserving rewrite of the JS expression (e.g.
+        // string concatenation or an inlined literal), the search below
+        // tries several known forms; only look for the current selector
+        // first, then search *after* it for the legacy pattern, so ordering
+        // is guaranteed by construction rather than by comparing positions
+        // found independently (which a coincidental earlier match, such as
+        // the `main.main-surface` CSS rule embedded above this shim, could
+        // otherwise satisfy spuriously).
         let current = built
             .payload
             .find("main[data-app-shell-main-surface]")
             .expect("current main-surface selector must be present");
-        let legacy = built
-            .payload
+        built.payload[current..]
             .find("main.${LEGACY_SHELL_MAIN_CLASS}")
-            .expect("legacy main-surface fallback must be present");
-        assert!(current < legacy, "current main-surface selector must be tried first");
+            .or_else(|| built.payload[current..].find("\"main.\" + LEGACY_SHELL_MAIN_CLASS"))
+            .or_else(|| built.payload[current..].find("main.main-surface"))
+            .expect(
+                "legacy main-surface fallback must be present after the current selector \
+                 (checked the template-literal, string-concatenation, and inlined-literal \
+                 forms of theme-runtime.js's selector construction -- if theme-runtime.js's \
+                 legacy-selector expression changed to a different form, update this test \
+                 rather than assuming the fallback itself broke)",
+            );
         assert!(built.payload.contains("data-cts-main-surface-compat"));
 
         // Composer-surface compatibility shim: both the current CSS-module
