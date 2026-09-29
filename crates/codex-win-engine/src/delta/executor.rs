@@ -19,7 +19,7 @@ use crate::delta::layout::build_package_layout;
 use crate::delta::planner::{build_reuse_index, plan_delta, DeltaPlan, PlannerConfig};
 use crate::delta::zip_format::{ByteSource, InMemorySource};
 use crate::network::{is_schannel_revocation_offline, NetworkConfig, SchannelRevocationCheck};
-use crate::process::{curl_exe, hidden_command, run_capturing, RunError, RunLimits};
+use crate::process::{curl_exe, hidden_command, run_capturing, run_with_progress, RunError, RunLimits};
 use crate::EngineError;
 
 /// Anything the delta engine can pull an arbitrary byte range from. Kept
@@ -31,6 +31,23 @@ pub trait RangeFetcher {
     fn total_len(&self) -> Result<u64, EngineError>;
     /// Fetch exactly `len` bytes starting at `offset`.
     fn fetch_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, EngineError>;
+    /// Like [`fetch_range`](Self::fetch_range), but writes the bytes
+    /// directly to `dest` at `dest`'s current seek position instead of
+    /// returning them, so a caller assembling a large destination file does
+    /// not have to hold an entire fetched range (up to several hundred MB
+    /// for a coalesced block run) in memory at once, on top of the ~900 MB
+    /// base package [`crate::delta::executor::execute_delta`] already holds
+    /// resident. The default implementation just delegates to
+    /// `fetch_range` -- fine for small reads (layout probing) and for the
+    /// fake fetcher tests use; [`CurlRangeFetcher`] overrides it to stream
+    /// its curl output file straight into `dest` in bounded chunks instead.
+    /// Returns the number of bytes written (equal to `len` on success).
+    fn fetch_range_into(&self, offset: u64, len: u64, dest: &mut File) -> Result<u64, EngineError> {
+        let bytes = self.fetch_range(offset, len)?;
+        dest.write_all(&bytes)
+            .map_err(|err| EngineError::Io(format!("write fetched range: {err}")))?;
+        Ok(bytes.len() as u64)
+    }
 }
 
 /// Wraps any [`RangeFetcher`] and records bytes fetched / requests made --
@@ -76,6 +93,18 @@ impl<F: RangeFetcher> RangeFetcher for CountingFetcher<'_, F> {
         *self.bytes_fetched.lock().unwrap() += data.len() as u64;
         *self.request_count.lock().unwrap() += 1;
         Ok(data)
+    }
+
+    fn fetch_range_into(&self, offset: u64, len: u64, dest: &mut File) -> Result<u64, EngineError> {
+        let written = self.inner.fetch_range_into(offset, len, dest)?;
+        if written != len {
+            return Err(EngineError::Io(format!(
+                "range fetch wrote {written} bytes, expected {len} (offset={offset})"
+            )));
+        }
+        *self.bytes_fetched.lock().unwrap() += written;
+        *self.request_count.lock().unwrap() += 1;
+        Ok(written)
     }
 }
 
@@ -232,11 +261,12 @@ fn assemble<F: RangeFetcher>(
     }
 
     for fetch in &plan.fetches {
-        let bytes = fetcher.fetch_range(fetch.offset, fetch.len)?;
         out.seek(SeekFrom::Start(fetch.offset))
             .map_err(|err| EngineError::Io(format!("seek: {err}")))?;
-        out.write_all(&bytes)
-            .map_err(|err| EngineError::Io(format!("write: {err}")))?;
+        // `fetch_range_into` (not `fetch_range`) so a large coalesced range
+        // streams straight into `out` instead of first materializing as an
+        // owned `Vec` on top of the ~900 MB `base_bytes` already resident.
+        fetcher.fetch_range_into(fetch.offset, fetch.len, &mut out)?;
     }
 
     out.flush()
@@ -272,7 +302,17 @@ impl<'a> CurlRangeFetcher<'a> {
         }
     }
 
-    fn run_curl(&self, extra_args: &[String], limits: RunLimits) -> Result<std::process::Output, EngineError> {
+    /// `progress_path`, when given, is polled for its file size to detect a
+    /// stalled transfer (`limits.stall`, if set, is otherwise never enforced
+    /// -- `run_capturing`'s no-progress-callback form only ever checks the
+    /// total deadline). It should be the path curl is writing its `-o`
+    /// output to; growth in that file's size is curl making progress.
+    fn run_curl(
+        &self,
+        extra_args: &[String],
+        limits: RunLimits,
+        progress_path: Option<&Path>,
+    ) -> Result<std::process::Output, EngineError> {
         let attempt = |revocation: SchannelRevocationCheck| -> Result<std::process::Output, RunError> {
             let mut command = hidden_command(curl_exe());
             let mut args = self.network.curl_args_with_schannel_revocation(revocation);
@@ -289,7 +329,16 @@ impl<'a> CurlRangeFetcher<'a> {
             args.extend_from_slice(extra_args);
             args.push(self.url.to_string());
             command.args(args);
-            run_capturing(command, limits, None)
+            match progress_path {
+                Some(path) => run_with_progress(
+                    command,
+                    limits,
+                    None,
+                    &|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                    &|_| {},
+                ),
+                None => run_capturing(command, limits, None),
+            }
         };
 
         match attempt(SchannelRevocationCheck::Strict) {
@@ -353,6 +402,7 @@ impl RangeFetcher for CurlRangeFetcher<'_> {
                 body_str.clone(),
             ],
             RunLimits::total(Duration::from_secs(30)),
+            None,
         );
         let header_text = std::fs::read_to_string(&headers).unwrap_or_default();
         let _ = std::fs::remove_file(&body);
@@ -371,6 +421,45 @@ impl RangeFetcher for CurlRangeFetcher<'_> {
         if len == 0 {
             return Ok(Vec::new());
         }
+        let body = self.fetch_range_to_temp_file(offset, len)?;
+        // Clean up the temp file on every path -- a failed or timed-out curl
+        // invocation can still have written a partial body before erroring,
+        // and repeated failed delta attempts must not accumulate large
+        // partial-range files in `tmp_dir`.
+        let read_result =
+            std::fs::read(&body).map_err(|err| EngineError::Io(format!("read fetched range: {err}")));
+        let _ = std::fs::remove_file(&body);
+        read_result
+    }
+
+    fn fetch_range_into(&self, offset: u64, len: u64, dest: &mut File) -> Result<u64, EngineError> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let body = self.fetch_range_to_temp_file(offset, len)?;
+        // Stream the curl output file into `dest` in bounded chunks (via
+        // `io::copy`'s fixed-size internal buffer) rather than reading it
+        // fully into an owned `Vec` first -- the whole point of this method
+        // over `fetch_range` is to keep a large coalesced range (up to
+        // several hundred MB) from ever being resident in memory at once.
+        let copy_result = (|| -> Result<u64, EngineError> {
+            let mut reader = std::fs::File::open(&body)
+                .map_err(|err| EngineError::Io(format!("open fetched range: {err}")))?;
+            std::io::copy(&mut reader, dest)
+                .map_err(|err| EngineError::Io(format!("copy fetched range: {err}")))
+        })();
+        let _ = std::fs::remove_file(&body);
+        copy_result
+    }
+}
+
+impl CurlRangeFetcher<'_> {
+    /// Range-fetch `len` bytes starting at `offset` into a freshly named
+    /// temp file under `tmp_dir` and return its path. The caller owns
+    /// removing that file (on every path, including error, since a
+    /// failed/timed-out curl invocation can still have written a partial
+    /// body).
+    fn fetch_range_to_temp_file(&self, offset: u64, len: u64) -> Result<PathBuf, EngineError> {
         std::fs::create_dir_all(&self.tmp_dir)
             .map_err(|err| EngineError::Io(format!("create tmp dir: {err}")))?;
         let body = self.unique_tmp_path("delta-range-body");
@@ -385,16 +474,15 @@ impl RangeFetcher for CurlRangeFetcher<'_> {
                 body_str.clone(),
             ],
             RunLimits::with_stall(Duration::from_secs(30 * 60), Duration::from_secs(90)),
+            Some(&body),
         );
-        // Clean up the temp file on every path -- a failed or timed-out curl
-        // invocation can still have written a partial body before erroring,
-        // and repeated failed delta attempts must not accumulate large
-        // partial-range files in `tmp_dir`.
-        let read_result = result.map(|_| ()).and_then(|()| {
-            std::fs::read(&body).map_err(|err| EngineError::Io(format!("read fetched range: {err}")))
-        });
-        let _ = std::fs::remove_file(&body);
-        read_result
+        match result {
+            Ok(_) => Ok(body),
+            Err(err) => {
+                let _ = std::fs::remove_file(&body);
+                Err(err)
+            }
+        }
     }
 }
 
