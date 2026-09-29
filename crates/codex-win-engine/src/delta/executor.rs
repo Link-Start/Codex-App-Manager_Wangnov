@@ -79,7 +79,15 @@ impl<'a, F: RangeFetcher> CountingFetcher<'a, F> {
 
 impl<F: RangeFetcher> RangeFetcher for CountingFetcher<'_, F> {
     fn total_len(&self) -> Result<u64, EngineError> {
-        self.inner.total_len()
+        let len = self.inner.total_len()?;
+        // The length probe is itself a real curl invocation (a ranged GET
+        // for `CurlRangeFetcher`, since presigned mirror URLs reject
+        // `HEAD`), so it must count toward `request_count` the same as
+        // every `fetch_range`/`fetch_range_into` call -- otherwise
+        // `DeltaOutcome.request_count` (and the example binary's headline
+        // number) undercounts the actual number of curl invocations by one.
+        *self.request_count.lock().unwrap() += 1;
+        Ok(len)
     }
 
     fn fetch_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, EngineError> {
