@@ -167,7 +167,19 @@ pub fn resolve_package_layout(
                         file.name
                     ))
                 })?;
-                let data_offset = entry.local_header_offset + lfh_size;
+                // Both operands are untrusted package bytes -- `lfh_size` in
+                // particular is an arbitrary attacker/corruption-controlled
+                // u64 straight out of the AppxBlockMap.xml text (unlike the
+                // small, packer-bounded value `zip_format::local_header_size`
+                // itself computes) -- so a plain `+` here could overflow
+                // instead of the caller getting a clean `Err` and falling
+                // back to a full download.
+                let data_offset = entry.local_header_offset.checked_add(lfh_size).ok_or_else(|| {
+                    EngineError::Msix(format!(
+                        "AppxBlockMap.xml File {:?} has an LfhSize that overflows its local header offset",
+                        file.name
+                    ))
+                })?;
                 let mut offset = data_offset;
                 let blocks = file
                     .blocks
