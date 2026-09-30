@@ -1,7 +1,12 @@
 export type OperatingSystem = "windows" | "macos" | "linux" | "unknown";
 export type Architecture = "x64" | "arm64" | "unknown";
 export type OperationKind =
-  "install" | "update" | "uninstall" | "set-install-root" | "adopt";
+  | "install"
+  | "update"
+  | "uninstall"
+  | "set-install-root"
+  | "adopt"
+  | "manager-update";
 export type OperationToken = string;
 /** Lifecycle phase of a backend operation lease (mirrors Rust `OperationPhase`). */
 export type OperationPhase =
@@ -125,6 +130,30 @@ export interface DownloadProgress {
    * progress so a reloaded UI can reject late events from a previous op.
    */
   operationId?: string;
+}
+
+/** Phase of the Manager's own self-update, mirroring
+ *  `manager_update_runtime::ManagerUpdatePhase` on the Rust side. */
+export type ManagerUpdatePhase =
+  | "idle"
+  | "downloading"
+  | "installing"
+  | "installed"
+  | "error";
+
+/** Backend-owned snapshot of the Manager's self-update progress. Emitted on
+ *  `manager://update-state` and readable via `manager_get_update_runtime`, so
+ *  every open view (Home, WinHome, About) reflects the same in-flight
+ *  download/install instead of each holding its own local guess. */
+export interface ManagerUpdateSnapshot {
+  phase: ManagerUpdatePhase;
+  version: string | null;
+  downloaded: number;
+  total: number | null;
+  /** Stable failure category while `phase` is "error" (same codes as
+   *  `CommandError.code`); localize it via `errorCopy`, never show raw text. */
+  code: string | null;
+  updatedAtMs: number;
 }
 
 export type HistoricalReleasePlatform = "macos" | "windows";

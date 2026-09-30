@@ -23,6 +23,12 @@ pub enum OperationKind {
     Uninstall,
     SetInstallRoot,
     Adopt,
+    /// The Manager's own self-update (check-confirm-download-install), as
+    /// distinct from a Codex `Update`. Holding this kind for the duration of
+    /// `manager_install_update` keeps it from racing a concurrent Codex
+    /// install/update/uninstall/adopt operation, and vice versa, since both
+    /// share the same single-instance operation lock.
+    ManagerUpdate,
 }
 
 impl OperationKind {
@@ -33,6 +39,7 @@ impl OperationKind {
             Self::Uninstall => "uninstall",
             Self::SetInstallRoot => "set-install-root",
             Self::Adopt => "adopt",
+            Self::ManagerUpdate => "manager-update",
         }
     }
 }
@@ -66,6 +73,11 @@ struct Inner {
     paused: Option<OperationSnapshot>,
     completed: VecDeque<OperationCompletion>,
     lock_file: Result<File, String>,
+    /// Set once `prepare_relaunch` has armed the exit latches. From then on no
+    /// new operation may start: the exit handler only checks `force_quit`, so
+    /// an operation begun in the gap before the queued exit runs would be
+    /// killed by the restart it never agreed to.
+    relaunching: bool,
 }
 
 /// Byte-transfer progress mirrored into the active lease so a reloaded
@@ -337,6 +349,7 @@ impl OperationManager {
                 paused: None,
                 completed: VecDeque::new(),
                 lock_file,
+                relaunching: false,
             })),
             stale_after_secs,
         }
@@ -711,6 +724,40 @@ impl OperationManager {
         policy
     }
 
+    /// Linearizes an explicit "relaunch the Manager now" request with the
+    /// operation lease. Unlike `prepare_quit`, a relaunch never counts as the
+    /// user's consent to abandon other work: `prepare_exit` runs (under the
+    /// operation mutex) only when NO operation is active in this process or
+    /// held by another Manager instance, whatever its phase. Otherwise this
+    /// returns the busy error and `prepare_exit` is not called, so an
+    /// interruptible Codex download/update is never cancelled as a side effect.
+    /// Once it succeeds, `begin` refuses every new operation until the process
+    /// exits, so nothing can start in the gap before the queued exit runs.
+    pub fn prepare_relaunch(&self, prepare_exit: impl FnOnce()) -> Result<(), OperationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationError::Lock("operation mutex poisoned".to_string()))?;
+        let _ = self.reclaim_stale_detached(&mut inner);
+        if let Some(active) = inner.active.as_ref() {
+            return Err(OperationError::BusySameProcess(active.kind.as_str()));
+        }
+        if let Ok(lock_file) = Self::lock_file_mut(&mut inner) {
+            match Fs4FileExt::try_lock(lock_file) {
+                Ok(()) => {
+                    let _ = Fs4FileExt::unlock(lock_file);
+                }
+                Err(TryLockError::WouldBlock) => return Err(OperationError::BusyOtherProcess),
+                Err(TryLockError::Error(_)) => {}
+            }
+        }
+        prepare_exit();
+        // Held through process exit (there is deliberately no way back): the
+        // restart is already queued, so nothing else may take the lease.
+        inner.relaunching = true;
+        Ok(())
+    }
+
     /// Snapshot of the local active operation, for frontend reattach after
     /// renderer reload / remount. `None` when free (or only a cross-process lock).
     pub fn snapshot(&self) -> Option<OperationSnapshot> {
@@ -1001,6 +1048,9 @@ impl OperationManager {
                 kind.as_str()
             );
             return Err(OperationError::BusySameProcess(active.kind.as_str()));
+        }
+        if inner.relaunching {
+            return Err(OperationError::BusySameProcess("relaunch"));
         }
 
         let started_unix = now_unix();
@@ -1920,6 +1970,81 @@ mod tests {
         assert!(automatic_preparation.load(Ordering::SeqCst));
 
         drop(guard);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn relaunch_preparation_never_cancels_other_active_operations() {
+        use crate::app::op_phase::OperationPhase;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let path = lock_path("relaunch-preparation");
+        let manager = OperationManager::new(path.clone());
+
+        // An interruptible Codex operation is `Confirm` for a quit (and would
+        // be cancelled by a confirmed one). A relaunch must instead be
+        // refused as busy without running the exit preparation.
+        let guard = manager.begin(OperationKind::Update).unwrap();
+        manager
+            .set_phase(guard.token(), OperationPhase::Downloading)
+            .unwrap();
+        let untouched = AtomicBool::new(false);
+        let err = manager
+            .prepare_relaunch(|| untouched.store(true, Ordering::SeqCst))
+            .unwrap_err();
+        assert!(matches!(err, OperationError::BusySameProcess("update")));
+        assert!(!untouched.load(Ordering::SeqCst));
+
+        // Same for the point of no return.
+        manager
+            .set_phase(guard.token(), OperationPhase::Committing)
+            .unwrap();
+        assert!(manager
+            .prepare_relaunch(|| untouched.store(true, Ordering::SeqCst))
+            .is_err());
+        assert!(!untouched.load(Ordering::SeqCst));
+
+        // A refused relaunch leaves nothing behind: once the operation ends,
+        // a new one can start and the relaunch can be refused again.
+        drop(guard);
+        let next = manager.begin(OperationKind::Install).unwrap();
+        assert!(manager.prepare_relaunch(|| ()).is_err());
+        drop(next);
+
+        // Idle: the relaunch may proceed and the exit preparation runs.
+        let prepared = AtomicBool::new(false);
+        manager
+            .prepare_relaunch(|| prepared.store(true, Ordering::SeqCst))
+            .unwrap();
+        assert!(prepared.load(Ordering::SeqCst));
+
+        // From then on nothing may start before the queued exit runs: the
+        // exit handler only checks `force_quit`, so an operation begun in
+        // that gap would be killed by the restart.
+        assert!(matches!(
+            manager.begin(OperationKind::Update),
+            Err(OperationError::BusySameProcess("relaunch"))
+        ));
+        assert!(manager.begin_detached(OperationKind::Update).is_err());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn manager_update_lease_excludes_and_is_excluded_by_codex_operations() {
+        let path = lock_path("manager-update-lease");
+        let manager = OperationManager::new(path.clone());
+        let guard = manager.begin(OperationKind::ManagerUpdate).unwrap();
+        assert!(matches!(
+            manager.begin(OperationKind::Update),
+            Err(OperationError::BusySameProcess("manager-update"))
+        ));
+        drop(guard);
+        let codex = manager.begin(OperationKind::Update).unwrap();
+        assert!(matches!(
+            manager.begin(OperationKind::ManagerUpdate),
+            Err(OperationError::BusySameProcess("update"))
+        ));
+        drop(codex);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

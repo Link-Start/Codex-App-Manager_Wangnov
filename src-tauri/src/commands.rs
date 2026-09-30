@@ -15,6 +15,11 @@ use crate::app::diagnostics::Diagnostics;
 use crate::app::disk::available_space;
 use crate::app::install_tx::SelfUpdatePolicyTransition;
 use crate::app::logging::redact_url;
+use crate::app::manager_update_runtime::{
+    classify_updater_error, enter_commit_checkpoint, with_stall_timeout, ActivityClock,
+    EmitThrottle, ManagerUpdateRuntime, ManagerUpdateSnapshot, RelaunchClaim, UpdateStage, CHECK_TIMEOUT,
+    DOWNLOAD_STALL_TIMEOUT, PROGRESS_EMIT_INTERVAL,
+};
 use crate::app::network;
 use crate::app::mac_update::{
     cancel_macos_download, detect_existing_install_at_path as detect_macos_install_at_path,
@@ -396,7 +401,12 @@ fn manager_updater_builder(
     app: &AppHandle,
 ) -> Result<tauri_plugin_updater::UpdaterBuilder, AppError> {
     let saved = PersistedAppSettings::load();
-    let mut builder = app.updater_builder();
+    // Bounds every manifest request. The plugin applies no timeout unless one
+    // is set here, and the check runs while the shared `ManagerUpdate` lease
+    // is held (see `manager_install_update`). The artifact download is
+    // bounded separately, by inactivity (`DOWNLOAD_STALL_TIMEOUT`): the
+    // plugin does not carry this timeout over to `Update::download`.
+    let mut builder = app.updater_builder().timeout(CHECK_TIMEOUT);
     match saved.proxy_mode {
         ProxyMode::System => {}
         ProxyMode::Direct => {
@@ -431,6 +441,7 @@ fn manager_update_or_stale<T>(update: Option<T>) -> Result<T, AppError> {
 #[tauri::command]
 pub async fn manager_check_update(
     app: AppHandle,
+    state: State<'_, ManagerState>,
 ) -> Result<Option<ManagerUpdateMetadata>, CommandError> {
     let updater = manager_updater_builder(&app)?
         .build()
@@ -438,7 +449,14 @@ pub async fn manager_check_update(
     let update = updater
         .check()
         .await
-        .map_err(|e| AppError::Engine(format!("check manager update: {e}")))?;
+        .map_err(|e| manager_check_failure("check manager update", &e))?;
+    // A version this process already wrote to disk is not "available" any
+    // more, even after the reminder was dismissed: the running binary still
+    // reports its old version until it relaunches, so without this the next
+    // check would offer the same update again.
+    let update = state
+        .manager_update
+        .without_installed(update, |update| update.version.as_str());
     Ok(update.map(|update| ManagerUpdateMetadata {
         version: update.version,
         current_version: update.current_version,
@@ -446,20 +464,37 @@ pub async fn manager_check_update(
     }))
 }
 
+/// Emits the runtime's current snapshot on `manager://update-state` so every
+/// open view (Home, WinHome, About) sees the same progress without polling.
+fn emit_manager_update_state(app: &AppHandle, runtime: &ManagerUpdateRuntime) {
+    let _ = app.emit("manager://update-state", runtime.snapshot());
+}
+
 #[tauri::command]
 pub async fn manager_install_update(
     app: AppHandle,
+    state: State<'_, ManagerState>,
     expected_version: String,
     expected_current_version: String,
 ) -> Result<(), CommandError> {
+    // Shares the single-instance operation lock with Codex install/update/
+    // uninstall/adopt so a Manager self-update can never run concurrently
+    // with one of those (and vice versa).
+    let op_guard = begin_guard(&state, OperationKind::ManagerUpdate)?;
+
     let updater = manager_updater_builder(&app)?
         .build()
         .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
     let update = manager_update_or_stale(
-        updater
-            .check()
-            .await
-            .map_err(|e| AppError::Engine(format!("check manager update before install: {e}")))?,
+        // A version already written to disk by this process is not installable
+        // again; only a relaunch is left.
+        state.manager_update.without_installed(
+            updater
+                .check()
+                .await
+                .map_err(|e| manager_check_failure("check manager update before install", &e))?,
+            |update| update.version.as_str(),
+        ),
     )?;
     if !manager_update_matches_confirmation(
         &update.version,
@@ -472,10 +507,235 @@ pub async fn manager_install_update(
         )
         .into());
     }
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| AppError::Engine(format!("install manager update: {e}")))?;
+
+    let runtime = &state.manager_update;
+    runtime.start_download(&update.version);
+    emit_manager_update_state(&app, runtime);
+    let _ = state
+        .operations
+        .set_phase(op_guard.token(), OperationPhase::Downloading);
+
+    let progress_app = app.clone();
+    let mut throttle = EmitThrottle::new(PROGRESS_EMIT_INTERVAL);
+    let activity = ActivityClock::new();
+    // Split the plugin's own `download_and_install` so a final pre-commit
+    // checkpoint can run between the two halves — its `on_download_finish`
+    // callback fires too late to stop `install()`, which the plugin always
+    // calls right after, unconditionally.
+    //
+    // The plugin's `download` has no timeout of its own here, and this whole
+    // function holds the shared `ManagerUpdate` lease. A connection that is
+    // accepted but then stalls (captive portal, dead proxy) would therefore
+    // lock out every Codex operation and the relaunch until the app is quit;
+    // abandon the download after `DOWNLOAD_STALL_TIMEOUT` without any byte
+    // instead, which drops the request and releases the lease on return.
+    let downloaded = with_stall_timeout(
+        update.download(
+            |chunk_len, total| {
+                activity.touch();
+                // The snapshot is updated per chunk; only the IPC event is
+                // rate-limited. Every phase change below emits unthrottled, so
+                // the final byte count always reaches the renderer.
+                runtime.add_progress(chunk_len as u64, total);
+                if throttle.should_emit(std::time::Instant::now()) {
+                    emit_manager_update_state(&progress_app, runtime);
+                }
+            },
+            || {},
+        ),
+        &activity,
+        DOWNLOAD_STALL_TIMEOUT,
+    )
+    .await;
+
+    let bytes = match downloaded {
+        Ok(Ok(bytes)) => bytes,
+        Err(_stalled) => {
+            return Err(manager_update_failure_with_kind(
+                &app,
+                runtime,
+                ErrorKind::Timeout,
+                format!(
+                    "download manager update: no data received for {}s",
+                    DOWNLOAD_STALL_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        Ok(Err(error)) => {
+            return Err(manager_update_failure(
+                &app,
+                runtime,
+                UpdateStage::Download,
+                "download manager update",
+                &error,
+            ));
+        }
+    };
+
+    // Final pre-commit checkpoint, mirroring `mac_update`/`win_update`'s own
+    // swap flow (see `enter_commit_checkpoint` for the race it closes).
+    if !enter_commit_checkpoint(
+        &state.operations,
+        op_guard.token(),
+        &state.force_quit,
+    ) {
+        runtime.mark_error(ErrorKind::Cancelled.as_code());
+        emit_manager_update_state(&app, runtime);
+        return Err(CommandError {
+            code: ErrorKind::Cancelled.as_code().to_string(),
+            message: AppError::Engine(
+                "self-update cancelled: the application is quitting".to_string(),
+            )
+            .to_string(),
+        });
+    }
+
+    runtime.mark_installing();
+    emit_manager_update_state(&progress_app, runtime);
+
+    // NOTE(windows): on a normal successful update, tauri-plugin-updater's
+    // Windows `install_inner` launches the NSIS/MSI installer and then calls
+    // `std::process::exit(0)` before returning — this process is gone before
+    // `Ok(())` can come back here. So on Windows this `Ok` arm (and the
+    // `mark_installed`/reattach/"Relaunch Now" UI it drives) is unreachable
+    // in normal operation; it is only exercised on macOS/Linux, where
+    // `install_inner` returns normally after swapping the bundle. See
+    // `ManagerUpdateRuntime::mark_installed`'s doc comment and the Windows
+    // NSIS handoff follow-up.
+    match update.install(bytes) {
+        Ok(()) => {
+            runtime.mark_installed();
+            emit_manager_update_state(&app, runtime);
+            Ok(())
+        }
+        Err(error) => Err(manager_update_failure(
+            &app,
+            runtime,
+            UpdateStage::Install,
+            "install manager update",
+            &error,
+        )),
+    }
+}
+
+/// Records a failed self-update in the runtime and builds the command error.
+/// The snapshot (broadcast to every view) carries only the stable category
+/// code, which the renderer localizes; the raw updater text — English, and
+/// possibly holding feed URLs or local paths — goes to the log and to the
+/// rejected invoke's `message`, where the UI keeps it for a details
+/// disclosure only.
+fn manager_update_failure(
+    app: &AppHandle,
+    runtime: &ManagerUpdateRuntime,
+    stage: UpdateStage,
+    context: &str,
+    error: &tauri_plugin_updater::Error,
+) -> CommandError {
+    manager_update_failure_with_kind(
+        app,
+        runtime,
+        classify_updater_error(stage, error),
+        format!("{context}: {error}"),
+    )
+}
+
+fn manager_update_failure_with_kind(
+    app: &AppHandle,
+    runtime: &ManagerUpdateRuntime,
+    kind: ErrorKind,
+    message: String,
+) -> CommandError {
+    log::warn!("manager update failed code={} {message}", kind.as_code());
+    runtime.mark_error(kind.as_code());
+    emit_manager_update_state(app, runtime);
+    CommandError {
+        code: kind.as_code().to_string(),
+        message: AppError::Engine(message).to_string(),
+    }
+}
+
+/// A failed manifest check. Unlike a download/install failure it does not
+/// enter the runtime (nothing was started, so there is no snapshot to show):
+/// it only rejects the invoke, but with the same stable code so the confirm
+/// sheet can show localized network/timeout copy instead of the generic error.
+fn manager_check_failure(context: &str, error: &tauri_plugin_updater::Error) -> CommandError {
+    let kind = classify_updater_error(UpdateStage::Check, error);
+    let message = format!("{context}: {error}");
+    log::warn!("manager update check failed code={} {message}", kind.as_code());
+    CommandError {
+        code: kind.as_code().to_string(),
+        message: AppError::Engine(message).to_string(),
+    }
+}
+
+/// Lets the renderer reattach to the current self-update progress after a
+/// reload (or a second window opening) instead of losing it — the runtime
+/// lives on `ManagerState`, independent of any one view's component state.
+#[tauri::command]
+pub fn manager_get_update_runtime(state: State<'_, ManagerState>) -> ManagerUpdateSnapshot {
+    state.manager_update.snapshot()
+}
+
+/// Clears a terminal (installed/error) snapshot back to idle once the
+/// renderer has shown it to the user. A no-op while a download/install is
+/// still in flight, returned as the (unchanged) current snapshot. Also
+/// re-emits `manager://update-state` when it actually changed anything: the
+/// live listener is what `reattached` views (no local `update`/`pendingUpdate`
+/// of their own) key off of, so without this broadcast their sheet would
+/// keep showing the just-dismissed terminal snapshot forever.
+#[tauri::command]
+pub fn manager_ack_update_runtime(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+) -> ManagerUpdateSnapshot {
+    if state.manager_update.ack() {
+        emit_manager_update_state(&app, &state.manager_update);
+    }
+    state.manager_update.snapshot()
+}
+
+/// Restarts the Manager process from the Rust backend rather than the
+/// renderer, so `process:allow-restart` no longer needs to be exposed to the
+/// webview at all. Single-claim: a second call after a restart was already
+/// queued is an idempotent no-op instead of an error, since the process is
+/// about to exit anyway. A second call that overlaps the first while it is
+/// still being validated gets the busy error instead: the first can yet be
+/// refused, and reporting success then would show "relaunching" for a restart
+/// that never happens.
+#[tauri::command]
+pub fn manager_relaunch(app: AppHandle, state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    match state.manager_update.reserve_relaunch() {
+        RelaunchClaim::Claimed => {}
+        RelaunchClaim::AlreadyAccepted => return Ok(()),
+        RelaunchClaim::InFlight => {
+            return Err(AppError::from(crate::app::oplock::OperationError::BusySameProcess(
+                OperationKind::ManagerUpdate.as_str(),
+            ))
+            .into());
+        }
+    }
+    // The self-update confirm dialog already asked the user to accept a
+    // restart, so this must not raise the ordinary CloseRequested/
+    // ExitRequested handler's own "close the manager?" prompt a second time.
+    // But a relaunch is consent only to restarting the Manager, never to
+    // abandoning other work: with ANY other operation active (a Codex
+    // download/update still in an interruptible phase as much as an
+    // uninterruptible one) `prepare_relaunch_for` refuses with the busy error
+    // instead of cancelling it. Release the reservation in that case so a
+    // later attempt, once that operation finishes, is not silenced forever by
+    // the single-claim guard above.
+    if let Err(err) = crate::prepare_relaunch_for(&app) {
+        state.manager_update.release_relaunch_reservation();
+        log::warn!("manager relaunch refused: {err}");
+        return Err(AppError::from(err).into());
+    }
+    state.manager_update.mark_relaunch_accepted();
+    // `request_restart` only flags the intent and asks the runtime to exit;
+    // it returns immediately rather than blocking, so no extra thread is
+    // needed to keep this command responsive. `prepare_relaunch_for` above
+    // already armed `force_quit`, so the ExitRequested handler it triggers
+    // will see `QuitPolicy::Allow` and let it through without asking again.
+    app.request_restart();
     Ok(())
 }
 

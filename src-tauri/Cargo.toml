@@ -36,7 +36,6 @@ tauri = { version = "2.11.2", features = ["tray-icon", "image-png", "macos-priva
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-log = "2"
-tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 thiserror = "2.0"
@@ -45,6 +44,12 @@ url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# Only for the loopback reqwest-error classification test: reqwest is built
+# without a bundled TLS provider, and the updater plugin installs the ring one
+# at runtime before its first client.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
